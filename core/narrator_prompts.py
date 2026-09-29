@@ -391,6 +391,8 @@ def system_prompt(phase: str, main_prompt: Optional[str], format_prompt: Optiona
         if output_recovery else '',
         'The JSON object itself is the final structured output. Do not wrap it in Markdown fences.',
         'The interval object is the authoritative clock. Use interval.nowLocal and interval.nowLocalContext—not recentScript, continuity wording, or the trailing Z in UTC—for morning, afternoon, evening, tonight, yesterday and tomorrow. interval.nowLocalContext.period and daylightExpectation describe the scene at the endpoint. If older prose says night but nowLocal says 16:00/afternoon, advance the life into the current afternoon and do not call it dark unless a current setting or observed event explicitly establishes unusual darkness. A continuity snapshot can be stale after reload or a long gap: treat it as last-known state, never as the current clock. When creating sendAt or notBefore, return a complete ISO-8601 timestamp with Z or an explicit offset.',
+        'interval.realCalendar, when present, is the authoritative real-world calendar for the protagonist in mainland China: today/tomorrow status (school day, weekend, statutory holiday, make-up workday, winter or summer break, gaokao), nextSevenDays, nextBreak, current grade, school phase, age and gaokao countdown. It overrides any static grade, age or school-schedule wording in setting or profile, and outranks older script that assumed a different day type. On holidays and breaks she does not go to school; on make-up workdays and Saturday classes she does. Let upcoming holidays, exams and grade changes shape mood and plans naturally without reciting the data. When realCalendar.note says dates are estimated, avoid naming exact unannounced arrangements.',
+
         phase_instruction(phase, group_turn),
         script_first_transport_instruction(phase, group_turn, streaming_reply_first),
         'When currentEvent.imageCount is greater than zero, the current user event includes that many attached native image inputs. They are observed material from this one event, not separate messages or historical evidence. Use only details visibly supported by them, integrate them naturally into the protagonist’s present reality, and do not invent unseen image details.',
@@ -832,6 +834,7 @@ def to_prompt_payload(request: dict[str, Any], options: Optional[dict[str, Any]]
             'fromLocalContext': from_local_context,
             'nowLocalContext': now_local_context,
             'elapsedSeconds': max(0, _js_round((dt_ms(now_value) - dt_ms(from_value)) / 1000)),
+            **_real_calendar_field(now_value, timezone),
         },
         'timelinePlan': timeline_plan_value,
         'timelineCarry': timeline_carry_value,
@@ -932,6 +935,22 @@ def to_prompt_payload(request: dict[str, Any], options: Optional[dict[str, Any]]
     cache_payload['recentExchange'] = build_recent_exchange(request)
     cache_payload['continuation'] = continuation
     return _compile_narrative_context(cache_payload, _pick(request, 'sceneFrame', 'scene_frame'), _pick(request, 'dialogueBurst', 'dialogue_burst'))
+
+
+def _real_calendar_field(now_value: Any, timezone: Any) -> dict[str, Any]:
+    """本地扩展：`interval.realCalendar`（中国法定节假日 + 高中校历的权威现实事实）。
+
+    任何异常都只丢掉这个字段，绝不影响主叙事请求。
+    """
+    try:
+        from . import real_calendar
+        now_dt = parse_dt(now_value)
+        if now_dt is None:
+            return {}
+        ctx = real_calendar.narrative_context(now_dt, str(timezone or 'Asia/Shanghai'))
+        return {'realCalendar': ctx} if ctx else {}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _interrupted_outgoing_drafts(request: dict[str, Any], now_value: Any) -> list[dict[str, Any]]:

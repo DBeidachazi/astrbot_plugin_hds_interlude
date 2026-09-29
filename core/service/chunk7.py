@@ -69,8 +69,10 @@ from datetime import datetime
 from typing import Any, Callable, Optional
 
 from ..script.life_handoff import entry_life_handoff
+from .. import real_calendar
 from ..schedule_preplan import (
     apply_schedule_preplan_proposal,
+    materialize_schedule_preplan,
     next_schedule_preplan_transition,
     normalize_schedule_preplan_record,
     refresh_schedule_preplan,
@@ -1313,7 +1315,10 @@ class ServiceChunk7(ServiceBase):
             options if after > 0 else {**options, 'limit': 60},
         )
         if after > 0:
-            entries = [row for row in rows if _number(pick(row, 'id'), 0) > after][:60]
+            # 本地修复：原实现取游标之后**最旧**的 60 条，而每天新增剧本远多于 60 条，
+            # 游标永远落后（复核只看到一两天前的夜间睡眠）。改为取游标之后**最新**的 60 条，
+            # 被跳过的旧条目已不代表当前作息。
+            entries = [row for row in rows if _number(pick(row, 'id'), 0) > after][-60:]
         else:
             entries = list(rows)
         if _cfg(self.shared_story_config, 'shareParticipantDetails', 'share_participant_details', False) is True:  # type: ignore[attr-defined]
@@ -1403,6 +1408,34 @@ class ServiceChunk7(ServiceBase):
             return None
         current = await self.get_schedule_preplan(story_id)
         timezone = _setting_timezone(story)
+        # 本地扩展：现实日历驱动。启用时日程完全由中国法定节假日 + 高中校历生成，
+        # 不再调用模型复核（也就不存在证据游标堆积）；每个本地日首次扫描时重建一次。
+        try:
+            calendar_on = real_calendar.enabled()
+        except Exception as error:  # noqa: BLE001 - 配置异常时回退到原模型流程
+            calendar_on = False
+            self.report(  # type: ignore[attr-defined]
+                'warn', story, 'advance', '现实日历配置读取失败，回退模型日程：%s', error,
+            )
+        if calendar_on:
+            local_date = calendar_day_key(now, timezone)
+            if real_calendar.preplan_is_current(current, local_date):
+                return None
+            record = real_calendar.build_preplan_record(
+                story_id, local_date, timezone, now, current, materialize_schedule_preplan,
+            )
+            await self.save_schedule_preplan(record)
+            self.schedule_preplan_backoff.pop(story_id, None)  # type: ignore[attr-defined]
+            self.report_operation(  # type: ignore[attr-defined]
+                'standard', 'info', story, 'advance',
+                'Schedule Preplan 已按现实日历重建 版本=%s 覆盖=%s→%s 例外日=%d',
+                record.get('revision'), record.get('valid_from'), record.get('valid_through'),
+                len(record.get('exceptions') or []),
+            )
+            return {
+                'current': record, 'evidence_entries': [], 'local_date': local_date,
+                'needs_model': False, 'request': None,
+            }
         if not schedule_preplan_review_due(current, now, timezone, config):
             return None
         local_date = calendar_day_key(now, timezone)

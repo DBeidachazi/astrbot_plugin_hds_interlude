@@ -34,7 +34,7 @@ except Exception:  # noqa: BLE001
     _LunarConverter = None
     _Lunar = None
 
-VERSION = 1
+VERSION = 2
 REASON_TAG = '[real-calendar'
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -54,6 +54,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
     'saturday_classes': {'1': False, '2': False, '3': True},
     'after_graduation': '毕业后去向未定（大学生活待设定）',
     'horizon_days': 14,
+    # 每日作息模板：[id, start, end, label, kind, location]；上课块 id 以 classes- 开头时自动追加补课后缀，
+    # 休息日模板里的 {label} 替换为假期名称。修改 real_calendar.json 即热生效（无需重载插件）。
+    'school_day_blocks': [
+        ['sleep', '00:00', '06:00', '夜间睡眠', 'routine', '家'],
+        ['breakfast', '06:00', '06:40', '起床洗漱、吃早饭（边吃边看看手机）', 'routine', '家'],
+        ['commute-am', '06:40', '07:00', '骑车上学', 'routine', '路上'],
+        ['classes-am', '07:00', '12:00', '早读与上午课程（上课时手机静音收好，课间可以看看手机、偶尔回消息）', 'fixed', '学校'],
+        ['lunch', '12:00', '13:30', '午饭与午休（刷手机、回消息、群里冒泡）', 'routine', '学校'],
+        ['classes-pm', '13:30', '17:00', '下午课程（课间可以看看手机）', 'fixed', '学校'],
+        ['commute-pm', '17:00', '17:30', '17:00放学，骑车回家', 'routine', '路上'],
+        ['dinner', '17:30', '18:30', '晚饭（边吃边看手机、聊天）', 'routine', '家'],
+        ['homework', '18:30', '20:00', '写作业（效率还行，一个半小时左右写完）', 'flexible', '家'],
+        ['evening-free', '20:00', '23:59', '自由时间：刷手机、追番、打游戏、在群里水群闲聊', 'open', '家'],
+    ],
+    'rest_day_blocks': [
+        ['sleep', '00:00', '09:00', '睡觉、赖床', 'routine', '家'],
+        ['late-morning', '09:00', '12:00', '{label}：起床、刷手机、自由安排', 'flexible', '家'],
+        ['lunch', '12:00', '13:00', '午饭（边吃边看手机）', 'routine', '家'],
+        ['afternoon', '13:00', '17:30', '{label}：自由活动（作业不多，挑时间写掉）', 'open', ''],
+        ['dinner', '17:30', '18:30', '晚饭', 'routine', '家'],
+        ['evening', '18:30', '23:59', '自由时间：刷手机、追番、打游戏、群里闲聊', 'open', '家'],
+    ],
+    'routine_notes': {
+        'school': '上课日：7:00前到校，17:00放学，没有晚自习。上课时手机静音收好不看；课间、早中晚饭和午休时会看看手机、偶尔回消息或在群里冒个泡。晚上作业一个半小时左右写完，之后自由安排（刷手机、追番、游戏、水群）。',
+        'rest': '休息日：会赖床；全天大多有空，看手机和回消息都比较随意，作业不多，挑时间写掉，其余时间自由安排。',
+        'gaokao': '高考期间：专心考试，基本不看手机。',
+    },
 }
 
 _HOLIDAY_ZH = {
@@ -349,6 +376,15 @@ def _break_runs(start: date, cfg: dict[str, Any], limit_days: int = 200) -> Opti
     return None
 
 
+def _routine_note(c: dict[str, Any]) -> str:
+    notes = load_config().get('routine_notes') or DEFAULT_CONFIG['routine_notes']
+    if c['status'] == 'gaokao':
+        return str(notes.get('gaokao') or '')
+    if c['status'] in _SCHOOL_STATUSES:
+        return str(notes.get('school') or '')
+    return str(notes.get('rest') or '')
+
+
 def narrative_context(now: datetime, timezone: str = 'Asia/Shanghai') -> Optional[dict[str, Any]]:
     cfg = load_config()
     if not enabled(cfg):
@@ -387,6 +423,7 @@ def narrative_context(now: datetime, timezone: str = 'Asia/Shanghai') -> Optiona
             'finished': today > gk_end,
         },
         'nextBreak': next_break,
+        'dailyRoutine': _routine_note(t),
     }
     if t['holidayEstimated'] or any(not classify_day(today + timedelta(days=i), cfg)['officialDataAvailable'] for i in (0, 30)):
         ctx['note'] = '部分日期尚无国务院官方放假安排，节假日为惯例估算、调休补班未知。'
@@ -403,30 +440,31 @@ def _b(block_id: str, start: str, end: str, label: str, kind: str, location: str
     return block
 
 
-def _school_blocks(label_suffix: str = '') -> list[dict[str, Any]]:
-    return [
-        _b('sleep', '00:00', '06:00', '夜间睡眠', 'routine', '家'),
-        _b('morning-prep', '06:00', '06:40', '起床洗漱、吃早饭', 'routine', '家'),
-        _b('commute-am', '06:40', '07:00', '骑车上学', 'routine', '路上'),
-        _b('classes-am', '07:00', '11:50', f'早读与上午课程{label_suffix}', 'fixed', '学校'),
-        _b('lunch', '11:50', '13:30', '午饭与午休', 'routine', '学校'),
-        _b('classes-pm', '13:30', '17:30', '下午课程', 'fixed', '学校'),
-        _b('dinner', '17:30', '18:30', '晚饭', 'routine', '学校食堂'),
-        _b('evening-study', '18:30', '21:30', '晚自习', 'fixed', '学校'),
-        _b('commute-pm', '21:30', '22:00', '放学回家', 'routine', '路上'),
-        _b('night-free', '22:00', '23:59', '写作业、洗漱、刷手机', 'flexible', '家'),
+def _blocks_from_config(key: str, label: str = '', suffix: str = '') -> list[dict[str, Any]]:
+    rows = load_config().get(key) or DEFAULT_CONFIG[key]
+    blocks = []
+    for row in rows:
+        try:
+            block_id, start, end, text, kind = (str(x) for x in row[:5])
+            location = str(row[5]) if len(row) > 5 and row[5] else ''
+        except (TypeError, ValueError, IndexError):
+            continue
+        text = text.replace('{label}', label or '休息日')
+        if suffix and block_id.startswith('classes-'):
+            text = f'{text}{suffix}'
+        blocks.append(_b(block_id, start, end, text, kind, location))
+    return blocks or [
+        _b(*row[:5], row[5] if len(row) > 5 else '')  # 配置全部无效时回落默认模板
+        for row in DEFAULT_CONFIG[key]
     ]
+
+
+def _school_blocks(label_suffix: str = '') -> list[dict[str, Any]]:
+    return _blocks_from_config('school_day_blocks', suffix=label_suffix)
 
 
 def _rest_blocks(label: str) -> list[dict[str, Any]]:
-    return [
-        _b('sleep', '00:00', '09:00', '睡觉、赖床', 'routine', '家'),
-        _b('late-morning', '09:00', '12:00', f'{label}：作业或自由安排', 'flexible', '家'),
-        _b('lunch', '12:00', '13:00', '午饭', 'routine', '家'),
-        _b('afternoon', '13:00', '18:00', f'{label}：自由活动', 'open'),
-        _b('dinner', '18:00', '19:00', '晚饭', 'routine', '家'),
-        _b('evening', '19:00', '23:59', '写作业、娱乐、洗漱', 'flexible', '家'),
-    ]
+    return _blocks_from_config('rest_day_blocks', label=label)
 
 
 def _gaokao_blocks() -> list[dict[str, Any]]:

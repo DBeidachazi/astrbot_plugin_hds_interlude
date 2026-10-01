@@ -63,7 +63,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
          'vars': {'ask': ['说想借她的彩笔', '拿着数学作业说有道题不会', '说自己的风筝挂树上了']},
          'cast': ['小宇'], 'cooldown_days': 4},
         {'id': 'dad-snack', 'weight': 1, 'tier': 'minor', 'days': ['off', 'school'], 'hours': [18, 21],
-         'event': '爸爸出差回来了，拎着一袋{snack}', 'vars': {'snack': ['当地特产小点心', '没见过的零食', '一盒鲜花饼']},
+         'event': '爸爸出差回来了，拎回来{snack}', 'vars': {'snack': ['一袋当地特产小点心', '一包没见过的零食', '一盒鲜花饼']},
          'cast': ['爸爸'], 'cooldown_days': 7},
         {'id': 'deskmate-note', 'weight': 2, 'tier': 'minor', 'days': ['school'], 'hours': [12, 17],
          'event': '同桌周屿把一张写满物理解题步骤的草稿纸推到她桌上', 'cast': ['周屿'], 'cooldown_days': 4},

@@ -1242,7 +1242,8 @@ def _sole_action(actions: list[Any]) -> Any:
 
 
 def repair_missing_visible_reply(decision: Any, phase: str, group_context: Any,
-                                 has_private_participant: bool) -> tuple[Any, str]:
+                                 has_private_participant: bool,
+                                 separator: str = '<sep/>') -> tuple[Any, str]:
     """本地偏离：模型整段省略传输字段时，能确定答案就直接补齐，不再白白重写一整份剧本。
 
     gemini 一类模型经常把 `interaction` / `groupReply` 整个漏掉（不是写错，是没写）。
@@ -1254,12 +1255,18 @@ def repair_missing_visible_reply(decision: Any, phase: str, group_context: Any,
     - 私聊用户回合：`interaction` 缺失、没有跨对话行动、剧本里**恰好一个**已解析的
       `<say>`——与 `sole_action_reply` 同一族假设：唯一的授权原话就是这条回复。
 
+    - 零个 `<say>`、没有残留标签、但散文里**恰有一段**带分隔符的裸气泡块（模型写了
+      「……发进群里：甲<sep/>乙」却忘了包 `<say>`）：分隔符只属于运输，那段就是她发出
+      的字（见 `sole_bubble_block`）。此前群聊这里会被判成 `group-silent`（她不说话）
+      或白重写一次。认下之后清掉 `actionId`，否则 `normalize_decision` 再解析一次引用时
+      会把刚认下的内容擦回 none。
+
     其余形态（多个 say、残留标签、已有字段但形状错误）保持原有重写路径。
     返回 `(decision, 修复类型)`；未修复时类型为空串。
     """
     if phase != 'user-message' or not isinstance(decision, dict):
         return decision, ''
-    from ..script.authored_actions import inspect_say_markup
+    from ..script.authored_actions import inspect_say_markup, sole_bubble_block
 
     def pick(record: dict[str, Any], *keys: str) -> Any:
         for key in keys:
@@ -1292,12 +1299,20 @@ def repair_missing_visible_reply(decision: Any, phase: str, group_context: Any,
                            and isinstance(item.get('content'), str) and item['content'].strip()), None)
             target = target or _sole_action(actions)
             if target is None:
-                return decision, ''
+                block = None if (actions or leftover) else sole_bubble_block(script, separator)
+                if not block:
+                    return decision, ''
+                post = {**group_reply, 'actionId': None, 'action_id': None, 'content': block}
+                return {**decision, 'groupReply': post, 'group_reply': dict(post)}, 'group-bare-bubble'
             post = {**group_reply, 'actionId': target['id'], 'content': target['content']}
             return {**decision, 'groupReply': post, 'group_reply': dict(post)}, 'group-reply-bound'
         if leftover:
             return decision, ''
         if not actions:
+            block = sole_bubble_block(script, separator)
+            if block:
+                post = {'mode': 'immediate', 'content': block}
+                return {**decision, 'groupReply': post, 'group_reply': dict(post)}, 'group-bare-bubble'
             silent = {'mode': 'none'}
             return {**decision, 'groupReply': silent, 'group_reply': dict(silent)}, 'group-silent'
         only = _sole_action(actions)
@@ -1311,6 +1326,12 @@ def repair_missing_visible_reply(decision: Any, phase: str, group_context: Any,
         return decision, ''
     if leftover:
         return decision, ''
+    if not actions:
+        block = sole_bubble_block(script, separator)
+        if not block:
+            return decision, ''
+        reply = {'mode': 'immediate', 'content': block}
+        return {**decision, 'interaction': {'seen': True, 'reply': reply}}, 'private-bare-bubble'
     only = _sole_action(actions)
     if only is None:
         return decision, ''

@@ -170,6 +170,10 @@ def sole_bubble_block(prose: Any, separator: str) -> Optional[str]:
     "只有一段含分隔符"这条限定与**位置无关**（块后面常常还跟着「发出去……」的叙述），
     同时排除"叙述里也提到分隔符"的歧义：只要出现两段候选、或那一段不是合法气泡块，
     就一律不认，退回原来的重写路径——**绝不从散文里猜动作**这条底线没动。
+
+    同段里引出气泡块的叙述（「……敲出两句发进群里：甲<sep/>乙」）会被剥掉，只在冒号前
+    以发送动作收尾时才剥；成对的外层引号同理。分隔符是只属于运输的记号，叙述从不写它，
+    所以它出现在哪一段，哪一段就是她发出去的字——只是忘了包 `<say>`。
     """
     if not separator or not isinstance(prose, str):
         return None
@@ -180,13 +184,48 @@ def sole_bubble_block(prose: Any, separator: str) -> Optional[str]:
     ]
     if len(candidates) != 1:
         return None
-    block = candidates[0]
+    block = _strip_send_lead_in(candidates[0], separator)
     if not block or len(block) > 4000:
         return None
     parts = block.split(separator)
     if len(parts) < 2 or any((not part.strip()) or _BAD_BUBBLE_CHAR.search(part) for part in parts):
         return None
-    return block
+    return _strip_bubble_quotes(block, separator)
+
+
+# 「……指尖在键盘上轻快敲出两句发进群里：甲<sep/>乙」——裸气泡块常与引出它的叙述同段。
+# 只有冒号前那段**以发送动作收尾**（发/敲/打/回/说/问…后最多十个非标点字）时才把它当
+# 叙述剥掉；「提醒：明天考试<sep/>别忘了」这种话里自带冒号的气泡不会被误切。
+_SEND_LEAD_IN = re.compile(
+    r'^(.*?(?:发|敲|打|回|输入|键入|写|说|道|问|补|丢|甩|戳|贴|私聊|艾特|@)[^，。！？!?：:\n]{0,10})[：:]\s*',
+    re.S,
+)
+_QUOTE_PAIRS = {'“': '”', '「': '」', '『': '』', '"': '"', '‘': '’'}
+
+
+def _strip_send_lead_in(paragraph: str, separator: str) -> str:
+    head = paragraph.split(separator, 1)[0]
+    match = _SEND_LEAD_IN.match(head)
+    # 太短的「冒号前」（「我说：」「跟你说：」）更像话本身，不剥。
+    return paragraph[match.end():].strip() if match and len(match.group(1)) >= 4 else paragraph
+
+
+def _strip_bubble_quotes(block: str, separator: str) -> str:
+    """叙述里引出的话常带引号（「“甲”<sep/>“乙”」）；成对的外层引号不属于发出的字。"""
+    parts = [part.strip() for part in block.split(separator)]
+    close = _QUOTE_PAIRS.get(parts[0][:1])
+    if close and len(parts) > 1 and parts[-1].endswith(close) and not parts[0].endswith(close):
+        # 一对引号包住了整个块：“甲<sep/>乙”
+        parts[0], parts[-1] = parts[0][1:].strip(), parts[-1][:-1].strip()
+    stripped = []
+    for part in parts:
+        close = _QUOTE_PAIRS.get(part[:1])
+        if close and len(part) > 2 and part.endswith(close):
+            part = part[1:-1].strip()
+        stripped.append(part)
+    if not all(stripped):
+        return block
+    return separator.join(stripped)
 
 
 def read_authored_actions(script: str) -> ReadAuthoredActionsResult:

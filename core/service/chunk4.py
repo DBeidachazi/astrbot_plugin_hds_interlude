@@ -1704,6 +1704,7 @@ class ServiceChunk4(ServiceBase):
             if main_available and not early_reply_committed:
                 decision, repaired = repair_missing_visible_reply(
                     decision, phase, group_context, bool(participant) and not group_context,
+                    str(_cfg(self.runtime_config, 'messageSeparator', '<sep/>')),
                 )
                 if repaired:
                     self.report_operation(
@@ -1754,6 +1755,17 @@ class ServiceChunk4(ServiceBase):
                         'Narrative provider crossed the live time boundary after one recovery attempt: %s'
                         % recovered_time_overflow,
                     )
+                if main_available and not early_reply_committed:
+                    # 重写稿犯同样的错（漏写 `<say>`）时同样可以无猜测地补齐，否则只能整套持久化重试。
+                    decision, repaired = repair_missing_visible_reply(
+                        decision, phase, group_context, bool(participant) and not group_context,
+                        str(_cfg(self.runtime_config, 'messageSeparator', '<sep/>')),
+                    )
+                    if repaired:
+                        self.report_operation(
+                            'standard', 'info', story, phase,
+                            '恢复稿省略了结构化回复字段，已按剧本补齐 类型=%s', repaired,
+                        )
                 if (
                     main_available and not early_reply_committed
                     and requires_visible_reply_recovery(phase, group_context, decision)

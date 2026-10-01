@@ -111,7 +111,9 @@ ctx = rc.narrative_context(now, tz)
 check(ctx['today']['status'] == 'school' and ctx['grade'] == '高二' and ctx['age'] == 17, ctx['today'])
 check('17:00放学' in ctx['dailyRoutine'] and '课间' in ctx['dailyRoutine'], ctx['dailyRoutine'])
 hol = rc.narrative_context(datetime(2026, 10, 2, 4, 0, tzinfo=timezone.utc), tz)
-check(hol['dailyRoutine'].startswith('休息日'), hol['dailyRoutine'])
+check(hol['dailyRoutine'].startswith('长假'), hol['dailyRoutine'])  # 国庆走长假专用说明
+wkd = rc.narrative_context(datetime(2026, 10, 18, 4, 0, tzinfo=timezone.utc), tz)  # 10/18 周日
+check(wkd['dailyRoutine'].startswith('休息日'), wkd['dailyRoutine'])
 nb = ctx['nextBreak']
 check(nb['from'] == '2026-10-01' and nb['to'] == '2026-10-07' and nb['startsInDays'] == 2 and '国庆节' in nb['name'], nb)
 check(ctx['gaokao']['dates'].startswith('2028-06-07') and ctx['gaokao']['daysLeft'] == (date(2028, 6, 7) - date(2026, 9, 29)).days, ctx['gaokao'])

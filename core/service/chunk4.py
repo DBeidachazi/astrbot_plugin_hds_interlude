@@ -96,6 +96,7 @@ from ..story_state import decode_story_state, encode_story_state, normalize_cont
 from ..time import dt_ms, format_log_time, iso, parse_dt, utc_now
 from ..turn_persistence import script_entry_draft_for_commit
 from ..urge import commit_urge, normalize_urge_state, urge_burst_active
+from .. import vitality
 from .base import ServiceBase, pick
 from .config import (
     TIMELINE_DIRECTOR_FUSE,
@@ -1357,6 +1358,20 @@ class ServiceChunk4(ServiceBase):
             request['quotedMessages'] = quoted_messages
         if sticker_catalog and phase == 'user-message':
             request['stickerCatalog'] = sticker_catalog
+        # 本地扩展：生活活力（防停滞 / 生活钩子 / 长线剧情）。停滞判定要看几个小时，
+        # 不能用按 60 分钟时间窗裁过的 recent_entries，单独取最近 40 条。
+        vitality_context = vitality.request_context(
+            story, decoded_state, phase, now, await self.recent_entries(story['id'], 40),
+        )
+        if vitality_context:
+            request['vitality'] = vitality_context
+            if vitality_context.get('lifeHooks') or vitality_context.get('lifeStagnation'):
+                self.report_operation(
+                    'standard', 'info', story, phase, '生活活力注入 钩子=%s 停滞=%s 主线=%s',
+                    '；'.join(item['event'] for item in vitality_context.get('lifeHooks') or []) or '无',
+                    safe_json_preview(vitality_context.get('lifeStagnation')) if vitality_context.get('lifeStagnation') else '无',
+                    '、'.join(item['title'] for item in vitality_context.get('activeArcs') or []) or '无',
+                )
         return _resync_dual(resolve_authored_actions(
             await self.narrator.decide(request), False, separator,
         ))
@@ -2038,6 +2053,12 @@ class ServiceChunk4(ServiceBase):
             state = state_before
             next_count = max(0, int(math.floor(state.get('narrative_update_count') or 0))) + 1
             next_state: dict[str, Any] = {**state, 'narrative_update_count': next_count}
+            # 本地扩展：回收生活钩子结果与长线剧情推进（读模型原始输出，归一化会丢掉这两个字段）。
+            vitality_state, vitality_logs = vitality.record_turn(story, state, phase, now, raw, script)
+            if vitality_state is not None:
+                next_state['extensions'] = {**(next_state.get('extensions') or {}), 'vitality': vitality_state}
+            for line in vitality_logs:
+                self.report_operation('standard', 'info', story, phase, '%s', line)
             # 原文与执行标注现在就提供连续性：第二份实时散文摘要不得为一次
             # 没有执行过的发送动作背书。
             if resolved_consequences or resolved_follow_ups:

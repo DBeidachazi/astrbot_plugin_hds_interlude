@@ -69,7 +69,7 @@ from datetime import datetime
 from typing import Any, Callable, Optional
 
 from ..script.life_handoff import entry_life_handoff
-from .. import real_calendar
+from .. import real_calendar, vitality
 from ..schedule_preplan import (
     apply_schedule_preplan_proposal,
     materialize_schedule_preplan,
@@ -496,13 +496,16 @@ class ServiceChunk7(ServiceBase):
         if not isinstance(rest_windows, list):
             rest_windows = DEFAULT_REST_WINDOWS
         in_rest = active_rest_window(rest_windows, _setting_timezone(story), anchor) is not None
-        follow_ups = [] if in_rest else _schedule_conversation_follow_ups(anchor, config)
+        # 本地扩展：她已经睡着了就不再每 10 分钟写一段「平稳熟睡」，直接排到睡眠块结束。
+        sleep_resume = await self.sleep_resume_at(story, anchor)
+        follow_ups = [] if (in_rest or sleep_resume) else _schedule_conversation_follow_ups(anchor, config)
         ordinary_next = (
             follow_ups[-1] if follow_ups
             else _ms_from_now(anchor, automatic_interval_minutes(story, anchor, config))
         )
         normal_next = (
             ordinary_next if follow_ups
+            else sleep_resume if sleep_resume
             else await self.schedule_preplan_anchored_time(story, anchor, ordinary_next)  # type: ignore[attr-defined]
         )
         patch = {
@@ -540,6 +543,9 @@ class ServiceChunk7(ServiceBase):
         next_advance_at = await self.schedule_preplan_anchored_time(  # type: ignore[attr-defined]
             story, now, ordinary_next,
         )
+        sleep_resume = await self.sleep_resume_at(story, now)
+        if sleep_resume and sleep_resume > next_advance_at:
+            next_advance_at = sleep_resume
         patch = {
             'quiet_until': None,
             'conversation_follow_up_at': [],
@@ -556,8 +562,17 @@ class ServiceChunk7(ServiceBase):
             '已设置下次自动推进 时间=%s 间隔=%d分钟%s',
             format_log_time(next_advance_at, _setting_timezone(story)),
             max(1, _js_round((dt_ms(next_advance_at) - dt_ms(now)) / MINUTE_MS)),
-            '（Schedule Preplan 锚点）' if next_advance_at < ordinary_next else '',
+            '（睡眠合并）' if sleep_resume and next_advance_at == sleep_resume
+            else '（Schedule Preplan 锚点）' if next_advance_at < ordinary_next else '',
         )
+
+    async def sleep_resume_at(self, story: Any, now: datetime) -> Optional[datetime]:
+        """本地扩展：她最近一段剧本已经睡着时，下一次推进的时刻（睡眠块结束）；否则 None。"""
+        try:
+            entries = await self.recent_entries(pick(story, 'id'), 6)  # type: ignore[attr-defined]
+            return vitality.sleep_resume_at(entries, now, _setting_timezone(story))
+        except Exception:  # noqa: BLE001 - 合并只是省调用，失败时退回常规节奏
+            return None
 
     async def schedule_preplan_anchored_time(
         self, story: Any, now: datetime, ordinary_next: datetime,

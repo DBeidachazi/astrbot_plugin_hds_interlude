@@ -84,10 +84,12 @@ from .helpers import (
     extract_session_file_facts,
     extract_session_voice_count,
     format_group_speaker,
+    is_record,
     narrative_cursor,
     normalize_group_chat_actions,
     normalize_group_visible_reply,
     normalize_participant_state,
+    safe_json_preview,
 )
 
 __all__ = ['ServiceChunk1']
@@ -1475,6 +1477,20 @@ class ServiceChunk1(ServiceBase):
                     _message_characters(self.runtime_config),
                     str(_config_limit(self.runtime_config, 'messageSeparator', 'message_separator', '<sep/>')),
                 )
+                # 落库的提交里已经有一条待投递的群消息事件、发送端却算出空内容：两条路径对
+                # 同一份决策读出了不同结论（2026-10-01 09:38/09:39/10:04 三轮都是这个形态——
+                # 账本里 group-message 一直 pending，群里却一个字没发）。以账本为准，它就是
+                # 已经落库、等着被投递的那件事；同时留一条可见记录，便于追查分歧来源。
+                commit_event = find_group_script_event(pick(persisted, 'commit')) if pick(persisted, 'commit') else None
+                commit_content = commit_event.get('content') if is_record(commit_event) else None
+                if not content and isinstance(commit_content, str) and commit_content.strip():
+                    self.report_operation(
+                        'standard', 'warn', current, 'user-message',
+                        '群回复内容与落库提交不一致，按提交投递 groupReply=%s interaction=%s',
+                        safe_json_preview(pick(decision, 'groupReply', 'group_reply')),
+                        safe_json_preview(pick(decision, 'interaction')),
+                    )
+                    content = commit_content
                 await self.db_set('interlude_story', {'id': pick(current, 'id')}, {
                     'cursorAt': snapshot['now'], 'updatedAt': self.now(),
                 })

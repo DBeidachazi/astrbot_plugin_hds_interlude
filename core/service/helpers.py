@@ -1283,8 +1283,27 @@ def repair_missing_visible_reply(decision: Any, phase: str, group_context: Any,
     actions = actions if isinstance(actions, list) else []
     leftover = inspect_say_markup(script)['leftover']
     if group_context:
-        if decision.get('interaction'):
-            return decision, ''
+        interaction = decision.get('interaction')
+        if interaction:
+            # 群聊里模型常把回复写进 interaction（甚至写成 reply.mode=none），却在剧本里裸写了
+            # 「……甩进群里：甲<sep/>乙」。`_has_structured_interaction` 会把 none 当成合法的
+            # 「不回」放行，于是她一言不发（2026-10-01 10:04 实测 group-fallback:none）。
+            # interaction 带着可投递内容时照旧走 group-fallback；否则只要没有像样的 groupReply，
+            # 就继续往下走裸气泡判断。
+            reply = interaction.get('reply') if is_record(interaction) else None
+            if (is_record(reply) and reply.get('mode') in ('immediate', 'delayed')
+                    and isinstance(reply.get('content'), str) and reply['content'].strip()):
+                return decision, ''
+            existing = pick(decision, 'groupReply', 'group_reply')
+            if _has_structured_group_reply_field(existing) and existing.get('mode') == 'immediate':
+                return decision, ''
+            if leftover or actions:
+                return decision, ''
+            block = sole_bubble_block(script, separator)
+            if not block:
+                return decision, ''
+            post = {'mode': 'immediate', 'content': block}
+            return {**decision, 'groupReply': post, 'group_reply': dict(post)}, 'group-bare-bubble'
         group_reply = pick(decision, 'groupReply', 'group_reply')
         if group_reply:
             # 模型写了 groupReply={"mode":"immediate","actionId":...} 却没有可用内容：驼峰

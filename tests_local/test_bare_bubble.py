@@ -65,6 +65,29 @@ for group_reply in ({'mode': 'immediate', 'actionId': 'reply'}, None):
     again = resolve({**repaired, 'group_reply': repaired['group_reply']}, False, SEP)
     check(again['group_reply'].get('content') == EXPECTED, '二次解析后内容应保留')
 
+# --- 群聊：模型把回复写进 interaction 且 mode=none / 引用失配（2026-10-01 10:04 实测）---
+for interaction in ({'seen': True, 'reply': {'mode': 'none'}},
+                    {'seen': True, 'reply': {'mode': 'none', 'actionId': 'reply'}},
+                    {'reply': {'mode': 'none'}}):
+    for group_reply in (None, {'mode': 'immediate', 'actionId': 'reply'}, {'mode': 'none'}):
+        raw = {'script': CASE, 'interaction': interaction}
+        if group_reply:
+            raw['groupReply'] = group_reply
+        decision = resolve(raw, False, SEP)
+        repaired, kind = repair(decision, 'user-message', GROUP, False, SEP)
+        check(kind == 'group-bare-bubble' and repaired['groupReply']['content'] == EXPECTED,
+              f'群聊 interaction={interaction} groupReply={group_reply} 应补齐，实际 {kind!r}')
+        check(helpers.visible_reply_mode(repaired, 'user-message', GROUP) == 'group:immediate',
+              '补齐后日志应显示 group:immediate')
+        check(helpers.normalize_group_visible_reply(
+            repaired.get('groupReply'), repaired.get('interaction'), 500, SEP) == EXPECTED, '发送端能取到内容')
+# interaction 已带可投递内容：照旧走 group-fallback，不改写。
+decision = {'script': CASE, 'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'content': '好呀'}}}
+check(repair(decision, 'user-message', GROUP, False, SEP)[1] == '', 'interaction 有内容时不动')
+# interaction=none 且剧本里没有裸气泡：真的不回，保持原样。
+decision = resolve({'script': '她看了一眼没回。', 'interaction': {'seen': True, 'reply': {'mode': 'none'}}}, False, SEP)
+check(repair(decision, 'user-message', GROUP, False, SEP)[1] == '', '真的不回保持沉默')
+
 # --- 私聊：interaction 缺失 / 声明了 actionId 却没写 say ---
 repaired, kind = repair(resolve({'script': CASE}, False, SEP), 'user-message', None, True, SEP)
 check(kind == 'private-bare-bubble' and repaired['interaction']['reply']['content'] == EXPECTED,

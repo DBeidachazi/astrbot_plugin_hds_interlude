@@ -43,6 +43,18 @@ from datetime import datetime, timedelta
 from typing import Any, Mapping, Optional, TypedDict
 
 from .time import dt_ms, iso, parse_dt, utc_now
+
+
+def _number(value: Any) -> float:
+    """上游 `Number(value)`（None → NaN，布尔 → 0/1，失败 → NaN）；与 service.helpers 同语义。"""
+    if value is None:
+        return float('nan')
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float('nan')
 from .types import (
     AgencyActivityLoad,
     AgencyConfig,

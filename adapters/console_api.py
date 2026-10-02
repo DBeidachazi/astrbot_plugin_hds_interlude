@@ -66,6 +66,7 @@ from .astrbot_bridge import (
     NESTED_MODEL_SECTIONS,
     PLUGIN_NAME,
     _plugin_version,
+    log_fallback,
 )
 
 __all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'CONTEXT_SECTION_LABELS', 'INTERNAL_INTENT_TYPES', 'mask_endpoint',

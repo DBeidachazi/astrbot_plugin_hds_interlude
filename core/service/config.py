@@ -252,6 +252,10 @@ def _desktop_timeline_track_for_entry(entry: Any) -> DesktopTimelineTrack:
     return 'system'
 
 
+#: `__all__` 登记的公开名（此前只有带下划线的实现，`from config import *` 会失败）。
+desktop_timeline_track_for_entry = _desktop_timeline_track_for_entry
+
+
 def parse_desktop_timeline_date(value: Any) -> Any:
     """上游 `parseDesktopTimelineDate`：只接受字符串，非法时间返回 `None`。"""
     if not isinstance(value, str):

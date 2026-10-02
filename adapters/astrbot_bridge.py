@@ -4420,7 +4420,7 @@ class AstrbotBridge:
                 try:
                     await recover()
                 except Exception as error:  # noqa: BLE001 - 启动路径绝不因为可选特性失败
-                    logger.warning('hds-interlude：共同作品恢复失败 %s' % error)
+                    log_fallback('warn', 'hds-interlude：共同作品恢复失败 %s', error)
             # v1.7.2 动作开关分组收敛（10 → 4）：把旧分组里用户写过的值折进新分组，
             # 写一次盘就再也没有新旧两份打架的可能。**必须在启动时做**（放在适配层的
             # 真实启动路径，同坑 68 的理由）：宿主在加载配置时已经按 schema 把新分组
@@ -4428,7 +4428,7 @@ class AstrbotBridge:
             try:
                 await self.migrate_legacy_action_sections()
             except Exception as error:  # noqa: BLE001 - 迁移失败不影响插件启动
-                logger.warning('hds-interlude：动作开关分组迁移失败 %s' % error)
+                log_fallback('warn', 'hds-interlude：动作开关分组迁移失败 %s', error)
             self.interlude_context.emit_ready()
             self._started = True
             missing = getattr(self.service, '_missing_chunks', ())
@@ -4546,7 +4546,7 @@ class AstrbotBridge:
             try:
                 stop_works()
             except Exception as error:  # noqa: BLE001 - 卸载路径绝不抛回宿主
-                logger.warning('hds-interlude：关闭共同作品失败 %s' % error)
+                log_fallback('warn', 'hds-interlude：关闭共同作品失败 %s', error)
         client = self._httpx_client
         self._httpx_client = None
         if client is not None:

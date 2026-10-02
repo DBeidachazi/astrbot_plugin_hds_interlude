@@ -35,7 +35,7 @@ import json
 import math
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import quote as _urlquote
 
 from .. import database as _database

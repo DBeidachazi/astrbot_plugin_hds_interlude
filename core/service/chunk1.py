@@ -79,6 +79,7 @@ from .base import (
     pick,
 )
 from .helpers import (
+    _turn_get,
     clip,
     describe_group_attachments,
     describe_quoted_message,

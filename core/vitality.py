@@ -208,6 +208,69 @@ def sleep_resume_at(entries: Any, now: datetime, tz: str) -> Optional[datetime]:
     return resume if resume > now else None
 
 
+# ---------------------------------------------------------------------------- 夜间免打扰
+
+#: 夜里仍会叫醒她的群消息：明显的紧急求助（@ / 引用她由调用方另行判断）。
+_URGENT = re.compile(r'紧急|急事|救命|出事了?|快醒醒|醒醒|快来人|报警|急急急|十万火急|SOS', re.IGNORECASE)
+#: 起床后的第一次自主回合最多带多少条夜间群消息原文。
+OVERNIGHT_MESSAGE_LIMIT = 15
+
+
+def is_urgent(text: str) -> bool:
+    return bool(text) and bool(_URGENT.search(text))
+
+
+def night_over(now: datetime, tz: str) -> bool:
+    """按钟点判断夜晚是否已经结束（过了当天睡眠块结束时刻、且还没到 20 点）。"""
+    local = now.astimezone(ZoneInfo(tz or 'Asia/Shanghai'))
+    end = sleep_block_end(local.date()) or time(7, 0)
+    return end <= local.time() and local.hour < 20
+
+
+def quiet_inbox_add(vitality_state: Any, count: int, now: datetime) -> dict[str, Any]:
+    """记一笔「睡着时没打扰她的群消息」（返回新的 vitality 状态）。"""
+    vitality = dict(vitality_state) if isinstance(vitality_state, dict) else {}
+    inbox = dict(vitality.get('sleep_inbox') or {})
+    stamp = now.astimezone(ZoneInfo('UTC')).isoformat().replace('+00:00', 'Z')
+    inbox['since'] = inbox.get('since') or stamp
+    inbox['last'] = stamp
+    inbox['count'] = int(inbox.get('count') or 0) + max(0, int(count))
+    vitality['sleep_inbox'] = inbox
+    return vitality
+
+
+def _speaker(entry: Any) -> str:
+    metadata = _get(entry, 'metadata')
+    if isinstance(metadata, str):
+        try:
+            import json
+            metadata = json.loads(metadata)
+        except ValueError:
+            metadata = None
+    return str(_get(metadata, 'senderName', 'sender_name') or _get(metadata, 'senderId', 'sender_id') or '群友')
+
+
+def overnight_context(vitality_state: Any, entries: Any, now: datetime, tz: str) -> Optional[dict[str, Any]]:
+    """夜晚结束后第一次自主回合要看到的 `overnightMessages`；没有积压时 None。"""
+    inbox = _get(vitality_state, 'sleep_inbox')
+    if not isinstance(inbox, dict) or not int(inbox.get('count') or 0) or not night_over(now, tz):
+        return None
+    since = _parse(inbox.get('since'))
+    zone = ZoneInfo(tz or 'Asia/Shanghai')
+    recent = []
+    for entry in entries if isinstance(entries, list) else []:
+        at = _parse(_get(entry, 'occurredAt', 'occurred_at'))
+        if _get(entry, 'kind') != 'group-message' or at is None or (since and at < since):
+            continue
+        recent.append({'atLocal': at.astimezone(zone).strftime('%H:%M'), 'speaker': _speaker(entry),
+                       'content': str(_get(entry, 'content') or '')[:200]})
+    return {
+        'count': int(inbox['count']),
+        'sinceLocal': since.astimezone(zone).strftime('%H:%M') if since else '',
+        'recent': recent[-OVERNIGHT_MESSAGE_LIMIT:],
+    }
+
+
 # ---------------------------------------------------------------------------- 请求 / 落库
 
 
@@ -253,6 +316,10 @@ def request_context(story: Any, story_state: Any, phase: str, now: datetime,
         if hooks:
             result['lifeHooks'] = life_hooks.prompt_hooks(hooks)
         result.update(story_arcs.context(_vitality_state(story_state).get('arcs'), local_day))
+        if phase in HOOK_PHASES:
+            overnight = overnight_context(_vitality_state(story_state), entries, now, tz)
+            if overnight:
+                result['overnightMessages'] = overnight
         return result
     except Exception:  # noqa: BLE001 - 活力机制绝不影响主叙事
         return {}
@@ -297,6 +364,10 @@ def record_turn(story: Any, story_state: Any, phase: str, now: datetime,
             logs.append('长线剧情 %s %s %s' % (change['id'], change['change'], change.get('stage') or change.get('title') or ''))
         if arcs:
             vitality['arcs'] = arcs
+        inbox = vitality.get('sleep_inbox')
+        if phase in HOOK_PHASES and isinstance(inbox, dict) and night_over(now, tz):
+            vitality.pop('sleep_inbox', None)  # 已在本回合的 overnightMessages 里交给她
+            logs.append('夜间群消息已在起床后交付 条数=%s' % inbox.get('count'))
         return (vitality if repr(vitality) != before else None), logs
     except Exception as error:  # noqa: BLE001
         return None, ['活力状态回收失败：%s' % error]

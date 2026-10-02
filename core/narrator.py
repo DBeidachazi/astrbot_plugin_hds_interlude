@@ -694,6 +694,41 @@ def resolve_http(source: Any) -> HttpClient:
 # ========== 提供者 ==========
 
 
+
+#: 本地修复：`chunk4.decide()` 按上游 wire format 用 camelCase 构造请求，而本模块按移植约定
+#: 读 snake_case。两侧对不上时 `alterEnabled` / `agencyEnabled` / `groupContext` /
+#: `schedulePreplan` / `outputRecovery` … 全部读成「没有」，系统提示词里对应的规则段落
+#: （情绪、行动窗口、群聊 groupReply 传输、重写纠错、日程用法、表情包、引用…）从未出现过。
+_REQUEST_KEY_ALIASES = (
+    ('alterEnabled', 'alter_enabled'),
+    ('agencyEnabled', 'agency_enabled'),
+    ('groupContext', 'group_context'),
+    ('schedulePreplan', 'schedule_preplan'),
+    ('outputRecovery', 'output_recovery'),
+    ('refreshContinuity', 'refresh_continuity'),
+    ('writingOptions', 'writing_options'),
+    ('chatCapabilities', 'chat_capabilities'),
+    ('stickerCatalog', 'sticker_catalog'),
+    ('quotedMessages', 'quoted_messages'),
+    ('urgeEnabled', 'urge_enabled'),
+    ('onEarlyReply', 'on_early_reply'),
+    ('recentEntries', 'recent_entries'),
+)
+
+
+def normalize_request_keys(request: Any) -> Any:
+    """返回一份两种拼写都齐全的请求浅拷贝（已有的值优先，绝不覆盖）。幂等。"""
+    if not isinstance(request, dict):
+        return request
+    result = dict(request)
+    for camel, snake in _REQUEST_KEY_ALIASES:
+        if result.get(snake) is None and result.get(camel) is not None:
+            result[snake] = result[camel]
+        elif result.get(camel) is None and result.get(snake) is not None:
+            result[camel] = result[snake]
+    return result
+
+
 class SilentNarrator:
     """空叙事提供者（上游 `SilentNarrator`）。"""
 
@@ -881,6 +916,7 @@ class OpenAICompatibleNarrator:
 
     async def decide(self, request: NarrativeRequest) -> NarrativeDecision:
         """主叙事调用：允许逐服务商重试与故障切换。"""
+        request = normalize_request_keys(request)
         # 一次失败不能让故事卡死在某个 endpoint。
         assigned = self._assigned_providers('main')
         main_model_id = effective_main_model_id(self.config)
@@ -959,6 +995,7 @@ class OpenAICompatibleNarrator:
         task: str = '主叙事',
     ) -> NarrativeDecision:
         """对单条连接发起一次主叙事请求（上游 `requestProvider`）。"""
+        request = normalize_request_keys(request)
         overrides = overrides or {}
         cache_first_payload = self.config.get('main_payload_order') == 'cache-first'
         usage_records = usages if usages is not None else []

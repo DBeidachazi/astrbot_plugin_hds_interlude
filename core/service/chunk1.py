@@ -66,6 +66,7 @@ from ..script.commit_builder import find_group_script_event
 from ..script.contract import message_event_reference
 from ..script.delivery_ledger import platform_action_reference
 from ..story_state import decode_story_state, encode_story_state
+from .. import vitality
 from ..types import empty_participant_state, empty_story_state
 from .base import (
     GROUP_SKIP_NOTE_INTERVAL_MS,
@@ -1342,6 +1343,7 @@ class ServiceChunk1(ServiceBase):
             rng=self.rng,
         )
         self.group_willingness[key] = willingness['state']
+        addressed = bool(turn.get('mentioned_bot')) or bool(turn.get('quoted_bot'))
         turn['mentioned_bot'] = False
         turn['quoted_bot'] = False
         if not willingness['should_call']:
@@ -1377,6 +1379,34 @@ class ServiceChunk1(ServiceBase):
             if not turn.get('messages') and not turn.get('timer'):
                 self.buffered_group_turns.pop(key, None)
             return
+        # 本地扩展：夜间免打扰。她已经睡着（且在睡眠时段）时，群消息照常入库但不调用主叙事；
+        # 起床后第一次自主回合通过 interval.overnightMessages 一次性看到。被 @ / 引用她、
+        # 或明显的紧急消息仍照常进入主叙事（醒不醒由她当下的状态决定）。
+        batch_text = '\n'.join(str(pick(item, 'content') or '') for item in batch)
+        if not addressed and not vitality.is_urgent(batch_text):
+            sleep_resume = await self.sleep_resume_at(story, self.now())
+            if sleep_resume is not None:
+                async def quiet_task() -> int:
+                    current = await self.get_story(story_id)
+                    state = decode_story_state(pick(current, 'state'))
+                    extensions = dict(state.get('extensions') or {})
+                    extensions['vitality'] = vitality.quiet_inbox_add(
+                        extensions.get('vitality'), len(batch), self.now(),
+                    )
+                    await self.db_set('interlude_story', {'id': story_id}, {
+                        'state': encode_story_state({**state, 'extensions': extensions}),
+                    })
+                    return int(extensions['vitality']['sleep_inbox']['count'])
+
+                total = await self.serial(story_id, quiet_task)
+                self.report_operation(
+                    'standard', 'info', story, 'user-message',
+                    '夜间免打扰：她已睡着，群消息已入库不调用主叙事 群=%s 本批=%d 累计=%d 预计起床=%s', group_id,
+                    len(batch), total, format_log_time(sleep_resume, pick(pick(story, 'setting') or {}, 'timezone') or 'Asia/Shanghai'),
+                )
+                if not turn.get('messages') and not turn.get('timer'):
+                    self.buffered_group_turns.pop(key, None)
+                return
         self.report_operation(
             'standard', 'info', story, 'user-message',
             '群聊消息准备进入主叙事 群=%s 模式=%s 意愿=%s', group_id,

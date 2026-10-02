@@ -1361,7 +1361,10 @@ class ServiceChunk1(ServiceBase):
             if not turn.get('messages') and not turn.get('timer'):
                 self.buffered_group_turns.pop(key, None)
             return
-        if await self.group_cooldown_active(
+        # 本地偏离：明确 @ 主角（意愿门判为 forced-mention）时不受群发言冷却约束。
+        # 冷却是为了压住她自己连续插话；被点名却因为 20~60 秒前刚说过话而整条丢弃
+        # （冷却期内的消息不排队），在群友看来就是「@ 了她不理人」。
+        if willingness.get('reason') != 'forced-mention' and await self.group_cooldown_active(
             pick(story, 'id'), group_id, _config_limit(rule, 'cooldownSeconds', 'cooldown_seconds', 1),
         ):
             self.report_operation(

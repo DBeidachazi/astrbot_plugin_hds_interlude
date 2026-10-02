@@ -2208,9 +2208,37 @@ class AstrbotBridge:
             bound = self.task_model_id(task)
             if bound:
                 log_fallback('info', '模型来源：%s → AstrBot Provider %s', task, bound)
-        for note in (self.image_capability_note(), self.audio_capability_note()):
+        for note in (self.image_capability_note(), self.audio_capability_note(), self.json_mode_note()):
             if note:
                 log_fallback('warn', '%s', note)
+
+    def json_mode_note(self) -> str:
+        """主叙事经 AstrBot Provider 调用时，JSON 模式实际不会生效；是则返回提醒，否则空串。
+
+        AstrBot 的 `llm_generate` 虽接受 `**kwargs`，OpenAI 类 Provider 组装请求时只放
+        `messages` / `model`，`response_format` 到不了模型——`json-object` 只剩提示词约束。
+        结构遵从较弱的模型（如 gemini-flash）会频繁整段省略 `interaction` / `groupReply`，
+        表现为「结构化可见回复缺失」重写乃至失败。直连连接池没有这个问题。
+        """
+        model = self.section('model')
+        if not isinstance(model, dict):
+            return ''
+        response_format = model.get('main_response_format', model.get('mainResponseFormat', 'json-object'))
+        if response_format != 'json-object':
+            return ''
+        via = self.task_model_id('main')
+        if not via:
+            rows = model.get('providers')
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict) or row.get('enabled') is False:
+                    continue
+                if row.get('use_for_main', row.get('useForMain', True)) and _text(row.get('endpoint')):
+                    return ''  # 有可用的直连主叙事连接：JSON 模式照常生效
+            via = self._resolved_chat_provider_id or '会话默认模型'
+        return (
+            '主叙事经 AstrBot Provider（%s）调用：AstrBot 不会把 JSON 模式转给模型，结构化输出只靠提示词约束；'
+            '若日志频繁出现「结构化可见回复缺失」，建议在「模型中心」连接池为同一模型配置直连' % via
+        )
 
     def audio_capability_note(self) -> str:
         """主叙事当前能不能吃音频；不能时返回一句给人看的话，否则空串。"""

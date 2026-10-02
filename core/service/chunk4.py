@@ -130,6 +130,7 @@ from .helpers import (
     normalize_timeline_plan,
     participant_relevance,
     pick_participant_state_patch,
+    repair_missing_visible_reply,
     requires_visible_reply_recovery,
     safe_json_preview,
     timeline_entry_prompt_projection,
@@ -1700,6 +1701,15 @@ class ServiceChunk4(ServiceBase):
             initial_time_overflow = detect_live_script_time_overflow(
                 _raw_decision(decision, 'script'), phase, from_, effective_now, timezone, endorsed_clocks,
             )
+            if main_available and not early_reply_committed:
+                decision, repaired = repair_missing_visible_reply(
+                    decision, phase, group_context, bool(participant) and not group_context,
+                )
+                if repaired:
+                    self.report_operation(
+                        'standard', 'info', story, phase,
+                        '模型省略了结构化回复字段，已按剧本补齐 类型=%s（跳过重写）', repaired,
+                    )
             initial_visible_recovery = (
                 main_available and not early_reply_committed
                 and requires_visible_reply_recovery(phase, group_context, decision)
@@ -1718,8 +1728,9 @@ class ServiceChunk4(ServiceBase):
                     actions = _raw_decision(decision, 'authoredActions') or []
                     self.report_operation(
                         'standard', 'warn', story, phase,
-                        '被抛弃草稿的结构化回复字段 interaction=%s 已解析动作=%d 残留say标记=%d 残留预览=%s',
+                        '被抛弃草稿的结构化回复字段 interaction=%s groupReply=%s 已解析动作=%d 残留say标记=%d 残留预览=%s',
                         safe_json_preview(_record(decision).get('interaction')),
+                        safe_json_preview(_raw_decision(decision, 'groupReply')),
                         len(actions) if isinstance(actions, list) else 0,
                         markup['leftover'], markup['preview'] or '(无)',
                     )
@@ -1799,6 +1810,14 @@ class ServiceChunk4(ServiceBase):
                 'warn', story, phase, '模型调用失败 任务=主叙事 耗时=%dms 错误=%s',
                 dt_ms(self.now()) - started_at, error,
             )
+            if not isinstance(error, ValueError):
+                # 契约类失败（ValueError）的原因已写在错误文本里；其它异常类型多半是
+                # 解析/归一化代码的缺陷，只有一行错误文本时无从定位，附上堆栈。
+                import traceback
+                self.report(
+                    'warn', story, phase, '主叙事异常堆栈（非契约错误）：%s',
+                    traceback.format_exc().replace('\n', ' | ')[-3000:],
+                )
             return {
                 'decision': {},
                 'succeeded': False,
@@ -1888,8 +1907,14 @@ class ServiceChunk4(ServiceBase):
                 now,
                 {'scope': participant_id or 'protagonist-life', 'boundary': phase == 'advance'},
             )
+        # 群聊用户回合没有 participant：模型把回复写进 interaction 时，按上游
+        # normalizeGroupVisibleReply 的本意回退成群回复，而不是生成一条无收件人的
+        # 私聊消息（那会被 ScriptCommit 校验以 "has no participant" 拒绝，整回合静默）。
+        group_user_turn = phase == 'user-message' and not participant_id
         group_reply_content = normalize_group_visible_reply(
-            _record(raw).get('groupReply'), None, max_message_characters, separator,
+            _record(raw).get('groupReply'),
+            _record(raw).get('interaction') if group_user_turn else None,
+            max_message_characters, separator,
         )
         commit = None
         if script:
@@ -1900,6 +1925,8 @@ class ServiceChunk4(ServiceBase):
                 'localMedia': _record(raw).get('localMedia'),
                 'nativeFace': _record(raw).get('nativeFace'),
             }
+            if group_user_turn and isinstance(commit_decision.get('interaction'), dict):
+                commit_decision['interaction'] = {**commit_decision['interaction'], 'reply': {'mode': 'none'}}
             commit = decision_to_script_commit({
                 'story_id': story['id'],
                 'participant_id': participant_id,

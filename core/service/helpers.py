@@ -1231,6 +1231,93 @@ def visible_reply_mode(decision: dict[str, Any], phase: str, group_context: Any 
     return '未提供或无效'
 
 
+def _sole_action(actions: list[Any]) -> Any:
+    """恰好一个、字段完整、内容非空的已解析 say 行动；否则 None。"""
+    if len(actions) != 1 or not is_record(actions[0]):
+        return None
+    only = actions[0]
+    if not isinstance(only.get('id'), str) or not isinstance(only.get('content'), str) or not only['content'].strip():
+        return None
+    return only
+
+
+def repair_missing_visible_reply(decision: Any, phase: str, group_context: Any,
+                                 has_private_participant: bool) -> tuple[Any, str]:
+    """本地偏离：模型整段省略传输字段时，能确定答案就直接补齐，不再白白重写一整份剧本。
+
+    gemini 一类模型经常把 `interaction` / `groupReply` 整个漏掉（不是写错，是没写）。
+    原先的处理是抛弃草稿、完整重写一次；重写仍失败则进入持久化重试。只有两种形态
+    能**不猜测**地补齐：
+
+    - 群聊用户回合、两个传输字段都缺失、没有残留标签：剧本里没有 `<say>` → 她没写下
+      要发的话，等价于 `groupReply.mode=none`；恰好一个 `<say>` → 它就是这次群发言。
+    - 私聊用户回合：`interaction` 缺失、没有跨对话行动、剧本里**恰好一个**已解析的
+      `<say>`——与 `sole_action_reply` 同一族假设：唯一的授权原话就是这条回复。
+
+    其余形态（多个 say、残留标签、已有字段但形状错误）保持原有重写路径。
+    返回 `(decision, 修复类型)`；未修复时类型为空串。
+    """
+    if phase != 'user-message' or not isinstance(decision, dict):
+        return decision, ''
+    from ..script.authored_actions import inspect_say_markup
+
+    def pick(record: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if record.get(key) is not None:
+                return record[key]
+        return None
+
+    script = pick(decision, 'script')
+    if not isinstance(script, str) or not script.strip():
+        # 连剧本都没有：多半是输出没解析出来。补齐传输字段只会让后面的「必须有剧本」
+        # 检查失败、整回合作废；交还给原有的重写路径才有机会拿到完整输出。
+        return decision, ''
+    actions = pick(decision, 'authoredActions', 'authored_actions')
+    actions = actions if isinstance(actions, list) else []
+    leftover = inspect_say_markup(script)['leftover']
+    if group_context:
+        if decision.get('interaction'):
+            return decision, ''
+        group_reply = pick(decision, 'groupReply', 'group_reply')
+        if group_reply:
+            # 模型写了 groupReply={"mode":"immediate","actionId":...} 却没有可用内容：驼峰
+            # 键不经过 say 引用解析，或 id 照抄了协议示例。按 id 找到对应 say；找不到时
+            # 仅当剧本里恰好一个 say 才认它（与私聊 sole_action_reply 同一族兜底）。
+            if not is_record(group_reply) or group_reply.get('mode') != 'immediate':
+                return decision, ''
+            if isinstance(group_reply.get('content'), str) and group_reply['content'].strip():
+                return decision, ''
+            wanted = group_reply.get('actionId', group_reply.get('action_id'))
+            target = next((item for item in actions if is_record(item) and item.get('id') == wanted
+                           and isinstance(item.get('content'), str) and item['content'].strip()), None)
+            target = target or _sole_action(actions)
+            if target is None:
+                return decision, ''
+            post = {**group_reply, 'actionId': target['id'], 'content': target['content']}
+            return {**decision, 'groupReply': post, 'group_reply': dict(post)}, 'group-reply-bound'
+        if leftover:
+            return decision, ''
+        if not actions:
+            silent = {'mode': 'none'}
+            return {**decision, 'groupReply': silent, 'group_reply': dict(silent)}, 'group-silent'
+        only = _sole_action(actions)
+        if only is None:
+            return decision, ''
+        post = {'mode': 'immediate', 'actionId': only['id'], 'content': only['content']}
+        return {**decision, 'groupReply': post, 'group_reply': dict(post)}, 'group-sole-say'
+    if not has_private_participant or decision.get('interaction'):
+        return decision, ''
+    if pick(decision, 'crossConversationActions', 'cross_conversation_actions'):
+        return decision, ''
+    if leftover:
+        return decision, ''
+    only = _sole_action(actions)
+    if only is None:
+        return decision, ''
+    reply = {'mode': 'immediate', 'actionId': only['id'], 'content': only['content']}
+    return {**decision, 'interaction': {'seen': True, 'reply': reply}}, 'private-sole-say'
+
+
 def _has_structured_group_reply(decision: dict[str, Any]) -> bool:
     return _has_structured_group_reply_field(decision.get('groupReply')) or _has_structured_interaction(
         decision.get('interaction'))

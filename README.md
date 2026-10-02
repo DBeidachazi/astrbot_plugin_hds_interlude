@@ -317,7 +317,23 @@ AstrBot 的命令名不能带点，所以上游的 `interlude.memory.facts` 在�
 - 漏写 `<say>` 的裸气泡兜底；群聊 `interaction.reply=none` 时的投递修复。
 - 生活活力（`core/vitality.py` / `core/life_hooks.py` / `core/story_arcs.py`）：作息降级为默认安排、聊天转计划、防停滞提示、睡眠合并推进、生活钩子、长线剧情、夜间群消息免打扰。
 - 修复主叙事请求 camelCase / snake_case 键名不一致：此前 Alter、Agency、群聊 `groupReply` 传输说明、重写纠错等提示词段落从未注入。
-- 测试：`tests_local/`（本地扩展）；上游 `tests/` 通过 `tests/conftest.py` 关闭本地扩展后运行。已知：开启现实日历时，`main_payload_order=cache-first` 的可缓存前缀比例会下降（`interval.realCalendar` 位于不可缓存尾部），默认的 `legacy` 顺序不受影响。
+- 测试：`tests_local/`（本地扩展）；上游 `tests/` 通过 `tests/conftest.py` 关闭本地扩展后运行；全部由 GitHub Actions 执行（见「测试与 CI」）。已知：开启现实日历时，`main_payload_order=cache-first` 的可缓存前缀比例会下降（`interval.realCalendar` 位于不可缓存尾部），默认的 `legacy` 顺序不受影响。
+
+## 测试与 CI
+
+全量测试在 **GitHub Actions** 上跑（`.github/workflows/ci.yml`），每次推送任意分支、每个 PR 都会触发，同一分支的新推送会取消旧的运行。三个并行任务，Python 3.12（与生产 AstrBot 容器一致）：
+
+| 任务 | 内容 |
+| --- | --- |
+| 依赖与语法检查 | `pip check`；`compileall` 全部 Python 文件；`ruff --select E9,F63,F7,F82`（语法错误、未定义名称、`__all__` 里的不存在名称） |
+| 上游测试套件 | `pytest tests`（约 2700 个用例）。`tests/conftest.py` 把本地扩展（现实日历 / 生活钩子 / 长线剧情）指向关闭的临时配置，上游用例只验证上游行为 |
+| 本地扩展测试 | `tests_local/test_*.py` 逐个运行；仓库检出到 `astrbot_plugin_hds_interlude/` 目录，以包名导入 |
+
+工作流：
+
+1. 在分支上开发，推送到 GitHub，等 CI 变绿；本机不再跑全量测试。
+2. 部署脚本（`plugin-patches/deploy_*.sh`）只在生产容器里跑一遍 `tests_local`（几秒），作为上线前的冒烟检查，失败自动回滚。
+3. 需要在本地复现时：`pip install -r requirements.txt pytest && python -m pytest tests -q`；本地扩展测试见上表的运行方式。
 
 ## 常见问题
 

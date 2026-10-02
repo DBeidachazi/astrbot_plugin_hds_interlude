@@ -1,0 +1,91 @@
+name: CI
+
+# 每次推送任意分支、每个 PR 都跑；同一分支的新推送会取消旧的运行。
+# 生产容器只在部署时跑 tests_local（几秒），全量测试交给这里。
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.12'   # 与生产 AstrBot 容器一致
+  TZ: Asia/Shanghai        # 与生产容器一致；定时命令（cron）按本机时区计算
+
+jobs:
+  lint:
+    name: 依赖与语法检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt ruff
+      - name: 依赖一致性（pip check）
+        run: pip check
+      - name: 全部 Python 文件可编译
+        run: python -m compileall -q -x '(^|/)(\.git|frontend|node_modules)/' .
+      - name: 语法错误与未定义名称（ruff E9/F63/F7/F82）
+        run: ruff check --no-cache --select E9,F63,F7,F82 --output-format github .
+
+  upstream-tests:
+    name: 上游测试套件（tests/）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          # pillow 是可选运行依赖（缺了就透传原图），生产由 AstrBot 自带；测试里要用到。
+          pip install -r requirements.txt pytest pillow
+      - name: pytest
+        # tests/conftest.py 会把本地扩展（现实日历 / 生活钩子 / 长线剧情）指向关闭的临时配置，
+        # 上游用例只验证上游行为；-X faulthandler 让段错误留下线程栈。
+        run: python -X faulthandler -m pytest tests -q -p no:cacheprovider
+
+  local-tests:
+    name: 本地扩展测试（tests_local/）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # tests_local 以「包名」导入插件：检出到与生产相同的目录名，并把工作区根放进 PYTHONPATH。
+      - uses: actions/checkout@v4
+        with:
+          path: astrbot_plugin_hds_interlude
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: astrbot_plugin_hds_interlude/requirements.txt
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r astrbot_plugin_hds_interlude/requirements.txt pillow
+      - name: tests_local
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -e
+          for t in astrbot_plugin_hds_interlude/tests_local/test_*.py; do
+            echo "::group::$t"
+            python -X faulthandler "$t" astrbot_plugin_hds_interlude
+            echo "::endgroup::"
+          done

@@ -892,7 +892,21 @@ class Database:
         self.close()
 
     def close(self) -> None:
-        """关闭连接（幂等）。"""
+        """关闭连接（幂等）。
+
+        本地修复：必须拿同一把连接锁。否则主线程关连接时，线程池里正在执行的
+        `all()` 等操作会在 sqlite3 的 C 层撞上已释放的连接，整个进程 Segmentation
+        fault（上游测试套件全量运行时间歇复现，栈在 `all` ← `close`）。拿锁后关闭
+        会等在途操作结束；之后再来的调用拿到 `conn=None`，只抛普通 Python 异常。
+        """
+        lock = getattr(self, '_lock', None)
+        if lock is None:
+            self._close_unlocked()
+            return
+        with lock:
+            self._close_unlocked()
+
+    def _close_unlocked(self) -> None:
         conn = getattr(self, 'conn', None)
         if conn is None:
             return

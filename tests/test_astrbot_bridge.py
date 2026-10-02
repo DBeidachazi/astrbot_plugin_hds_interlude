@@ -2506,8 +2506,11 @@ class ModelCapabilitySelfCheckTests(unittest.TestCase):
         bridge = self._bridge_with('main-provider', ['text', 'image', 'audio'])
         with mock.patch.object(bridge_module, 'log_fallback') as logged:
             asyncio.run(bridge.log_model_capabilities())
+        # 本地补丁（0001）：主叙事经 AstrBot Provider 调用时，JSON 模式实际不会生效，启动时
+        # 固定提醒一次；除这条之外仍必须安静。
+        warnings = [item for item in logged.call_args_list if item.args and item.args[0] == 'warn']
         self.assertEqual(
-            [item for item in logged.call_args_list if item.args and item.args[0] == 'warn'], [],
+            [item for item in warnings if 'JSON 模式' not in str(item.args[2:])], [],
         )
 
     def test_status_line_reports_the_missing_capability(self):

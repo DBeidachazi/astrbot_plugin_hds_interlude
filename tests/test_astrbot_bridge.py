@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 import asyncio
 import json
 import os
@@ -1135,8 +1136,23 @@ class DeliveryCoordinateTests(unittest.TestCase):
                          'default:FriendMessage:2106758890')
 
 
+def _reset_shared_data_dir():
+    """清掉共享测试数据目录里的投递坐标落盘表。
+
+    `TEST_DATA_DIR` 是全模块共用的：某个用例 `remember_event()` 写下的
+    `delivery_endpoints.json` 会被之后新建的 bridge 读回，把后面的用例路由到前一个用例的
+    平台实例（`IncomingImageByteTests` → `ForwardMessageReadTests` 整文件运行时必挂，
+    单独运行却通过）。每个 bridge 都从干净目录起步，用例之间互不影响。
+    """
+    try:
+        os.remove(os.path.join(TEST_DATA_DIR, 'delivery_endpoints.json'))
+    except FileNotFoundError:
+        pass
+
+
 def _make_bridge(config=None, context=None):
     """构造一个不落盘的 `AstrbotBridge`。"""
+    _reset_shared_data_dir()
     fake_db = FakeDatabase(':memory:')
     with mock.patch.object(bridge_module, 'Database', lambda path: fake_db), \
             mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: TEST_DATA_DIR):
@@ -1151,6 +1167,7 @@ def _make_bridge(config=None, context=None):
 
 def _make_plugin(config=None, context=None):
     """构造一个不落盘的 `HDSInterludePlugin`。"""
+    _reset_shared_data_dir()
     fake_db = FakeDatabase(':memory:')
     with mock.patch.object(bridge_module, 'Database', lambda path: fake_db), \
             mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: TEST_DATA_DIR):

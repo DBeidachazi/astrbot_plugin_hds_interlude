@@ -28,6 +28,7 @@ import random
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+import sys
 from unittest import mock
 
 from plugin.core import logging as core_logging
@@ -640,8 +641,11 @@ class PureHelperTests(unittest.TestCase):
     def test_httpx_client_is_imported_lazily_so_the_core_stays_dependency_free(self):
         client = HttpxHttpClient()
         self.assertIsNone(client._client)
-        with self.assertRaises(RuntimeError) as ctx:
-            client._ensure_client()
+        # httpx 在 requirements.txt 里，装了依赖的环境（CI、生产容器）都能导入；
+        # 用 sys.modules 占位模拟「没装 httpx」，验证的是缺依赖时给出明确错误。
+        with mock.patch.dict(sys.modules, {'httpx': None}):
+            with self.assertRaises(RuntimeError) as ctx:
+                client._ensure_client()
         self.assertIn('httpx', str(ctx.exception))
         self.assertEqual(ZHIPU_FIRST_VISIBLE_TOKEN_TIMEOUT, 45_000)
 

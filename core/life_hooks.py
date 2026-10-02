@@ -35,6 +35,11 @@ MAX_PER_TURN = 2
 
 DEFAULT_CONFIG: dict[str, Any] = {
     'enabled': True,
+    # 牌库钩子与世界事件（合并模式）共享的每日交付上限；聊天种子另算 seed_daily_cap。
+    'daily_total_cap': 3,
+    'seed_daily_cap': 2,
+    # 世界播种器开启时，把它的事件并进钩子通道（贴合人设的提示词、记录反应、可开主线）。
+    'merge_seeder': True,
     # 每天的小波澜数量上限（实际在 1..daily_minor 之间抽）。
     'daily_minor': 2,
     # 每 7 天最多几个中等事件；有余额时每天按概率尝试一次。
@@ -255,7 +260,9 @@ def due_hooks(story_id: str, now: datetime, category: str, tz: str,
 
 def prompt_hooks(hooks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """发给模型的形状。"""
-    return [{'id': item['id'], 'event': item['event'], **({'cast': item['cast']} if item['cast'] else {})}
+    return [{'id': item['id'], 'event': item['event'],
+             **({'cast': item['cast']} if item.get('cast') else {}),
+             **({'guide': item['guide']} if item.get('guide') else {})}
             for item in hooks]
 
 

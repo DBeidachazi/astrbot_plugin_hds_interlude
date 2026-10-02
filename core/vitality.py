@@ -14,7 +14,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from . import life_hooks, story_arcs
+from . import life_hooks, life_seeds, story_arcs
 
 #: 这些阶段会注入钩子（自主生活回合）；回复回合不被打断。
 HOOK_PHASES = ('advance', 'conversation-follow-up')
@@ -289,20 +289,50 @@ def _story_id(story: Any) -> str:
     return str(_get(story, 'id') or '')
 
 
-def turn_hooks(story: Any, story_state: Any, phase: str, now: datetime) -> list[dict[str, Any]]:
-    """本回合要注入的钩子（decide 与 persist 用同一个函数，结果一致）。"""
+def seeder_merge_enabled() -> bool:
+    """世界播种器事件是否并进钩子通道（生活钩子开着且 merge_seeder=True）。"""
+    try:
+        cfg = life_hooks.load_config()
+        return bool(cfg.get('enabled', True) and cfg.get('merge_seeder', True))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def turn_hooks(story: Any, story_state: Any, phase: str, now: datetime,
+               world_rows: Any = None) -> list[dict[str, Any]]:
+    """本回合要注入的钩子（decide 与 persist 用同一个函数，结果一致）。
+
+    三个来源按优先级合并：聊天种子（用户种下的事，另有每日上限）→ 世界事件（合并模式）→
+    牌库钩子；世界事件与牌库共享 `daily_total_cap`，每回合最多 `life_hooks.MAX_PER_TURN` 个。
+    """
     if phase not in HOOK_PHASES:
+        return []
+    cfg = life_hooks.load_config()
+    if not cfg.get('enabled', True):
         return []
     tz = _story_tz(story)
     local_day = now.astimezone(ZoneInfo(tz)).date()
-    return life_hooks.due_hooks(
-        _story_id(story), now, calendar_category(local_day), tz,
-        _vitality_state(story_state).get('hooks'),
-    )
+    vitality = _vitality_state(story_state)
+    history = vitality.get('hooks') if isinstance(vitality.get('hooks'), dict) else {}
+    hooks: list[dict[str, Any]] = []
+    if life_seeds.today_count(history, local_day, ('seed',)) < int(cfg.get('seed_daily_cap', 2) or 0):
+        hooks += life_seeds.due_seed_hooks(vitality.get('seeds'), now, 1)
+    room = min(life_hooks.MAX_PER_TURN - len(hooks),
+               int(cfg.get('daily_total_cap', 3) or 0)
+               - life_seeds.today_count(history, local_day, ('minor', 'medium', 'world')))
+    if room > 0 and world_rows and seeder_merge_enabled():
+        found = life_seeds.world_hooks(world_rows, now, history, room)
+        hooks += found
+        room -= len(found)
+    if room > 0:
+        hooks += life_hooks.due_hooks(
+            _story_id(story), now, calendar_category(local_day), tz, history,
+        )[:room]
+    return hooks
 
 
 def request_context(story: Any, story_state: Any, phase: str, now: datetime,
-                    entries: Any) -> dict[str, Any]:
+                    entries: Any, world_rows: Any = None) -> dict[str, Any]:
     """主叙事请求里 `interval` 要加的字段。"""
     try:
         tz = _story_tz(story)
@@ -312,7 +342,7 @@ def request_context(story: Any, story_state: Any, phase: str, now: datetime,
         stagnation = life_stagnation(entries, now, tz, category)
         if stagnation:
             result['lifeStagnation'] = stagnation
-        hooks = turn_hooks(story, story_state, phase, now)
+        hooks = turn_hooks(story, story_state, phase, now, world_rows)
         if hooks:
             result['lifeHooks'] = life_hooks.prompt_hooks(hooks)
         result.update(story_arcs.context(_vitality_state(story_state).get('arcs'), local_day))
@@ -320,14 +350,57 @@ def request_context(story: Any, story_state: Any, phase: str, now: datetime,
             overnight = overnight_context(_vitality_state(story_state), entries, now, tz)
             if overnight:
                 result['overnightMessages'] = overnight
+        else:
+            echo = life_seeds.echoes(_vitality_state(story_state).get('seeds'), now)
+            if echo:
+                result['seedEchoes'] = echo
         return result
     except Exception:  # noqa: BLE001 - 活力机制绝不影响主叙事
+        return {}
+
+
+def seeder_context(story: Any, story_state: Any, now: datetime) -> dict[str, Any]:
+    """合并模式下给世界播种器的额外输入：日型、聊天种子、主线、最近的钩子。"""
+    try:
+        tz = _story_tz(story)
+        local_day = now.astimezone(ZoneInfo(tz)).date()
+        vitality = _vitality_state(story_state)
+        arcs_state = vitality.get('arcs') if isinstance(vitality.get('arcs'), dict) else {}
+        arcs_ctx = story_arcs.context(arcs_state, local_day)
+        available = [
+            {'id': arc['id'], 'title': arc.get('title', arc['id']), 'opening': arc['stages'][0]}
+            for arc in story_arcs.load_config().get('arcs') or []
+            if isinstance(arc, dict) and arc.get('id') and arc.get('stages') and arc['id'] not in arcs_state
+        ]
+        history = vitality.get('hooks') if isinstance(vitality.get('hooks'), dict) else {}
+        recent = sorted(
+            (record for record in history.values() if isinstance(record, dict)),
+            key=lambda record: str(record.get('at') or ''), reverse=True,
+        )[:10]
+        return {
+            'dayType': calendar_category(local_day),
+            'chatSeeds': life_seeds.open_seed_digest(vitality.get('seeds')),
+            'activeArcs': [
+                {'id': arc['id'], 'title': arc['title'], 'stage': arc['stage'], 'nextBeat': arc['nextBeat']}
+                for arc in arcs_ctx.get('activeArcs') or []
+            ],
+            'availableArcs': available,
+            'recentLifeHooks': [str(record.get('event') or '') for record in recent if record.get('event')],
+        }
+    except Exception:  # noqa: BLE001
         return {}
 
 
 def record_turn(story: Any, story_state: Any, phase: str, now: datetime,
                 raw_decision: Any, script: str) -> tuple[Optional[dict[str, Any]], list[str]]:
     """落库时回收钩子结果与主线推进。返回 `(新的 vitality 状态或 None, 日志行)`。"""
+    state, logs, _world = record_turn_full(story, story_state, phase, now, raw_decision, script)
+    return state, logs
+
+
+def record_turn_full(story: Any, story_state: Any, phase: str, now: datetime, raw_decision: Any,
+                     script: str, world_rows: Any = None) -> tuple[Optional[dict[str, Any]], list[str], list[Any]]:
+    """`record_turn` 的完整版：另外返回本回合交付掉的世界事件行 id（调用方负责标记 injected）。"""
     try:
         tz = _story_tz(story)
         local_day = now.astimezone(ZoneInfo(tz)).date()
@@ -336,13 +409,25 @@ def record_turn(story: Any, story_state: Any, phase: str, now: datetime,
         before = repr(vitality)
         logs: list[str] = []
 
-        delivered = turn_hooks(story, story_state, phase, now)
+        delivered = turn_hooks(story, story_state, phase, now, world_rows)
         if delivered:
             outcomes = _get(raw_decision, 'hookOutcomes', 'hook_outcomes')
             vitality['hooks'] = life_hooks.record_outcomes(vitality.get('hooks'), delivered, outcomes, now, tz)
             for hook in delivered:
                 record = vitality['hooks'][hook['id']]
                 logs.append('生活钩子 %s 结果=%s 事件=%s' % (hook['id'], record['outcome'], hook['event']))
+            by_id = {item['id']: item for item in outcomes if isinstance(item, dict) and isinstance(item.get('id'), str)} \
+                if isinstance(outcomes, list) else {}
+            if any(hook.get('seed_id') for hook in delivered):
+                vitality['seeds'] = life_seeds.settle_seeds(vitality.get('seeds'), delivered, by_id, now)
+
+        # 聊天种子：这一回合聊天里种下、她之后可能真去做的事。
+        cast = life_seeds.cast_names(_get(_get(story, 'setting'), 'supporting_cast', 'supportingCast'))
+        drafts = life_seeds.normalize_seeds(_get(raw_decision, 'lifeSeeds', 'life_seeds'), cast, now)
+        if drafts:
+            vitality['seeds'], added = life_seeds.add_seeds(vitality.get('seeds'), drafts, now, tz)
+            for seed in added:
+                logs.append('聊天种子 %s 来自=%s 立场=%s 内容=%s' % (seed['kind'], seed['from'], seed['stance'], seed['what']))
 
         arcs = vitality.get('arcs') if isinstance(vitality.get('arcs'), dict) else {}
         for hook in delivered:
@@ -368,6 +453,7 @@ def record_turn(story: Any, story_state: Any, phase: str, now: datetime,
         if phase in HOOK_PHASES and isinstance(inbox, dict) and night_over(now, tz):
             vitality.pop('sleep_inbox', None)  # 已在本回合的 overnightMessages 里交给她
             logs.append('夜间群消息已在起床后交付 条数=%s' % inbox.get('count'))
-        return (vitality if repr(vitality) != before else None), logs
+        world_ids = [hook['row_id'] for hook in delivered if hook.get('row_id') is not None]
+        return (vitality if repr(vitality) != before else None), logs, world_ids
     except Exception as error:  # noqa: BLE001
-        return None, ['活力状态回收失败：%s' % error]
+        return None, ['活力状态回收失败：%s' % error], []

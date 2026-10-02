@@ -1204,7 +1204,10 @@ class ServiceChunk4(ServiceBase):
         # 上游 1.0.1-rc23/rc26：到点世界事件在**本回合开始前**排水注入，于是它们本回合
         # 就出现在 recentScript 里（先进账、后写作）。`low` 只在非 user-message 相位
         # 排水，免得一条无关紧要的背景事件劫持对话回合。
-        if getattr(self, 'world_seeder_available', None) and self.world_seeder_available():
+        # 本地扩展：合并模式下世界事件改走生活钩子通道（共享每日预算、记录她的反应、可开主线），
+        # 不再直接写成 `[世界事件]` 剧本条目；未合并时保持上游排水。
+        seeder_on = bool(getattr(self, 'world_seeder_available', None) and self.world_seeder_available())
+        if seeder_on and not vitality.seeder_merge_enabled():
             await self.drain_due_seeded_events(story, now, phase != 'user-message')
         runtime = self.runtime_config
         shared = self.shared_story_config
@@ -1530,6 +1533,7 @@ class ServiceChunk4(ServiceBase):
         # 不能用按 60 分钟时间窗裁过的 recent_entries，单独取最近 40 条。
         vitality_context = vitality.request_context(
             story, decoded_state, phase, now, await self.recent_entries(story['id'], 40),
+            await self._merged_world_rows(story),
         )
         if vitality_context:
             request['vitality'] = vitality_context
@@ -1549,6 +1553,17 @@ class ServiceChunk4(ServiceBase):
         return _resync_dual(resolve_authored_actions(
             await self.narrator.decide(request), False, separator,
         ))
+
+    async def _merged_world_rows(self, story: Any) -> list[dict[str, Any]]:
+        """合并模式下交给生活钩子的世界事件行（播种器没开或未合并时为空）。"""
+        if not vitality.seeder_merge_enabled():
+            return []
+        if not (getattr(self, 'world_seeder_available', None) and self.world_seeder_available()):
+            return []
+        try:
+            return list(await self._seeded_event_rows(story['id']))
+        except Exception:  # noqa: BLE001 - 读不到就当没有，绝不影响主叙事
+            return []
 
     async def _backfill_quoted_messages(
         self, story: Any, quoted_messages: Any, entries: list[dict[str, Any]],
@@ -2307,9 +2322,14 @@ class ServiceChunk4(ServiceBase):
             next_count = max(0, int(math.floor(state.get('narrative_update_count') or 0))) + 1
             next_state: dict[str, Any] = {**state, 'narrative_update_count': next_count}
             # 本地扩展：回收生活钩子结果与长线剧情推进（读模型原始输出，归一化会丢掉这两个字段）。
-            vitality_state, vitality_logs = vitality.record_turn(story, state, phase, now, raw, script)
+            vitality_state, vitality_logs, world_ids = vitality.record_turn_full(
+                story, state, phase, now, raw, script, await self._merged_world_rows(story),
+            )
             if vitality_state is not None:
                 next_state['extensions'] = {**(next_state.get('extensions') or {}), 'vitality': vitality_state}
+            for row_id in world_ids:
+                # 合并模式：世界事件已作为钩子交给她，标记为已注入（也计入播种器的每日上限）。
+                await self.db_set('interlude_seeded_event', {'id': row_id}, {'status': 'injected', 'updatedAt': now})
             for line in vitality_logs:
                 self.report_operation('standard', 'info', story, phase, '%s', line)
             # 原文与执行标注现在就提供连续性：第二份实时散文摘要不得为一次

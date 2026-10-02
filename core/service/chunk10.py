@@ -35,6 +35,8 @@ from ..world_seeder import (
     validate_seed_event,
     world_seeder_system_prompt,
 )
+from .. import vitality
+from ..world_seeder import seed_event_extras, slice_of_life_domain, slice_of_life_seeder_prompt
 from .base import ServiceBase, pick
 
 __all__ = ['ServiceChunk10']
@@ -139,7 +141,10 @@ class ServiceChunk10(ServiceBase):
                     len(scheduled), runtime['max_pending'], len(last24), runtime['daily_cap'],
                 )
                 return
-            domain = seed_domain_for_run(story_id, now, int(runtime['cadence_minutes']))
+            merged = vitality.seeder_merge_enabled()
+            domain = (slice_of_life_domain if merged else seed_domain_for_run)(
+                story_id, now, int(runtime['cadence_minutes']),
+            )
             system, user = await self._build_world_seeder_payload(story, now, rows, domain, runtime)
             try:
                 raw = await self.narrator.generate_world_seeds(system, user, runtime)  # type: ignore[attr-defined]
@@ -154,13 +159,14 @@ class ServiceChunk10(ServiceBase):
             if not self.task_generation_current(story_id, generation):
                 return
             drafts = parse_world_seed_events(raw)
+            extras = seed_event_extras(raw) if merged else {}
             if not drafts:
                 self.report_operation(  # type: ignore[attr-defined]
                     'diagnostic', 'debug', story, 'advance', '世界播种器本轮无事件',
                 )
                 return
             await self._persist_world_seed_drafts(
-                story, now, drafts, rows, scheduled, last24, runtime,
+                story, now, drafts, rows, scheduled, last24, runtime, extras,
             )
         except Exception as error:  # noqa: BLE001 - 后台任务失败绝不外抛
             self.report_standalone('warn', '世界播种器运行失败 错误=%s', error)  # type: ignore[attr-defined]
@@ -176,6 +182,7 @@ class ServiceChunk10(ServiceBase):
         scheduled: list[dict[str, Any]],
         last24: list[dict[str, Any]],
         runtime: dict[str, Any],
+        extras: Optional[dict[str, dict[str, str]]] = None,
     ) -> None:
         """逐条走频控 + 校验闸后入库（上游 `worldSeederSweep` 的尾段）。"""
         story_id = pick(story, 'id')
@@ -213,7 +220,13 @@ class ServiceChunk10(ServiceBase):
                     'expiresAt': draft.get('expiresAt'),
                     'status': STATUS_SCHEDULED,
                     'subjects': draft.get('subjects') or [],
-                    'sourcePayload': {'rationale': draft.get('rationale') or ''},
+                    'sourcePayload': {
+                        'rationale': draft.get('rationale') or '',
+                        # 合并模式的附加字段（主线 id / 她可能的反应）。上游解析器可能规范化 summary，
+                        # 对不上时，单条输出就直接用那一条的附加字段。
+                        **((extras or {}).get(str(draft['summary']).strip())
+                           or (next(iter((extras or {}).values())) if len(extras or {}) == 1 else {})),
+                    },
                     'createdAt': now, 'updatedAt': now,
                 })
             except Exception as error:  # noqa: BLE001 - 一条失败不影响其余
@@ -376,10 +389,12 @@ class ServiceChunk10(ServiceBase):
                 'characterProfile': str(pick(pick(setting, 'character') or {}, 'profile') or '')[:600],
                 'world': str(pick(setting, 'world') or '')[:800],
                 'location': str(pick(setting, 'location') or '')[:300],
-                'supportingCast': str(pick(setting, 'supportingCast', 'supporting_cast') or '')[:400],
+                # 本地修复：400 字会截掉配角表后半（7 人配角约 600+ 字），放宽到 1200。
+                'supportingCast': str(pick(setting, 'supportingCast', 'supporting_cast') or '')[:1200],
             },
-            'currentScene': '',
-            'currentArc': '',
+            # 本地修复：上游这里恒为空串（提示词却声称会给场景与弧线摘要）。
+            'currentScene': str(pick(await self.active_scene(story_id) or {}, 'summary') or '')[:400],  # type: ignore[attr-defined]
+            'currentArc': str(pick(await self.active_arc(story_id) or {}, 'summary') or '')[:400],  # type: ignore[attr-defined]
             'recentEstablishedLife': recent_life,
             'workingDetails': working_details,
             'blockedNames': blocked,
@@ -393,6 +408,9 @@ class ServiceChunk10(ServiceBase):
                 'note': 'BLOCKED NAMES are off-limits; offline channels only; most runs return empty events.',
             },
         }
+        if vitality.seeder_merge_enabled():
+            payload.update(vitality.seeder_context(story, state, now))
+            return slice_of_life_seeder_prompt(domain), _json.dumps(payload, ensure_ascii=False)
         return world_seeder_system_prompt(domain), _json.dumps(payload, ensure_ascii=False)
 
 

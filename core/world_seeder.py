@@ -47,6 +47,10 @@ __all__ = [
     'validate_seed_event',
     'world_seeder_system_prompt',
     'season_for_month',
+    'SLICE_OF_LIFE_DOMAINS',
+    'slice_of_life_domain',
+    'slice_of_life_seeder_prompt',
+    'seed_event_extras',
 ]
 
 
@@ -502,3 +506,77 @@ def season_for_month(month: int) -> str:
     if 9 <= month <= 11:
         return 'autumn'
     return 'winter'
+
+
+# ── 本地扩展：轻小说校园日常口径（与生活钩子合并模式） ───────────────────────
+#
+# 上游的提示词与切面是「任意世界观」的通用版，产出常是「小区停水通知」这类真实但没有
+# 叙事推动力的事件。合并模式（生活钩子开启且 merge_seeder=True）改用下面这套：
+# 切面换成高中生活的六个侧面（与上游同一套确定性轮换，只换内容），提示词要求事件
+# 具体、有画面、带一个她可以回应的小钩子，可以动用配角、接住聊天种子、推一把主线。
+# 上游函数与常量保持逐字不动（上游测试逐字比对）。
+
+SLICE_OF_LIFE_DOMAINS: List[Dict[str, str]] = [
+    {'key': 'campus', 'label': '校园与同学', 'brief': '课堂、社团、班级活动、同学之间的小事、老师的安排'},
+    {'key': 'home', 'label': '家与家人', 'brief': '爸妈的安排与心血来潮、家里的小变化、煤球的动静'},
+    {'key': 'friends', 'label': '朋友与约定', 'brief': '苏棠等线下朋友的邀约、分享、小插曲'},
+    {'key': 'neighborhood', 'label': '街区与城市', 'brief': '小区、街角小店、公园、城市里的活动与季节限定'},
+    {'key': 'hobby', 'label': '兴趣与爱好', 'brief': '吉他、追番、音游、画画、看书带来的小机会或小挫折'},
+    {'key': 'chance', 'label': '小意外与际遇', 'brief': '捡到的东西、偶遇、天气突变、身体的小状况、意外的善意'},
+]
+
+
+def slice_of_life_domain(story_id: str, slot_start: datetime, cadence_minutes: int) -> Dict[str, str]:
+    """与上游 `seed_domain_for_run` 同一个槽位，换成校园日常切面。"""
+    upstream = seed_domain_for_run(story_id, slot_start, cadence_minutes)
+    index = next((i for i, item in enumerate(WORLD_SEED_DOMAINS) if item['key'] == upstream['key']), 0)
+    return SLICE_OF_LIFE_DOMAINS[index % len(SLICE_OF_LIFE_DOMAINS)]
+
+
+_SLICE_OF_LIFE_PROMPT_LINES: List[str] = [
+    'You are the event seeder for a warm slice-of-life light novel whose heroine is the protagonist. Your only job is to occasionally originate one small, vivid thing that happens to her offline world.',
+    'You will receive: local time, season and day type (school / weekend / holiday / break), the story’s world setting and supporting cast, current scene and arc summaries, her recent established life, her working details, chatSeeds (things people in her chats recently suggested to her), her active and available story arcs, recently delivered life hooks and recently seeded events, and BLOCKED NAMES.',
+    'Rules:',
+    '- Make it a scene, not a news item: concrete, sensory, local, with a small hook she can respond to (an invitation, a choice, a tiny problem, a delight). Avoid dry notices unless something human comes with them.',
+    '- Her supporting cast are real people in her offline life and may appear (classmates, family, friends, neighbors, shopkeepers). Keep their established personalities and relationships.',
+    '- NEVER generate events about BLOCKED NAMES or anyone she knows only online. Offline channels only: in person, phone calls, notes, deliveries, weather, public events.',
+    '- chatSeeds may echo offline: a friend also wants to try the recommended shop, the shop has a new item, a song is playing in a store. Never turn an online acquaintance’s invitation into a real meeting.',
+    '- You may nudge a story arc: set "arc" to an id from activeArcs when the event advances that thread, or from availableArcs when it naturally opens that thread. Leave it out otherwise.',
+    '- Fit the day: school days have class hours, holidays are free; respect the calendar, season and her established life; never contradict what already happened, and do not repeat recently delivered hooks or seeded events.',
+    '- Place the event at a concrete future time within the allowed horizon, in an ordinary gap of her day.',
+    '- Importance: low = texture and small delights (most events); medium = a small practical change or a choice; high = relationship-relevant or disruptive (rare).',
+    'Most runs should return an empty events array; when you do return one, make it worth a scene. Output at most 1 event.',
+    'Output one JSON object only: {"events":[{"summary":"one vivid Chinese sentence of what happens","importance":"low|medium|high","occursAt":"ISO-8601 with offset","expiresAt":"optional ISO-8601","subjects":["offline people involved"],"response":"optional short Chinese note on how she might respond","arc":"optional arc id","rationale":"short reason this fits now"}]}',
+]
+
+
+def slice_of_life_seeder_prompt(domain: Optional[Dict[str, Any]] = None) -> str:
+    """合并模式的播种器提示词；`domain` 给出时追加本轮切面。"""
+    lines = list(_SLICE_OF_LIFE_PROMPT_LINES)
+    if domain:
+        lines.insert(len(lines) - 2, '- THIS RUN’S SLICE OF HER LIFE: %s — %s. Originate this run’s event from this slice only; '
+                     'if nothing genuine fits right now, return an empty array.' % (domain.get('label', ''), domain.get('brief', '')))
+    return '\n'.join(lines)
+
+
+def seed_event_extras(value: Any) -> Dict[str, Dict[str, str]]:
+    """从模型原始输出里取合并模式的附加字段，按 summary 对齐：`{summary: {arc, response}}`。
+
+    上游 `parse_world_seed_events` 只保留上游字段（且有逐字测试），这里单独读，互不影响。
+    """
+    record = value if isinstance(value, dict) else {}
+    events = record.get('events') if isinstance(record.get('events'), list) else []
+    extras: Dict[str, Dict[str, str]] = {}
+    for raw in events:
+        if not isinstance(raw, dict) or not isinstance(raw.get('summary'), str):
+            continue
+        item: Dict[str, str] = {}
+        arc = raw.get('arc')
+        if isinstance(arc, str) and 0 < len(arc.strip()) <= 64:
+            item['arc'] = arc.strip()
+        response = raw.get('response')
+        if isinstance(response, str) and response.strip():
+            item['response'] = response.strip()[:120]
+        if item:
+            extras[raw['summary'].strip()] = item
+    return extras

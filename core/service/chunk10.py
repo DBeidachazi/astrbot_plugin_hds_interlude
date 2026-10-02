@@ -324,6 +324,17 @@ class ServiceChunk10(ServiceBase):
         """
         return await self.db_get('interlude_seeded_event', {'storyId': story_id})  # type: ignore[attr-defined]
 
+    async def _seeder_summary(self, getter: str, story_id: str) -> str:
+        """当前场景 / 弧线摘要（本地修复：上游恒给空串）。取不到就给空串，绝不影响播种。"""
+        method = getattr(self, getter, None)
+        if not callable(method):
+            return ''
+        try:
+            record = await method(story_id)
+        except Exception:  # noqa: BLE001
+            return ''
+        return str(pick(record or {}, 'summary') or '')[:400]
+
     def _world_seeder_blocked_names(self, story_id: str) -> list[str]:
         """上游 `BLOCKED NAMES`：参与者 displayName（trim 后长度 ≥ 2）。"""
         names: list[str] = []
@@ -393,8 +404,8 @@ class ServiceChunk10(ServiceBase):
                 'supportingCast': str(pick(setting, 'supportingCast', 'supporting_cast') or '')[:1200],
             },
             # 本地修复：上游这里恒为空串（提示词却声称会给场景与弧线摘要）。
-            'currentScene': str(pick(await self.active_scene(story_id) or {}, 'summary') or '')[:400],  # type: ignore[attr-defined]
-            'currentArc': str(pick(await self.active_arc(story_id) or {}, 'summary') or '')[:400],  # type: ignore[attr-defined]
+            'currentScene': await self._seeder_summary('active_scene', story_id),
+            'currentArc': await self._seeder_summary('active_arc', story_id),
             'recentEstablishedLife': recent_life,
             'workingDetails': working_details,
             'blockedNames': blocked,

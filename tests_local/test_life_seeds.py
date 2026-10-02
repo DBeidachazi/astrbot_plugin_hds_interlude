@@ -217,7 +217,7 @@ class FakeSeederService:
         self.ops.append(args)
 
 
-for name in ('_build_world_seeder_payload', '_persist_world_seed_drafts', '_world_seeder_blocked_names'):
+for name in ('_build_world_seeder_payload', '_persist_world_seed_drafts', '_world_seeder_blocked_names', '_seeder_summary'):
     setattr(FakeSeederService, name, getattr(chunk10.ServiceChunk10, name))
 long_cast = CAST + '\n' + '\n'.join('· 配角%d：很长的描述' % i + '啊' * 40 for i in range(40))
 seeder_story = {'id': 'seed-story', 'setting': {'timezone': TZ, 'supporting_cast': long_cast,

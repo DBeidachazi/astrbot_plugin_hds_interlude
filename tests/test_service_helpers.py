@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import unittest
+import zlib
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -543,6 +544,207 @@ class StickerVisionHelperTests(unittest.TestCase):
         self.assertRegex(h.stable_sticker_asset_id('bq (6).png', hash_a), r'aaaaaaaaaaaaaaaa$')
 
 
+class StickerGuessHelperTests(unittest.TestCase):
+    """第二层判据的纯函数（本移植版新增，受控偏离 `§45.7`）。
+
+    这一层只在**便宜**这一侧正确才有意义：宽高要能在不引入 Pillow 的前提下读出来，
+    明显不像表情包的图要在调模型之前被挡掉，而"收不收"的阈值只有一处。
+    """
+
+    def test_image_dimensions_are_read_from_the_header_of_the_four_allowed_formats(self):
+        self.assertEqual(h.guess_image_dimensions(png(320, 200)), (320, 200))
+        self.assertEqual(h.guess_image_dimensions(png(320, 200, color_type=6)), (320, 200))
+        self.assertEqual(h.guess_image_dimensions(gif(96, 64)), (96, 64))
+        self.assertEqual(h.guess_image_dimensions(jpeg(640, 480)), (640, 480))
+        self.assertEqual(h.guess_image_dimensions(webp_vp8x(300, 200)), (300, 200))
+        self.assertEqual(h.guess_image_dimensions(webp_vp8(120, 90)), (120, 90))
+        self.assertEqual(h.guess_image_dimensions(webp_vp8l(64, 48)), (64, 48))
+
+    def test_unparsable_or_unknown_bytes_have_no_dimensions(self):
+        for label, payload in (
+            ('空字节', b''),
+            ('None', None),
+            ('纯文本', b'this is not an image at all, really'),
+            ('只有魔数的残缺 PNG', b'\x89PNG\r\n\x1a\n' + b'x' * 4),
+            ('没有 SOF 的 JPEG', b'\xff\xd8' + b'\xff\xd9'),
+            ('VP8X 但没有尺寸字段', b'RIFF\x10\x00\x00\x00WEBPVP8X\x04\x00\x00\x00\x00\x00\x00\x00'),
+        ):
+            with self.subTest(label=label):
+                self.assertIsNone(h.guess_image_dimensions(payload))
+
+    def test_the_prefilter_only_rejects_what_clearly_is_not_a_sticker(self):
+        # 近方形 + 两边都小 = 表情包的典型尺寸。
+        self.assertTrue(h.sticker_guess_candidate(png(120, 120), 'image/png'))
+        self.assertTrue(h.sticker_guess_candidate(png(512, 400, color_type=2), 'image/png'))
+        # 大图 / 长宽比明显像照片或截图 → 不值得问模型。
+        self.assertFalse(h.sticker_guess_candidate(png(2000, 1500, color_type=2), 'image/png'))
+        self.assertFalse(h.sticker_guess_candidate(png(800, 300, color_type=2), 'image/png'))
+        self.assertFalse(h.sticker_guess_candidate(jpeg(1920, 1080), 'image/jpeg'))
+        # 解析不出宽高 = 拿不准 = 不花钱。
+        self.assertFalse(h.sticker_guess_candidate(b'\x89PNG\r\n\x1a\n' + b'x' * 40, 'image/png'))
+        self.assertFalse(h.sticker_guess_candidate(None, 'image/png'))
+
+    def test_gifs_and_transparent_pngs_are_always_candidates(self):
+        # 聊天里 GIF 几乎只当动图 / 表情用，哪怕它是张大图。
+        self.assertTrue(h.sticker_guess_candidate(gif(800, 600), 'image/gif'))
+        # 透明底是表情的典型特征：色彩类型 4 / 6 与 tRNS 三种都要认。
+        self.assertTrue(h.sticker_guess_candidate(png(900, 900, color_type=6), 'image/png'))
+        self.assertTrue(h.sticker_guess_candidate(png(900, 900, color_type=4), 'image/png'))
+        self.assertTrue(h.sticker_guess_candidate(png(900, 900, color_type=2, trns=True), 'image/png'))
+        # 不透明的大 PNG 仍然被挡（alpha 才放行）。
+        self.assertFalse(h.sticker_guess_candidate(png(900, 900, color_type=2), 'image/png'))
+
+    def test_the_name_signal_is_the_platform_name_only(self):
+        """名字信号（§49.1）：**方括号包起来的平台命名**才算，`[图片]` 占位不算。
+
+        它是唯一"不用字节"的结构信号，也是候选档（`sub_type` 2/3/7）在入站时能判的那一半。
+        """
+        self.assertEqual(h.sticker_media_signal(name='[中午好]'), h.STICKER_SIGNAL_NAME)
+        self.assertEqual(h.sticker_media_signal(name='[动画表情]'), h.STICKER_SIGNAL_NAME)
+        # `[图片]` 是普通图占位（NapCat 对 picSubType=0 写的就是它）—— 不算名字。
+        self.assertEqual(h.sticker_media_signal(name='[图片]'), h.STICKER_SIGNAL_NONE)
+        for value in ('中午好', '[中午好', '中午好]', '[]', '', None, '[图片] x', 'x[图片]'):
+            with self.subTest(name=value):
+                self.assertEqual(h.sticker_media_signal(name=value), h.STICKER_SIGNAL_NONE)
+        # 名字与字节信号各自独立：缺名字时尺寸仍然照判。
+        self.assertEqual(h.sticker_media_signal(mime_type='image/gif', data=b''), h.STICKER_SIGNAL_GIF)
+
+    def test_the_prefilter_delegates_to_the_shared_signal(self):
+        """第二层预筛就是共享信号函数的薄包装（§49.1：一份实现两处用）。"""
+        for payload, mime in (
+            (png(120, 120), 'image/png'),
+            (gif(800, 600), 'image/gif'),
+            (png(2000, 1500, color_type=2), 'image/png'),
+            (png(900, 900, color_type=6), 'image/png'),
+        ):
+            with self.subTest(mime=mime):
+                self.assertEqual(
+                    h.sticker_guess_candidate(payload, mime),
+                    bool(h.sticker_media_signal(mime_type=mime, data=payload)),
+                )
+
+    def test_the_internal_candidate_kind_is_normalized_on_the_wire(self):
+        """候选档是**内部**状态：出 wire 一律变普通图，提示词只认那 5 个值（§49.1）。"""
+        self.assertEqual(h.wire_media_kind(h.STICKER_CANDIDATE_KIND), 'image')
+        for kind in ('image', 'sticker', 'animated', 'market', 'card'):
+            with self.subTest(kind=kind):
+                self.assertEqual(h.wire_media_kind(kind), kind)
+        # 外部写法原样透传（不许多管闲事），空值回落到普通图。
+        self.assertEqual(h.wire_media_kind('photo'), 'photo')
+        self.assertEqual(h.wire_media_kind(''), 'image')
+        self.assertEqual(h.wire_media_kind(None), 'image')
+        self.assertNotIn(h.STICKER_CANDIDATE_KIND, h.WIRE_MEDIA_KINDS)
+
+    def test_acceptance_needs_a_confident_boolean_yes(self):
+        accepted = h.sticker_guess_result({
+            'is_sticker': True, 'kind': 'meme', 'confidence': 0.85, 'description': '  一只猫  ',
+        })
+        self.assertEqual(accepted, {
+            'is_sticker': True, 'kind': 'meme', 'confidence': 0.85, 'description': '一只猫',
+        })
+        # 阈值是启发式常量：正好在阈值上算通过。
+        self.assertIsNotNone(h.sticker_guess_result(
+            {'is_sticker': True, 'confidence': h.GUESS_STICKER_MIN_CONFIDENCE},
+        ))
+        rejected = [
+            ('判成照片', {'is_sticker': False, 'kind': 'photo', 'confidence': 0.99}),
+            ('置信度不够', {'is_sticker': True, 'confidence': 0.59}),
+            ('缺 confidence', {'is_sticker': True, 'kind': 'meme'}),
+            ('confidence 不是数', {'is_sticker': True, 'confidence': '0.9'}),
+            ('confidence 是布尔', {'is_sticker': True, 'confidence': True}),
+            ('is_sticker 是字符串', {'is_sticker': 'true', 'confidence': 0.99}),
+            ('is_sticker 是 1（不是布尔）', {'is_sticker': 1, 'confidence': 0.99}),
+            ('空对象', {}),
+            ('不是对象', 'not json'),
+            ('None', None),
+            ('列表', [1, 2]),
+        ]
+        for label, value in rejected:
+            with self.subTest(label=label):
+                self.assertIsNone(h.sticker_guess_result(value), label)
+
+    def test_unknown_kinds_fall_back_to_other_and_camel_case_aliases_are_read(self):
+        # `kind` 只做白名单归一，**不参与**收不收的判断。
+        self.assertEqual(h.sticker_guess_result(
+            {'is_sticker': True, 'kind': 'Meme!!!', 'confidence': 0.7},
+        )['kind'], 'other')
+        self.assertEqual(h.sticker_guess_result(
+            {'is_sticker': True, 'kind': 'caption_photo', 'confidence': 0.7},
+        )['kind'], 'caption_photo')
+        # 中转站改写了键名也认（本仓库读外部输入一律双读）。
+        accepted = h.sticker_guess_result({'isSticker': True, 'confidence': 0.7})
+        self.assertEqual(accepted['description'], '', '没给描述就是空串（调用方据此走描述流程）')
+
+    def test_the_heuristic_constants_are_the_documented_ones(self):
+        self.assertEqual(h.GUESS_STICKER_KIND, 'image')
+        self.assertEqual(h.GUESS_STICKER_MAX_DIMENSION, 512)
+        self.assertEqual(h.GUESS_STICKER_MAX_ASPECT, 1.6)
+        self.assertEqual(h.GUESS_STICKER_MIN_CONFIDENCE, 0.6)
+        self.assertEqual(h.STICKER_GUESS_KINDS, (
+            'meme', 'reaction', 'caption_photo', 'photo', 'screenshot', 'other',
+        ))
+
+
+def png(
+    width: int, height: int, color_type: int = 2, trns: bool = False,
+) -> bytes:
+    """一张结构合法的 PNG（宽高真的写在 `IHDR` 里）。"""
+    ihdr = (
+        width.to_bytes(4, 'big') + height.to_bytes(4, 'big') + bytes([8, color_type, 0, 0, 0])
+    )
+    body = _chunk(b'IHDR', ihdr)
+    if trns:
+        body += _chunk(b'tRNS', b'\x00' * 6)
+    body += _chunk(b'IDAT', b'') + _chunk(b'IEND', b'')
+    return b'\x89PNG\r\n\x1a\n' + body
+
+
+def _chunk(name: bytes, data: bytes) -> bytes:
+    return len(data).to_bytes(4, 'big') + name + data + zlib.crc32(name + data).to_bytes(4, 'big')
+
+
+def gif(width: int, height: int) -> bytes:
+    """一张 GIF：逻辑屏幕描述符里带宽高（小端 16 位）。"""
+    return b'GIF89a' + width.to_bytes(2, 'little') + height.to_bytes(2, 'little') + b'\x00' * 8
+
+
+def jpeg(width: int, height: int) -> bytes:
+    """一张 JPEG：`SOI` + `APP0` + `SOF0`（尺寸就在 SOF 里）。"""
+    app0 = b'\xff\xe0' + (16).to_bytes(2, 'big') + b'JFIF\x00' + b'\x00' * 9
+    sof = (
+        b'\xff\xc0' + (17).to_bytes(2, 'big') + b'\x08'
+        + height.to_bytes(2, 'big') + width.to_bytes(2, 'big') + b'\x03' + b'\x00' * 9
+    )
+    return b'\xff\xd8' + app0 + sof + b'\xff\xd9'
+
+
+def _webp(chunk: bytes) -> bytes:
+    body = b'WEBP' + chunk
+    return b'RIFF' + len(body).to_bytes(4, 'little') + body
+
+
+def webp_vp8x(width: int, height: int) -> bytes:
+    """扩展格式：画布尺寸是 24 位小端的「宽-1 / 高-1」。"""
+    payload = b'\x00' * 4 + (width - 1).to_bytes(3, 'little') + (height - 1).to_bytes(3, 'little')
+    return _webp(b'VP8X' + len(payload).to_bytes(4, 'little') + payload)
+
+
+def webp_vp8(width: int, height: int) -> bytes:
+    """有损格式：帧头起始码之后的两个 16 位（有效 14 位）。"""
+    payload = (
+        b'\x00\x00\x00' + b'\x9d\x01\x2a'
+        + width.to_bytes(2, 'little') + height.to_bytes(2, 'little') + b'\x00' * 4
+    )
+    return _webp(b'VP8 ' + len(payload).to_bytes(4, 'little') + payload)
+
+
+def webp_vp8l(width: int, height: int) -> bytes:
+    """无损格式：签名 0x2F + 位打包的（宽-1, 高-1）各 14 位。"""
+    bits = (width - 1) | ((height - 1) << 14)
+    payload = b'\x2f' + bits.to_bytes(4, 'little')
+    return _webp(b'VP8L' + len(payload).to_bytes(4, 'little') + payload)
+
+
 class GroupIdentityTests(unittest.TestCase):
     """`upstream/test/group-identity.test.ts` 的纯函数用例。"""
 
@@ -745,6 +947,317 @@ class LexicalScoreTests(unittest.TestCase):
         self.assertFalse(c.should_request_turn_embedding({'enabled': False}, True, 99))
         self.assertFalse(c.should_request_turn_embedding(None, True, 99))
 
+
+
+class RecallFusionTests(unittest.TestCase):
+    """v1.4.0 召回融合：本地查询改写 + 两路排名融合（`docs/MEMORY_MAINTENANCE.md` §5.2）。"""
+
+    CONFIG = {
+        'semanticWeight': 1.0, 'factImportanceWeight': 0.35, 'factConfidenceWeight': 0.2,
+        'factRecencyWeight': 0.2, 'unresolvedWeight': 0.2,
+    }
+
+    def _fact(self, fact_id, content, importance=0.5, embedding=None, scope='world'):
+        return {
+            'id': fact_id, 'content': content, 'importance': importance, 'confidence': 0.5,
+            'scope': scope, 'unresolved': False, 'embedding': embedding or [],
+            # 用"现在"当 lastSeenAt，让新近项确定性地取满分（评分用的是真实时钟）。
+            'lastSeenAt': h.iso(h.utc_now()),
+        }
+
+    def test_rewrite_strips_scaffolding_and_question_particles(self):
+        cases = {
+            '你还记得我上次说的那个面包店吗': '我上次说的面包店',
+            '你记不记得那本书呢': '那本书',
+            '我上次跟你说的那家店': '那家店',
+            '今天天气怎么样': '今天天气样',
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(h.rewrite_recall_query(text), expected)
+
+    def test_rewrite_keeps_short_or_unusable_queries(self):
+        for text in ('猫', '冰美式', '', '   '):
+            with self.subTest(text=text):
+                self.assertEqual(h.rewrite_recall_query(text), text.strip())
+
+    def test_ranks_share_ties(self):
+        self.assertEqual(h._ranks([1.0, 0.5, 0.5, 0.0]), [1, 2, 2, 4])
+        self.assertEqual(h._ranks([]), [])
+
+    def test_an_irrelevant_fact_earns_no_lane_credit(self):
+        facts = [self._fact(1, '主人喜欢喝冰美式', 0.3, [1.0, 0.0]),
+                 self._fact(2, '她养了一只叫团子的猫', 0.95, [0.0, 1.0])]
+        lanes = h.fact_lane_scores(facts, self.CONFIG, [1.0, 0.0], '你还记得冰美式吗')
+        self.assertAlmostEqual(lanes[0]['lexicalRrf'], 1.0, places=6)
+        self.assertAlmostEqual(lanes[0]['semanticRrf'], 1.0, places=6)
+        self.assertEqual(lanes[1]['lexicalRrf'], 0.0, '零重合不该靠"排最后一名"白拿分')
+        self.assertEqual(lanes[1]['semanticRrf'], 0.0)
+        scores = [h.fact_hybrid_score(fact, self.CONFIG, lane) for fact, lane in zip(facts, lanes)]
+        self.assertGreater(scores[0], scores[1], '重要度不该压过两路都命中的事实')
+
+    def test_rank_multiplier_rewards_the_better_ranked_lane(self):
+        facts = [self._fact(1, '面包店周一不开门'), self._fact(2, '面包店里的猫叫团子')]
+        lanes = h.fact_lane_scores(facts, self.CONFIG, [], '面包店周一')
+        self.assertEqual(lanes[0]['lexicalRank'], 1)
+        self.assertGreater(lanes[0]['lexicalRrf'], lanes[1]['lexicalRrf'])
+
+    def test_absent_lane_contributes_nothing(self):
+        facts = [self._fact(1, '主人喜欢喝冰美式')]
+        lanes = h.fact_lane_scores(facts, self.CONFIG, [], '')
+        self.assertIsNone(lanes[0]['lexicalRank'])
+        self.assertIsNone(lanes[0]['semanticRank'])
+        self.assertEqual(lanes[0]['lexicalRrf'], 0.0)
+        self.assertEqual(lanes[0]['semanticRrf'], 0.0)
+        # 没有查询可用时，排序完全由结构分决定（与上游一致）。
+        self.assertAlmostEqual(
+            h.fact_hybrid_score(facts[0], self.CONFIG, lanes[0]),
+            h.fact_structural_score(facts[0], self.CONFIG), places=9,
+        )
+
+    def test_rewritten_query_only_helps(self):
+        content = '那家面包店周一不开门'
+        plain = h.history_lexical_score('你还记得我上次说的那个面包店吗', content)
+        lanes = h.fact_lane_scores([self._fact(1, content)], self.CONFIG, [], '你还记得我上次说的那个面包店吗')
+        self.assertGreater(lanes[0]['lexicalScore'], plain)
+        self.assertGreaterEqual(lanes[0]['lexical'], 0.0)
+        with_rewrite = h.fact_lane_scores([self._fact(1, content)], self.CONFIG, [],
+                                          '你还记得我上次说的那个面包店吗', rewrite=False)
+        self.assertEqual(with_rewrite[0]['lexicalScore'], with_rewrite[0]['lexical'])
+
+    def test_structural_score_matches_upstream_when_no_relevance(self):
+        fact = self._fact(1, '任意内容', importance=0.8)
+        fact['confidence'] = 0.6
+        expected = (
+            0.8 * 0.35 + 0.6 * 0.2 + 1.0 * 0.2
+        )
+        self.assertAlmostEqual(h.fact_structural_score(fact, self.CONFIG), expected, places=9)
+
+    def test_an_open_promise_keeps_its_structural_bonus(self):
+        promise = self._fact(1, '答应回电话', importance=0.1, scope='promise')
+        promise['unresolved'] = True
+        plain = self._fact(2, '答应回电话', importance=0.1, scope='promise')
+        self.assertGreater(
+            h.fact_structural_score(promise, self.CONFIG),
+            h.fact_structural_score(plain, self.CONFIG),
+        )
+
+
+class ImageHashTests(unittest.TestCase):
+    """图片感知哈希与去重（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）。"""
+
+    @staticmethod
+    def _png(kind: str) -> bytes:
+        import io as _io
+
+        from PIL import Image, ImageDraw
+
+        image = Image.new('L', (64, 64), 0)
+        draw = ImageDraw.Draw(image)
+        if kind == 'bar':
+            draw.rectangle([4, 4, 30, 60], fill=255)
+        elif kind == 'circle':
+            draw.ellipse([10, 10, 54, 54], fill=255)
+        elif kind == 'stripes':
+            for x in range(0, 64, 8):
+                draw.rectangle([x, 0, x + 3, 63], fill=255)
+        buffer = _io.BytesIO()
+        image.save(buffer, 'PNG')
+        return buffer.getvalue()
+
+    def _require_pillow(self) -> None:
+        try:
+            import PIL  # noqa: F401
+        except Exception:  # pragma: no cover - 环境没装
+            self.skipTest('未安装 Pillow')
+
+    def test_flat_images_have_no_usable_hash(self):
+        self._require_pillow()
+        import io as _io
+
+        from PIL import Image
+
+        buffer = _io.BytesIO()
+        Image.new('L', (32, 32), 7).save(buffer, 'PNG')
+        self.assertEqual(h.image_perceptual_hash(buffer.getvalue()), '',
+                         '纯色图没有结构可比，不能参与去重')
+        self.assertEqual(h.image_perceptual_hash(b'nope'), '')
+
+    def test_different_images_hash_far_apart(self):
+        self._require_pillow()
+        bar = h.image_perceptual_hash(self._png('bar'))
+        circle = h.image_perceptual_hash(self._png('circle'))
+        self.assertTrue(bar and circle)
+        self.assertGreater(h.hamming_distance(bar, circle), h.IMAGE_HASH_TOLERANCE)
+
+    def test_the_same_image_hashes_identically_even_after_recompression(self):
+        self._require_pillow()
+        import io as _io
+
+        from PIL import Image
+
+        original = self._png('stripes')
+        buffer = _io.BytesIO()
+        Image.open(_io.BytesIO(original)).convert('RGB').save(buffer, 'JPEG', quality=60)
+        first = h.image_perceptual_hash(original)
+        again = h.image_perceptual_hash(buffer.getvalue())
+        self.assertTrue(first)
+        self.assertLessEqual(h.hamming_distance(first, again), h.IMAGE_HASH_TOLERANCE)
+
+    def test_hamming_distance_rejects_malformed_input(self):
+        self.assertEqual(h.hamming_distance('', 'ff'), 64)
+        self.assertEqual(h.hamming_distance('ff', 'fff'), 64)
+        self.assertEqual(h.hamming_distance('zz', 'ff'), 64)
+        self.assertEqual(h.hamming_distance('ff', 'ff'), 0)
+
+    def test_split_and_remember_track_recent_hashes(self):
+        images = [{'id': 1, 'perceptualHash': 'ffffffffffffffff'},
+                  {'id': 2, 'perceptualHash': '0000000000000000'}]
+        fresh, skipped = h.split_described_images(images, ['ffffffffffffffff'])
+        self.assertEqual([item['id'] for item in fresh], [2])
+        self.assertEqual(skipped, ['ffffffffffffffff'])
+        merged = h.remember_described_hashes(['ffffffffffffffff'], images, limit=2)
+        self.assertEqual(len(merged), 2)
+        capped = h.remember_described_hashes([], [{'perceptualHash': '%016x' % index} for index in range(5)], limit=3)
+        self.assertEqual(len(capped), 3)
+
+    def test_images_without_a_hash_are_never_deduplicated(self):
+        images = [{'id': 1}, {'id': 2, 'perceptualHash': ''}]
+        fresh, skipped = h.split_described_images(images, ['ffffffffffffffff'])
+        self.assertEqual([item['id'] for item in fresh], [1, 2])
+        self.assertEqual(skipped, [])
+
+
+class QuoteBackfillTests(unittest.TestCase):
+    """引用回填（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）。"""
+
+    ENTRIES = [
+        {'id': 7, 'content': '我把伞放门口了', 'metadata': {}},
+        {'id': 9, 'content': '群里说的那件事', 'metadata': {'messageId': 'abc-1'}},
+        {'id': 11, 'content': '空的元数据', 'metadata': None},
+    ]
+
+    def test_synthetic_ref_resolves_to_our_own_entry(self):
+        self.assertEqual(h.backfilled_quote_content({'messageId': 'msg-7'}, self.ENTRIES), '我把伞放门口了')
+
+    def test_platform_id_resolves_through_entry_metadata(self):
+        self.assertEqual(h.backfilled_quote_content({'id': 'abc-1'}, self.ENTRIES), '群里说的那件事')
+
+    def test_unknown_ids_and_garbage_stay_empty(self):
+        self.assertEqual(h.backfilled_quote_content({'messageId': 'nope'}, self.ENTRIES), '')
+        self.assertEqual(h.backfilled_quote_content({'messageId': 'msg-404'}, self.ENTRIES), '')
+        self.assertEqual(h.backfilled_quote_content(None, self.ENTRIES), '')
+        self.assertEqual(h.backfilled_quote_content({}, self.ENTRIES), '')
+        self.assertEqual(h.backfilled_quote_content({'messageId': 'msg-7'}, []), '')
+
+    def test_existing_content_is_never_overwritten(self):
+        quote = {'messageId': 'msg-7', 'content': '平台给的原文'}
+        self.assertEqual(h.backfilled_quote_content(quote, self.ENTRIES), '')
+
+    def test_a_malformed_entry_does_not_break_the_lookup(self):
+        self.assertEqual(h.backfilled_quote_content({'id': 'abc-1'}, [None, 'x', *self.ENTRIES]),
+                         '群里说的那件事')
+
+
+class MediaLabelTests(unittest.TestCase):
+    """入站媒体标记 → 语义标签（受控偏离 §29）。
+
+    用户报的现象：她分不清 QQ 表情、表情包图片、实拍照片、网图——因为适配器把
+    `sub_type` / `summary` 丢在解析层，提示词里只剩一个 `[图片]`。
+    """
+
+    def test_plain_image_stays_the_upstream_placeholder(self):
+        self.assertEqual(h.describe_image_media('src="https://example.com/a.jpg"'), '[图片]')
+
+    def test_sticker_and_animated_are_distinguished(self):
+        self.assertEqual(h.describe_image_media('src="https://x/a.png" kind="sticker"'), '[表情包]')
+        self.assertEqual(
+            h.describe_image_media('src="https://x/a.png" kind="sticker" summary="[动画表情]"'),
+            '[动画表情]',
+        )
+        self.assertEqual(h.describe_image_media('kind="animated"'), '[动画表情]')
+
+    def test_market_and_card_labels(self):
+        self.assertEqual(h.describe_image_media('kind="market"'), '[QQ 商城表情]')
+        self.assertEqual(
+            h.describe_card_media('app="com.tencent.miniapp_01" title="QQ经典农场"'),
+            '[QQ小程序：QQ经典农场]',
+        )
+        self.assertEqual(h.describe_card_media('app="com.tencent.tuwen" title="这条新闻"'), '[分享卡片：这条新闻]')
+        self.assertEqual(h.describe_card_media(''), '[分享卡片]')
+
+    def test_normalize_media_segments_keeps_kinds_and_names_faces(self):
+        text = h.normalize_media_segments(
+            '给你看<img src="https://x/a.png" kind="sticker"/>'
+            '<face id="277"/><card app="com.tencent.miniapp" title="宝箱"/>',
+        )
+        self.assertIn('[表情包]', text)
+        self.assertIn('[QQ 原生表情：汪汪（ID: 277）]', text)
+        self.assertIn('[QQ小程序：宝箱]', text)
+
+    def test_quoted_message_content_carries_the_kind(self):
+        quoted = h.normalize_quoted_message_content(
+            '看这个<img src="https://x/a.png" kind="sticker" summary="[动画表情]"/>',
+        )
+        self.assertIn('[动画表情]', quoted)
+        self.assertNotIn('<img', quoted)
+
+    def test_group_attachments_carries_the_kind(self):
+        text = h.describe_group_attachments(
+            '<img src="https://x/a.png" kind="sticker"/><record file="v.silk"/>',
+        )
+        self.assertIn('[表情包]', text)
+        self.assertIn('[语音]', text)
+
+
+class ContextMetricsTests(unittest.TestCase):
+    """上轮上下文构成（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.4）。"""
+
+    def test_estimate_tokens_counts_cjk_per_character(self):
+        self.assertEqual(h.estimate_tokens(''), 0)
+        self.assertEqual(h.estimate_tokens('她今天去了面包店'), 8)
+        self.assertLess(h.estimate_tokens('hello world'), 9)
+
+    def test_metrics_measure_every_section_that_is_present(self):
+        request = {
+            'phase': 'user-message',
+            'recentEntries': [{'id': 1, 'content': '你好'}],
+            'facts': [{'id': 2}, {'id': 3}],
+            'followUpCommitments': [],
+            'sceneContext': {'scene': {'summary': '在厨房里'}},
+        }
+        metrics = h.context_metrics(request, 12.6, 'user-message', 'p1')
+        self.assertEqual(metrics['assembly_ms'], 12)
+        self.assertEqual(metrics['phase'], 'user-message')
+        self.assertEqual(metrics['participant_id'], 'p1')
+        self.assertEqual(metrics['sections']['recentEntries']['items'], 1)
+        self.assertEqual(metrics['sections']['facts']['items'], 2)
+        self.assertNotIn('followUpCommitments', metrics['sections'], '空段不必占一行')
+        self.assertEqual(metrics['items'], 3)
+        self.assertGreater(metrics['characters'], 0)
+        self.assertGreater(metrics['payload_characters'], metrics['characters'])
+        self.assertGreater(metrics['estimated_tokens'], 0)
+
+    def test_metrics_never_drop_the_scene_characters(self):
+        without = h.context_metrics({'phase': 'advance'}, 0, 'advance')
+        with_scene = h.context_metrics(
+            {'phase': 'advance', 'sceneContext': {'scene': {'summary': '厨房'}}}, 0, 'advance',
+        )
+        self.assertGreater(with_scene['characters'], without['characters'])
+
+    def test_metrics_survive_a_non_serializable_request(self):
+        class _Opaque:
+            def __repr__(self) -> str:
+                return '<opaque>'
+
+        metrics = h.context_metrics({'phase': 'advance', 'facts': [{'id': 1, 'x': _Opaque()}]}, 0, 'advance')
+        self.assertEqual(metrics['sections']['facts']['items'], 1)
+        self.assertGreater(metrics['payload_characters'], 0)
+
+    def test_metrics_accept_a_timestamp(self):
+        from datetime import datetime, timezone
+        moment = datetime(2026, 9, 27, 3, 0, tzinfo=timezone.utc)
+        self.assertTrue(h.context_metrics({}, 0, '', '', moment)['at'].startswith('2026-09-27'))
 
 
 class NormalizeConfigTests(unittest.TestCase):
@@ -960,6 +1473,229 @@ class PromptSectionTests(unittest.TestCase):
         self.assertEqual(c.to_schema_shape({'runtime': {'auto_create': True}}),
                          {'runtime': {'auto_create': True}})
         self.assertEqual(c.to_schema_shape(None), {})
+
+
+# --------------------------------------------------------------------------- #
+# 两级表情选择 / 描述时定组（§48 的纯函数部分）
+# --------------------------------------------------------------------------- #
+
+class StickerGroupDirectoryTests(unittest.TestCase):
+    """`stickerGroupDirectory` 的等价物：模型可见的**同一份**分组目录。"""
+
+    def _assets(self):
+        return [
+            {'assetId': 'a-1', 'group': 'collected'},
+            {'assetId': 'a-2', 'group': 'collected'},
+            {'assetId': 'b-1', 'group': '猫猫'},
+            {'assetId': 'c-1', 'group': 'legacy-dir'},
+            {'assetId': 'd-1', 'group': ''},
+        ]
+
+    def _rows(self):
+        # 描述表的行：**键就是目录名**，没有 `name` 列（组名 = 目录名）。
+        return [
+            {'groupId': '猫猫', 'description': '猫、躺平', 'createdAt': '2026-01-01'},
+            {'groupId': '空组', 'description': '还没素材', 'createdAt': '2026-01-02'},
+            {'groupId': 'collected', 'description': '改过描述', 'createdAt': ''},
+        ]
+
+    def _dirs(self):
+        # 磁盘上真有目录的（含一个刚建好、还没素材、也没描述行的空组）。
+        return ['猫猫', '空组', 'legacy-dir', 'disk-only']
+
+    def test_directories_list_only_what_the_caller_needs(self):
+        assets, rows, dirs = self._assets(), self._rows(), self._dirs()
+        sending = h.sticker_group_directory(assets, rows, directories=dirs)
+        self.assertEqual(
+            [(item['groupId'], item['name'], item['description'], item['count']) for item in sending],
+            [('collected', h.COLLECTED_STICKER_GROUP_NAME, '改过描述', 2),  # 内置组永远第一
+             ('猫猫', '猫猫', '猫、躺平', 1),                                # 描述行按 createdAt
+             ('legacy-dir', 'legacy-dir', '', 1)],                        # 没有描述行的目录名照样列
+            '甲：只列真的有条目的组（空组选了也空手而归），空 group 桶不列',
+        )
+        organising = h.sticker_group_directory(assets, rows, include_empty=True, directories=dirs)
+        self.assertEqual([item['groupId'] for item in organising],
+                         ['collected', '猫猫', '空组', 'disk-only', 'legacy-dir'],
+                         '乙：还没素材的组也要列（描述行的 + 磁盘上的空目录）')
+        self.assertEqual(organising[2]['count'], 0)
+        # 没有素材、也没有描述行的空目录**只在乙里出现**（甲里选了也空手而归）。
+        self.assertNotIn('disk-only', [item['groupId'] for item in sending])
+        self.assertEqual(
+            [item['groupId'] for item in h.sticker_group_directory(
+                assets, rows, limit=2, directories=dirs)],
+            ['collected', '猫猫'],
+            '提示词里的目录有上限',
+        )
+
+    def test_builtin_defaults_come_from_the_shared_constants(self):
+        directory = h.sticker_group_directory(
+            [{'assetId': 'a', 'group': 'collected'}], [],
+        )
+        self.assertEqual(directory[0]['name'], h.COLLECTED_STICKER_GROUP_NAME)
+        self.assertEqual(directory[0]['description'], h.COLLECTED_STICKER_GROUP_DESCRIPTION)
+        self.assertEqual(h.COLLECTED_STICKER_GROUP_ID, 'collected', 'id 是目录名，不许动')
+
+    def test_items_need_a_description_and_respect_the_limit(self):
+        assets = [
+            {'assetId': 'a-1', 'group': 'g-1', 'description': '一只猫'},
+            {'assetId': 'a-2', 'group': 'g-1', 'description': '  '},
+            {'assetId': 'a-3', 'group': 'g-2', 'description': '一只狗'},
+            {'assetId': '', 'group': 'g-1', 'description': '没有 id'},
+        ]
+        self.assertEqual(
+            h.sticker_group_items(assets, 'g-1'),
+            [{'assetId': 'a-1', 'description': '一只猫'}],
+            '没描述的条目进不了候选（模型只能靠描述挑）',
+        )
+        self.assertEqual(h.sticker_group_items(assets, 'g-2', limit=1),
+                         [{'assetId': 'a-3', 'description': '一只狗'}])
+        self.assertEqual(h.sticker_group_items(assets, ''), [])
+        self.assertEqual(
+            h.sticker_group_directory_ids([{'groupId': 'x'}, {'groupId': ''}, 'noise']), {'x'},
+        )
+
+
+class StickerGroupNameTests(unittest.TestCase):
+    """分组名 = **目录名**：命名规则的唯一定义处（`safe_sticker_group_name`）。"""
+
+    def test_cjk_and_common_symbols_are_allowed(self):
+        for name in ('猫猫', '日常（打招呼）', 'dogs-and_cats.v2', '表情 包', 'a b', '狗狗2'):
+            with self.subTest(name=name):
+                self.assertEqual(h.safe_sticker_group_name(name), name)
+                self.assertEqual(h.sticker_group_name_problem(name), '')
+
+    def test_path_separators_and_reserved_characters_are_rejected(self):
+        for name in ('a/b', 'a\\b', 'a:b', 'a*b', 'a?b', 'a"b', 'a<b', 'a>b', 'a|b', '..',
+                     '.hidden', 'a\nb', 'a\tb', '\x00abc'):
+            with self.subTest(name=name):
+                self.assertEqual(h.safe_sticker_group_name(name), '')
+                self.assertTrue(h.sticker_group_name_problem(name), name)
+
+    def test_length_limit_is_in_bytes_not_characters(self):
+        """文件系统按**字节**算：33 个汉字（99 字节）行，34 个（102 字节）不行。"""
+        self.assertEqual(h.safe_sticker_group_name('猫' * 33), '猫' * 33)
+        self.assertEqual(h.safe_sticker_group_name('猫' * 34), '')
+        self.assertEqual(len('猫' * 33), 33, '33 个**字符**——上一版按字符限长就挡不住了')
+
+    def test_outer_whitespace_is_normalized_away(self):
+        # 归一化（而不是拒绝）：写进磁盘的名字里永远没有首尾空白，界面回的是真值。
+        self.assertEqual(h.safe_sticker_group_name('  猫猫  '), '猫猫')
+        self.assertEqual(h.safe_sticker_group_name('   '), '')
+        self.assertTrue(h.sticker_group_name_problem('   '))
+
+    def test_the_root_bucket_name_is_reserved_only_for_writes(self):
+        """`default` = 根目录素材的桶：**写入侧**拒（保留名），读侧照收（老目录要能显示）。"""
+        self.assertEqual(h.STICKER_GROUP_ROOT_BUCKET, 'default')
+        self.assertIn('default', h.STICKER_GROUP_RESERVED_NAMES)
+        # 文件系统合法性那一关**不**拒它：扫描遇到既有的 default 目录照常收录。
+        self.assertEqual(h.sticker_group_name_problem('default'), '')
+        self.assertEqual(h.safe_sticker_group_name('default'), 'default')
+        # 写入侧（新建 / 改名 / 移动 / 上传的目标）一律拒，并给出明确文案。
+        self.assertIn('保留名', h.sticker_group_name_problem('default', reserved=True))
+        self.assertEqual(h.safe_sticker_group_name('default', reserved=True), '')
+        # 别的名字不受影响（保留名只钉这一个）。
+        self.assertEqual(h.safe_sticker_group_name('默认组', reserved=True), '默认组')
+        self.assertEqual(h.safe_sticker_group_name('Defaults', reserved=True), 'Defaults')
+
+
+class StickerSelectionParsingTests(unittest.TestCase):
+    """模型原样返回的 JSON：两种拼写都认，拿不准一律回空 / None。"""
+
+    def test_group_choice_reads_local_media_first_then_the_top_level(self):
+        self.assertEqual(
+            h.parse_sticker_group_choice({'localMedia': {'stickerGroupId': '猫猫'}}), '猫猫',
+            '中文组名是常态：它现在**就是目录名**',
+        )
+        self.assertEqual(
+            h.parse_sticker_group_choice({'localMedia': {'sticker_group_id': 'g-2'}}), 'g-2',
+        )
+        self.assertEqual(h.parse_sticker_group_choice({'stickerGroupId': 'g-3'}), 'g-3')
+        self.assertEqual(h.parse_sticker_group_choice({'sticker_group_id': 'g-4'}), 'g-4')
+        # localMedia 优先：它就是"要发什么"的那一处。
+        self.assertEqual(
+            h.parse_sticker_group_choice(
+                {'localMedia': {'stickerGroupId': 'g-1'}, 'stickerGroupId': 'g-9'},
+            ),
+            'g-1',
+        )
+        for junk in ({}, None, [], {'localMedia': {}}, {'localMedia': {'stickerGroupId': ''}},
+                     {'stickerGroupId': '../etc'}, {'stickerGroupId': '  '},
+                     {'stickerGroupId': 'a/b'}, {'stickerGroupId': '.hidden'},
+                     {'stickerGroupId': 'x' * 200}):
+            with self.subTest(junk=junk):
+                self.assertEqual(h.parse_sticker_group_choice(junk), '')
+
+    def test_selection_receipt_normalizes_without_deciding(self):
+        self.assertEqual(
+            h.parse_sticker_selection_receipt(
+                {'stickerAssetId': 'a-1', 'willingness': 0.8, 'content': '正文'},
+            ),
+            {'assetId': 'a-1', 'content': '正文', 'willingness': 0.8},
+        )
+        self.assertEqual(
+            h.parse_sticker_selection_receipt({'sticker_asset_id': 'a-2', 'content': ''}),
+            {'assetId': 'a-2', 'content': '', 'willingness': None},
+        )
+        self.assertEqual(h.parse_sticker_selection_receipt(None), {})
+        # 兼容 `assetId`：老提示词（平铺目录）回的也是它。
+        self.assertEqual(h.parse_sticker_selection_receipt({'assetId': 'a-3'})['assetId'], 'a-3')
+
+    def test_auto_group_receipt_cleans_text_and_rejects_bad_shapes(self):
+        self.assertEqual(
+            h.parse_sticker_auto_group({'group': {'existing': 'g-1'}}),
+            {'mode': 'existing', 'groupId': 'g-1'},
+        )
+        self.assertEqual(
+            h.parse_sticker_auto_group({'group': {'new': {'name': '  猫   猫  ', 'description': 'a\nb'}}}),
+            {'mode': 'new', 'name': '猫 猫', 'description': 'a b'},
+            '控制字符换空格、压空白（名字要能进提示词）',
+        )
+        # 名字会变成**磁盘目录名**：与人工建组同一条规则（按字节限长 + 禁路径字符）。
+        self.assertIsNone(h.parse_sticker_auto_group({'group': {'new': {'name': 'x' * 200}}}))
+        self.assertIsNone(h.parse_sticker_auto_group(
+            {'group': {'new': {'name': '猫' * 40}}},  # 40 × 3 字节 = 120 > 100
+        ))
+        self.assertIsNone(h.parse_sticker_auto_group({'group': {'new': {'name': 'a/b'}}}))
+        self.assertIsNone(h.parse_sticker_auto_group({'group': {'new': {'name': '..'}}}))
+        self.assertIsNone(h.parse_sticker_auto_group({'group': {'existing': '../x'}}))
+        self.assertIsNone(h.parse_sticker_auto_group({'group': {'new': {'name': '   '}}}))
+        self.assertIsNone(h.parse_sticker_auto_group({'group': 'nonsense'}))
+        self.assertIsNone(h.parse_sticker_auto_group({'description': '只有描述'}))
+        self.assertIsNone(h.parse_sticker_auto_group(None))
+
+    def test_follow_up_content_only_fills_a_missing_visible_reply(self):
+        """正文**以第一段为准**（§48.1）：第二段只能填空，不能覆盖。"""
+        # 第一段写了正文 → 一字不动（这就是"第二段不许重写"的那条协议）。
+        written = {'interaction': {'reply': {'mode': 'immediate', 'content': '第一段写的'}}}
+        self.assertFalse(h.apply_sticker_follow_up_content(written, '第二段想改的'))
+        self.assertEqual(written['interaction']['reply']['content'], '第一段写的')
+        group_written = {'groupReply': {'mode': 'immediate', 'content': '群里的第一段'}}
+        self.assertFalse(h.apply_sticker_follow_up_content(group_written, '第二段想改的'))
+        self.assertEqual(group_written['groupReply']['content'], '群里的第一段')
+        # 该说话但正文是空的 → 才补。
+        private = {'interaction': {'reply': {'mode': 'immediate', 'content': '   '}}}
+        self.assertTrue(h.apply_sticker_follow_up_content(private, '补上的'))
+        self.assertEqual(private['interaction']['reply']['content'], '补上的')
+        group = {'groupReply': {'mode': 'immediate', 'content': ''}}
+        self.assertTrue(h.apply_sticker_follow_up_content(group, '补上的'))
+        self.assertEqual(group['groupReply']['content'], '补上的')
+        # 沉默 / 延后 / 没有回复位：不许凭空造一条消息出来。
+        for decision in (
+            {'interaction': {'reply': {'mode': 'none', 'content': ''}}},
+            {'interaction': {'reply': {'mode': 'deferred', 'content': ''}}},
+            {'interaction': {}},
+            {'groupReply': {'mode': 'none', 'content': ''}},
+            {},
+        ):
+            with self.subTest(decision=decision):
+                self.assertFalse(h.apply_sticker_follow_up_content(decision, '新的'))
+        self.assertFalse(h.apply_sticker_follow_up_content(private, '   '))
+        self.assertEqual(
+            h.visible_reply_text({'interaction': {'reply': {'mode': 'immediate', 'content': '  '}}}), '',
+        )
+        self.assertEqual(
+            h.visible_reply_text({'groupReply': {'mode': 'immediate', 'content': '群里的'}}), '群里的',
+        )
 
 
 if __name__ == '__main__':

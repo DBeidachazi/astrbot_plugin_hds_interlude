@@ -107,7 +107,9 @@ repaired, kind = repair(resolve({'script': '她写了<say id="a">半截'}, False
 check(kind == '', '残留 say 标记不补救')
 
 # --- 提示词硬规则只给非流式路径 ---
-check('HARD RULE' in np_.script_first_transport_instruction('user-message', True), '群聊提示词含硬规则')
-check('HARD RULE' not in np_.script_first_transport_instruction('user-message', False, True), '流式路径不含硬规则')
+# 合并 KelaLeaf（上游 rc16）后非流式改为 content-only 协议，不再教 <say>；HARD RULE 随之移除。
+group_rule = np_.script_first_transport_instruction('user-message', True)
+check('HARD RULE' not in group_rule and '<say' not in group_rule, '群聊提示词改为 content-only')
+check('return groupReply as {"mode":"immediate","content"' in group_rule, '群聊 content-only 传输说明')
 
 print(f'test_bare_bubble: {ok} checks passed')

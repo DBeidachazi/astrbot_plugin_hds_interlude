@@ -319,6 +319,9 @@ FACT = TableSpec(
         'status': _spec('string(16)'),
         'sourceEntryIds': _spec('json'),
         'lastSeenAt': _spec('timestamp'),
+        # v1.4.0 新增（`docs/MEMORY_MAINTENANCE.md`）：召回回写，遗忘评分用。
+        'accessCount': _spec('unsigned'),
+        'lastAccessAt': _spec('timestamp'),
         'createdAt': _spec('timestamp'),
         'updatedAt': _spec('timestamp'),
     },
@@ -344,6 +347,9 @@ STATE_PATCH = TableSpec(
         'sourceEntryIds': _spec('json'),
         'createdAt': _spec('timestamp'),
         'appliedAt': _spec('timestamp'),
+        # v1.4.0 新增（`docs/MEMORY_MAINTENANCE.md` §5.3）：控制台审批与回滚的留痕。
+        'decidedAt': _spec('timestamp'),
+        'decisionNote': _spec('text'),
     },
     primary='id',
     auto_increment=True,
@@ -414,6 +420,38 @@ STICKER = TableSpec(
         'aliases': _spec('json'),
         'status': _spec('string(16)'),
         'embedding': _spec('json'),
+        #: 本移植版新增（v1.8.0，自动收藏 + 控制台表情库页）：
+        #: `name` 手工可改的短名（与 `description` 分开，见 `docs/PORTING_NOTES.md` §45）；
+        #: `source` = `auto`（自动收藏入站表情包）/ `manual`（磁盘扫描进来的）；
+        #: `uses` 被选中投递过几次（控制台按它排序 / 展示）；
+        #: `descriptionManual` = 描述是**人写的**，自动扫描不得覆盖（扫描直接跳过模型）。
+        #: 旧库没有这几列，`register_tables()` 会 `ALTER TABLE ADD COLUMN` 增量补上；
+        #: 补出来的旧行是 NULL，读取侧一律当空串 / 0 / False 处理。
+        #:
+        #: 本移植版新增（v1.8.0 第二层判据，§45.7）：
+        #: `guessed` = 这一条是**识图模型猜出来的**（`kind == 'image'` 的普通图片经判定入库）。
+        #: `source` 仍是 `auto`（前端契约只有 auto / manual 两个取值，不加第三个），
+        #: 所以"模型猜的"这件事必须有自己的一列；控制台以额外字段 `guessed` 暴露。
+        #:
+        #: 本移植版新增（v1.8.4 描述时定组，§48）：「归属是谁定的」要看得出来——
+        #: `groupGuessed` = 这一组的归属是**模型**读描述时顺手定的（可回溯）；
+        #: `groupManual` = 归属是**人**定的（控制台移动 / 上传指定 / 扫描目录带进来的），
+        #: 自动定组一律不碰它（把人摆好的素材搬走是最讨人厌的一类副作用）。
+        'name': _spec('string(255)'),
+        'source': _spec('string(16)'),
+        'uses': _spec('unsigned'),
+        'descriptionManual': _spec('boolean'),
+        'guessed': _spec('boolean'),
+        'groupGuessed': _spec('boolean'),
+        'groupManual': _spec('boolean'),
+        #: 本移植版新增（v1.8.4 描述时判非表情包就停用，§50）：**这一行的启用状态是谁定的**。
+        #: `''`（旧行 / 没人动过）/ `'model'`（模型读描述时判定它不是表情包，停用）/
+        #: `'manual'`（人停用过**或**人启用过 —— 人的决定，模型永不覆盖）。
+        #: 为什么一个字段能表示"谁停的"又能表示"人启用过"：两者问的是同一件事
+        #: ——**启用状态的决定权在谁手里**；`status == 'disabled'` 与它合起来看就知道
+        #: 是"模型停的"还是"人停的"，而 `status == 'active' + disabledBy == 'manual'`
+        #: 就是"人启用的，模型不许再停"。
+        'disabledBy': _spec('string(16)'),
         'createdAt': _spec('timestamp'),
         'updatedAt': _spec('timestamp'),
     },
@@ -421,6 +459,43 @@ STICKER = TableSpec(
     auto_increment=True,
     unique=('assetId',),
     indexes=('status', 'group', 'updatedAt'),
+    added_later=True,
+)
+
+#: `interlude_sticker_groups` —— 表情库分组**描述表**（本移植版新增，见 `docs/PORTING_NOTES.md` §47）。
+#:
+#: **磁盘目录结构是分组的唯一事实来源**：上游 `interlude_sticker.group` 本来就是
+#: "素材落在哪个一级子目录"的字符串，子目录名 = 分组名（内置 `collected` 的显示名
+#: 是唯一特例）。所以这张表**不是注册表**——它只补两件上游没有的东西：
+#: **描述**（给模型看的那一份）与**时间**。键 `groupId` 就是目录名本身。
+#:
+#: * 表里**没有行** = 这一组还没有描述，**不是**"未注册"；磁盘上有目录、库里有用它
+#:   的素材，它就照样是一个正常分组；
+#: * 内置默认组（`groupId = 'collected'`，显示名「未整理」）**不依赖这张表里的行**：
+#:   列表里永远有它一条，这样自动收藏的素材不会无所属。
+#:
+#: ⚠️ **表名是复数**（`interlude_sticker_groups`），这不是笔误：索引名按
+#: `<表名>_<列名>` 生成，而 `interlude_sticker.group` 的索引恰好叫
+#: `interlude_sticker_group`——SQLite 里索引与表共用同一个命名空间，
+#: 单数表名会因为"这个名字已被索引占用"直接建不出来。
+STICKER_GROUP = TableSpec(
+    name='interlude_sticker_groups',
+    fields={
+        #: 分组名 = **素材落盘的一级目录名**（宽度与 `interlude_sticker.group` 同为 128，
+        #: 好让任何一个既有的 `group` 值都能有描述行）。命名规则只有一处：
+        #: `helpers.safe_sticker_group_name`（按**字节**上限 100 + 禁路径字符）。
+        'groupId': _spec('string(128)'),
+        'description': _spec('text'),
+        #: 这一行是不是**模型自动归组**（§48 乙）建出来的。只有它计入自动建组的
+        #: 24h/5 个速率额度——人在控制台建的组不该吃模型的额度（反过来也一样：
+        #: 人工建组不受任何额度约束）。
+        #: 旧库补列前写入的行是 NULL = "不是自动建的"（保守：不占额度）。
+        'autoCreated': _spec('boolean'),
+        'createdAt': _spec('timestamp'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='groupId',
+    indexes=('updatedAt',),
     added_later=True,
 )
 
@@ -447,11 +522,171 @@ SCHEDULE_PREPLAN = TableSpec(
     added_later=True,
 )
 
+#: `interlude_seeded_event` —— 世界播种器的事件表（上游 1.0.1-rc23）。
+#: 列名逐字 camelCase（持久化 wire format）；`status` 生命周期
+#: `scheduled → injecting → injected`，旁路 `expired`。
+SEEDED_EVENT = TableSpec(
+    name='interlude_seeded_event',
+    fields={
+        'id': _spec('unsigned autoInc'),
+        'storyId': _spec('string(255)'),
+        'summary': _spec('text'),
+        'importance': _spec('string(16)'),
+        'occursAt': _spec('timestamp'),
+        'expiresAt': _spec('timestamp'),
+        'status': _spec('string(16)'),
+        'subjects': _spec('json'),
+        'sourcePayload': _spec('json'),
+        'injectedEntryId': _spec('unsigned'),
+        'createdAt': _spec('timestamp'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='id',
+    auto_increment=True,
+    indexes=('storyId', 'status', 'occursAt'),
+    added_later=True,
+)
+
+#: `interlude_endpoint` —— 端点注册表（上游 1.0.1-rc28 的 M1a）。
+#: 身份与地址分离：主键是持久随机 ID，`accountKey` 等地址字段可变；唯一性靠应用层的
+#: `endpoint_unique_key()` 校验（`unique` 约束表达不了"ownerKind 决定键形状"）。
+ENDPOINT = TableSpec(
+    name='interlude_endpoint',
+    fields={
+        'id': _spec('string(63)'),
+        'ownerKind': _spec('string(24)'),
+        'ownerId': _spec('string(255)'),
+        'channelKind': _spec('string(8)'),
+        'platform': _spec('string(63)'),
+        'accountKey': _spec('string(127)'),
+        'selfId': _spec('string(63)'),
+        'userId': _spec('string(127)'),
+        'channelId': _spec('string(127)'),
+        'groupId': _spec('string(127)'),
+        'conversationKind': _spec('string(16)'),
+        'enabled': _spec('boolean'),
+        'createdAt': _spec('timestamp'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='id',
+    indexes=('accountKey', 'ownerKind', 'ownerId'),
+    added_later=True,
+)
+
+#: `interlude_story_alias` —— 推导 ID → 稳定剧本 ID 的重定向（M1b）。
+#: 回滚 = 删行；行自带审计（`reason` + 时间）。
+STORY_ALIAS = TableSpec(
+    name='interlude_story_alias',
+    fields={
+        'aliasStoryId': _spec('string(255)'),
+        'canonicalStoryId': _spec('string(255)'),
+        'reason': _spec('string(255)'),
+        'createdAt': _spec('timestamp'),
+    },
+    primary='aliasStoryId',
+    indexes=('canonicalStoryId',),
+    added_later=True,
+)
+
+#: `interlude_token_usage` —— Token 用量账本（本移植版新增，控制台「Token 统计」页）。
+#: 按 **(day, storyId, task, model)** 聚合，一行 = 某天某剧本某任务某模型的累计量；
+#: 刻意**不存每次调用明细**（一次长对话几百次调用，明细表会爆，而面板要的就是聚合视图）。
+TOKEN_USAGE = TableSpec(
+    name='interlude_token_usage',
+    fields={
+        'id': _spec('unsigned autoInc'),
+        'day': _spec('string(10)'),
+        'storyId': _spec('string(255)'),
+        'task': _spec('string(64)'),
+        'model': _spec('string(127)'),
+        'provider': _spec('string(127)'),
+        'inputTokens': _spec('unsigned'),
+        'outputTokens': _spec('unsigned'),
+        'cachedTokens': _spec('unsigned'),
+        'calls': _spec('unsigned'),
+        'createdAt': _spec('timestamp'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='id',
+    auto_increment=True,
+    indexes=('day', 'task', 'model', 'storyId'),
+    added_later=True,
+)
+
+#: `interlude_qzone_post` —— QQ 空间动作审计行（上游 rc28 `qzone.ts` 的账本）。
+#: 限流门（当日计数 / 最小间隔）与投递结果追溯共用；`kind` 含只读的 `feed-seen`
+#: （动态已入账标记，**不占动作配额**）。
+QZONE_POST = TableSpec(
+    name='interlude_qzone_post',
+    fields={
+        'id': _spec('unsigned autoInc'),
+        'storyId': _spec('string(255)'),
+        'kind': _spec('string(16)'),
+        'tid': _spec('string(127)'),
+        'targetUin': _spec('string(63)'),
+        'content': _spec('text'),
+        'ugcRight': _spec('unsigned'),
+        'endpointId': _spec('string(63)'),
+        'status': _spec('string(16)'),
+        'error': _spec('text'),
+        'createdAt': _spec('timestamp'),
+        'postedAt': _spec('timestamp'),
+    },
+    primary='id',
+    auto_increment=True,
+    indexes=('storyId', 'kind', 'status', 'createdAt'),
+    added_later=True,
+)
+
+#: `interlude_scheduled_command` —— 定时命令（本移植版新增，控制台与模型都能排）。
+#: `cron` 是 5 段表达式（分 时 日 月 周）；`nextRunAt` 由 sweep 推进。
+SCHEDULED_COMMAND = TableSpec(
+    name='interlude_scheduled_command',
+    fields={
+        'id': _spec('unsigned autoInc'),
+        'storyId': _spec('string(255)'),
+        'command': _spec('string(64)'),
+        'params': _spec('json'),
+        'cron': _spec('string(64)'),
+        'enabled': _spec('boolean'),
+        'nextRunAt': _spec('timestamp'),
+        'lastRunAt': _spec('timestamp'),
+        'lastStatus': _spec('string(16)'),
+        'lastError': _spec('text'),
+        'runCount': _spec('unsigned'),
+        'createdAt': _spec('timestamp'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='id',
+    auto_increment=True,
+    indexes=('storyId', 'enabled', 'nextRunAt'),
+    added_later=True,
+)
+
+#: `interlude_work` —— 共同作品（上游 rc28 `works.ts` 的 WorkRow）。
+#: 主键是**字符串**（`<storyId>:<participantId>` 由 `workKey()` 生成），一代一行做 CAS：
+#: `generation` 每次替换 +1，替换失败即"别处已经改过"，绝不覆盖别人的改动。
+WORK = TableSpec(
+    name='interlude_work',
+    fields={
+        'id': _spec('string(64)'),
+        'storyId': _spec('string(255)'),
+        'participantId': _spec('string(255)'),
+        'generation': _spec('unsigned'),
+        'state': _spec('json'),
+    },
+    primary='id',
+    indexes=('storyId', 'participantId'),
+    added_later=True,
+)
+
 #: 表名 → `TableSpec`。键顺序 = 上游 `registerTables` 的注册顺序。
 TABLES: dict[str, TableSpec] = {
     spec.name: spec for spec in (
         STORY, PARTICIPANT, SCRIPT_ENTRY, MEMORY, INTENT, SCENE, ARC, FACT, STATE_PATCH,
-        WEB_OBSERVATION, OVERLAY_SNAPSHOT, STICKER, SCHEDULE_PREPLAN,
+        WEB_OBSERVATION, OVERLAY_SNAPSHOT, STICKER, STICKER_GROUP, SCHEDULE_PREPLAN,
+        SEEDED_EVENT, ENDPOINT, STORY_ALIAS, TOKEN_USAGE, QZONE_POST, SCHEDULED_COMMAND,
+        WORK,
     )
 }
 
@@ -487,7 +722,7 @@ def auto_increment(table: str) -> bool:
 
 
 def table_names() -> list[str]:
-    """13 张表的表名（上游 `registerTables` 的注册顺序）。"""
+    """所有已注册表的表名（上游 `registerTables` 的注册顺序）。"""
     return list(TABLES)
 
 
@@ -806,6 +1041,33 @@ class Database:
         row = self.conn.execute(sql, params).fetchone()
         return int(row[0]) if row is not None else 0
 
+    def count_by(
+        self,
+        table: str,
+        column: str,
+        where: Optional[dict[str, Any]] = None,
+    ) -> dict[str, int]:
+        """按某一列**分组计数**：`{列值: 行数}`（`NULL` 折成空串）。
+
+        控制台「表情库」的分组列表要的是"每一组有多少张"。在 Python 侧把整张
+        `interlude_sticker` 拉出来只为数个数是控制台最容易犯的错（每行还带
+        `embedding` 的 JSON，几千行就是几十 MB），所以这里用一次 `GROUP BY` 换掉它。
+
+        列名必须属于该表——`_where_clause` 同一条纪律：防注入、也防拼错列名
+        （拼错在 SQLite 里只是回空结果，静默给出 0 张比报错更难查）。
+        """
+        spec = _require_table(table)
+        if column not in spec.fields:
+            raise KeyError(f'unknown column {column!r} for table {spec.name!r}')
+        clauses, params = self._where_clause(where, spec)
+        sql = 'SELECT %s, COUNT(*) FROM %s%s GROUP BY %s' % (
+            quote_ident(column), quote_ident(spec.name), clauses, quote_ident(column),
+        )
+        counts: dict[str, int] = {}
+        for value, total in self.conn.execute(sql, params).fetchall():
+            counts['' if value is None else str(value)] = int(total)
+        return counts
+
     def _select_sql(
         self,
         spec: TableSpec,
@@ -995,7 +1257,7 @@ def _serialized(method: Callable[..., T]) -> Callable[..., T]:
 
 for _name in (
     'list_tables', 'columns', 'table_exists', 'indexes', 'index_columns',
-    'register_tables', 'get', 'all', 'count', 'insert', 'update', 'remove',
+    'register_tables', 'get', 'all', 'count', 'count_by', 'insert', 'update', 'remove',
     'upsert', 'commit',
 ):
     setattr(Database, _name, _serialized(getattr(Database, _name)))

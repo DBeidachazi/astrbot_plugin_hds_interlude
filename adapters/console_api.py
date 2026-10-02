@@ -16,13 +16,50 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import inspect
 import json
 import os
+from datetime import datetime
 from typing import Any, Optional
 
+from ..core import platform_actions
 from ..core.database import TABLES
 from ..core.meta import HDS_INTERLUDE_VERSION
+#: N:1 旧分组归并（配置页显示的当前值必须与运行期读到的一致，见 `config_schema`）。
+from ..core.service.config import (
+    LEGACY_MERGE_TARGETS,
+    merge_legacy_section_values,
+    read_section_path,
+)
+#: 图片 MIME 的**唯一**嗅探实现（`inline=1` 信封用它；不另抄一份扩展名表）。
+from ..core.service.helpers import guess_image_mime
+#: 表情库分组 / 上传的常量与纯函数：**单一事实源在 `core/service/helpers.py`**，
+#: 服务层的上传管线读同一份（控制台不另抄一套上限数字——抄一份就漂移一次）。
+#: 分组名（= 目录名）的命名规则因此只有一处定义：控制台用 `sticker_group_name_problem`
+#: 快速失败给出中文原因，服务层再判一次（它才是唯一写入路径）。
+from ..core.service.helpers import (
+    COLLECTED_STICKER_GROUP_DESCRIPTION,
+    COLLECTED_STICKER_GROUP_ID,
+    COLLECTED_STICKER_GROUP_NAME,
+    STICKER_DESCRIPTION_MAX,
+    STICKER_NAME_MAX,
+    safe_sticker_group_name,
+    sticker_disabled_by,
+    sticker_group_name_problem,
+)
+from ..core.token_stats import normalize_range, range_bounds, summarize_usage
+from ..core.story_state import decode_story_state
+# 作品正文 / 创作意图 / 修改理由的上限与分段长度：**单一事实源在 `core/works.py`**，
+# 控制台不另抄一套数字（上限漂移过一次就等于前端与 core 各判一次）。
+from ..core.works import (
+    BRIEF_MAX as WORK_BRIEF_MAX,
+    CONTENT_MAX as WORK_CONTENT_MAX,
+    REASON_MAX as WORK_REASON_MAX,
+    TITLE_MAX as WORK_TITLE_MAX,
+    split_dump_parts,
+)
 from .astrbot_bridge import (
     CONSOLE_LOG_BUFFER as CONSOLE_LOG_MAX,
     CONSOLE_USAGE_BUFFER as CONSOLE_USAGE_MAX,
@@ -31,7 +68,7 @@ from .astrbot_bridge import (
     _plugin_version,
 )
 
-__all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'INTERNAL_INTENT_TYPES', 'mask_endpoint',
+__all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'CONTEXT_SECTION_LABELS', 'INTERNAL_INTENT_TYPES', 'mask_endpoint',
            'load_config_schema', 'coerce_schema_value']
 
 #: 控制台「模型」页展示的任务顺序与中文名（与 `model_routing` 的任务键一致）。
@@ -49,7 +86,185 @@ CONSOLE_TASKS: tuple[tuple[str, str], ...] = (
 #: - `split-message`：拆分气泡的投递节拍（"她还在打字"），投递完就 completed；
 #: - `narrative-retry`：叙事调用失败后的自动重试排程。
 #: 控制台的「承诺与意图」默认只显示人话层面的意图，这些折叠起来（可展开）。
+#: 上下文段名的中文标签（`helpers.CONTEXT_METRIC_SECTIONS` 的 wire 键）。
+CONTEXT_SECTION_LABELS = {
+    'recentEntries': '近期条目',
+    'recalledHistory': '召回的历史原文',
+    'memories': '压缩记忆',
+    'facts': '长期事实',
+    'overlaySnapshots': '设定演化',
+    'followUpCommitments': '承诺回访',
+    'dueIntents': '到期计划',
+    'upcomingIntents': '未来计划',
+    'activeConsequences': '剧情余波',
+    'workingDetails': '临时细节',
+    'participants': '参与者摘要',
+    'webContext': '网页观察',
+    'quotedMessages': '被回复的消息',
+    'automaticDeliverySummaries': '自动投递摘要',
+}
+
 INTERNAL_INTENT_TYPES: frozenset[str] = frozenset({'split-message', 'narrative-retry'})
+
+# ===================================================================== #
+# 控制台「表情库」面板（v1.8.0）
+#
+# 面板自己不改存储：列表读 `interlude_sticker`，写操作一律走服务层的
+# `save_sticker_description` / `rename_sticker` / `set_sticker_disabled` /
+# `restore_sticker_description` / `delete_sticker`（那五个方法是**唯一写入路径**，
+# 见 `docs/PORTING_NOTES.md` §45）。
+# ===================================================================== #
+
+#: 表情库列表一次最多回多少行（窗口 + `truncated`，与 `_chat_rows()` 同一套做法）。
+STICKER_ROW_LIMIT = 500
+#: `limit` 查询参数的上限（前端翻页；真到 500 条说明页面该筛选了）。
+STICKER_PAGE_MAX = 200
+
+#: 分组描述表一次最多读多少行（分组名 = 目录名，正常个位数；卡上限是防脏库）。
+STICKER_GROUP_ROW_LIMIT = 200
+#: 一次批量移动最多接受多少个 assetId（防一次请求改掉整库；超了 400）。
+STICKER_MOVE_MAX = 500
+#: `group` 是空串 / 缺失的旧行在列表里显示的组名（它没有 groupId 可归属）。
+STICKER_UNGROUPED_NAME = '未分组'
+
+#: 一个素材最长多长的描述 / 短名：**上限定义在 `core/service/helpers.py`**
+#: （服务层的上传管线读同一份），上面的 import 把这两个名字带进本模块命名空间，
+#: 本模块与测试按 `console_api.STICKER_DESCRIPTION_MAX` / `STICKER_NAME_MAX` 引用即可。
+
+#: 允许改的字段（**白名单**；其余一律 400，与 `set_config_value` 同一条纪律）。
+STICKER_EDITABLE_FIELDS: tuple[str, ...] = ('description', 'name', 'disabled')
+
+#: 停用即改 `status`：`disabled` 不参与 `refresh_sticker_catalog` 的 `status='active'`
+#: 查询，所以它立刻从模型可见的目录里消失，但**行与文件都还在**。
+STICKER_STATUS_DISABLED = 'disabled'
+
+#: `sticker-file?inline=1` 一次最多内联多少字节。
+#:
+#: **这是防轰炸的保护，不是为了省流量**：`inline=1` 是给宿主 bridge 的 JSON 通道用的
+#: （沙箱 iframe 里 `<img src>` 拿不到登录态，见 `docs/PORTING_NOTES.md` §45.8），
+#: 而整张图会以 base64 塞进响应体（体积 ×4/3）并由**父页面**先完整收下再 postMessage 递回，
+#: 库里要是有几张几十 MB 的 GIF，一屏 12 张能把控制台直接卡死。超过就明确报错让用户
+#: 走「保存原图」（`download` 那条路是流式落盘，不受这个上限约束）。
+#: 数量级照 `audio.max_file_size_mb` 的既有口径取 8MB —— 表情包正常都在 1MB 以内。
+STICKER_INLINE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def sticker_source(row: Any) -> str:
+    """素材来源：`auto`（自动收藏入站表情包）/ `manual`（磁盘扫描进来的）。
+
+    优先读列（v1.8.0 起有这一列）；旧库补列前写入的行是 NULL，
+    按资产 id 前缀兜底——`sticker-…` 是自动收藏的命名空间，**不必回填旧数据**。
+    """
+    record = _record(row)
+    value = _text(record.get('source')).strip().lower()
+    if value in ('auto', 'manual'):
+        return value
+    asset_id = _text(record.get('assetId') or record.get('asset_id'))
+    return 'auto' if asset_id.startswith('sticker-') else 'manual'
+
+
+def sticker_kind(row: Any) -> str:
+    """素材形式：`animated`（会动）/ `image`（静止）。
+
+    布尔列用 `_truthy_boolean` 读：**原始行**（`Database.all` 直读）里 `animated`
+    是 SQLite 的 `0/1`，`is True` 会把它判成静止（`scan_sticker_library` 建出来的
+    gif 行正好是这一种）。
+    """
+    record = _record(row)
+    if _truthy_boolean(record.get('animated')):
+        return 'animated'
+    return 'animated' if _text(record.get('mimeType')).lower() == 'image/gif' else 'image'
+
+
+def sticker_relative_file(row: Any) -> str:
+    """相对表情库根目录的文件名（**只取 basename**）。
+
+    `filePath` 在库里理应就是相对名，但它是可从旧版本继承的数据，
+    不能让一个被改坏的 `filePath` 变成"读任意文件"。取 basename 之后，
+    任何 `../` 都被结构性地消掉了。
+    """
+    return os.path.basename(_text(_record(row).get('filePath')).replace('\\', '/'))
+
+
+def sticker_group_display_name(names: Any, raw: Any) -> str:
+    """`group` 值 → 列表里显示的组名（§47）。
+
+    **组名就是目录名**，所以默认原样回显；`names` 只用来覆盖**唯一那个特例**
+    （内置组 `collected` 显示成「未整理」）。空值回「未分组」——这一条不消失、
+    也不假装属于某个正式分组。
+    """
+    value = _text(raw).strip()
+    if not value:
+        return STICKER_UNGROUPED_NAME
+    if isinstance(names, dict):
+        return _text(names.get(value)).strip() or value
+    return value
+
+
+def sticker_item(row: Any, group_names: Any = None) -> dict[str, Any]:
+    """一行 `interlude_sticker` → 面板列表项（wire camelCase + 契约里的 `file`）。
+
+    `group_names` 是 `groupId → 显示名` 的映射（`ConsoleApi._sticker_group_names()`，
+    现在只有内置组那一条）；不给就按目录名回显。**只加字段**：`group` 保持原样，
+    新增的 `groupId` / `groupName` 供前端分组筛选与显示，老字段一个都没改。
+    """
+    record = _record(row)
+    asset_id = _text(record.get('assetId') or record.get('asset_id'))
+    file_name = sticker_relative_file(record)
+    group_id = _text(record.get('group')).strip()
+    return {
+        'assetId': asset_id,
+        'name': _text(record.get('name')),
+        'description': _text(record.get('description')),
+        'kind': sticker_kind(record),
+        'source': sticker_source(record),
+        'addedAt': _timestamp_text(record.get('createdAt')) or _timestamp_text(record.get('updatedAt')),
+        'updatedAt': _timestamp_text(record.get('updatedAt')),
+        'uses': _int(record.get('uses'), 0),
+        #: 描述是不是**人写的**：前端据此显示"手工"徽章，并给出"恢复自动描述"按钮。
+        'manual': _truthy_boolean(record.get('descriptionManual')),
+        # 扩展字段（前端可以直接忽略）：状态、分组、体积、别名、MIME 都是列表里
+        # 想显示 / 想筛的东西，多回几个比让前端再发一次请求便宜。
+        'status': _text(record.get('status')),
+        'group': group_id,
+        #: v1.8.3（§47）新增：分组的**稳定 id**（筛选、移动都用它）与可直接显示的组名。
+        'groupId': group_id,
+        'groupName': sticker_group_display_name(group_names, group_id),
+        'size': _int(record.get('size'), 0),
+        'aliases': record.get('aliases') if isinstance(record.get('aliases'), list) else [],
+        'mimeType': _text(record.get('mimeType')),
+        #: **模型猜出来的**（第二层判据，`§45.7`）：`kind == 'image'` 的普通图片经识图模型
+        #: 判定成表情包才入库。`source` 仍是 `auto`（契约只有 auto / manual 两个取值），
+        #: 所以"猜的"这件事只能靠这个额外字段暴露——控制台**暂未显示**这个徽章，
+        #: 留给下一轮（见 `docs/PORTING_NOTES.md` §45.7）。
+        'guessed': _truthy_boolean(record.get('guessed')),
+        #: v1.8.4（§48）新增的两个归属标记（**只加字段**，老字段一个都没动）：
+        #: `groupGuessed` = 这一组的归属是**模型**读描述时顺手定的（前端可打"模型归的"徽章）；
+        #: `groupManual` = 归属是**人**定的（控制台移动 / 上传时指定 / 目录扫描带进来的），
+        #: 自动定组不碰这类素材。旧库补列前写入的行是 NULL → 都当 false。
+        'groupGuessed': _truthy_boolean(record.get('groupGuessed')),
+        'groupManual': _truthy_boolean(record.get('groupManual')),
+        #: v1.8.4（§50）新增：**这一行的启用状态是谁定的**（纯加字段）。
+        #: `'model'` = 模型读描述时判定它不是表情包而停用（界面可打"模型停的"并提示可启用）；
+        #: `'manual'` = 人停用过**或**人启用过（人的决定，模型不会再改它）；
+        #: `''` = 没人动过（旧库补列前写入的行也是 NULL → 空串）。读侧归一在
+        #: `helpers.sticker_disabled_by()` 一处，这里只如实带出去。
+        'disabled': _text(record.get('status')).lower() == STICKER_STATUS_DISABLED,
+        'disabledBy': sticker_disabled_by(record.get('disabledBy')),
+        #: 前端可直接用的**相对**地址（宿主会把插件页请求拼到插件名下）。
+        'file': file_name,
+        'thumbnailUrl': 'console/sticker-file?assetId=%s' % asset_id if asset_id else '',
+    }
+
+
+#: 共同作品（`interlude_work` 表，上游 rc28 `works.ts`；入口由本移植版补）的取数下限。
+#: 服务层没就绪时控制台回这个空壳，**不抛**（§29：一个没接线的功能不该让整页打不开）。
+WORKS_UNAVAILABLE_HINT = '共同作品尚未启用或服务层未就绪'
+#: 一件作品最多取多少行（一个参与者一行；正常只有个位数，卡上限是防脏库）。
+WORK_ROW_LIMIT = 200
+#: revision 预览长度：详情里只有 head 给全文，历史版本给长度 + 预览（64 × 8000 字
+#: 全量塞进一次响应会把面板拖垮，而界面主要看的是"谁在什么时候改了什么"）。
+WORK_REVISION_PREVIEW = 200
 
 
 # ===================================================================== #
@@ -332,6 +547,39 @@ def _text(value: Any) -> str:
     return value if isinstance(value, str) else ('' if value is None else str(value))
 
 
+def _truthy_boolean(value: Any) -> bool:
+    """布尔列的宽松读取：SQLite 存的是 0/1，`is True` 会漏掉 `1`（坑 8 的老病）。"""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _timestamp_text(value: Any) -> str:
+    """把时间列折成 ISO 文本（控制台只做展示，不做时间运算）。
+
+    `interlude_sticker` 的 `createdAt` / `updatedAt` 是 timestamp 列：
+    **原始行**（`Database.all` 直读）回来是 datetime，`db_get` 归一化后也是 datetime。
+    控制台把它当字符串渲染，所以这里统一成 ISO —— 否则
+    `String(datetime)` 会给出 `2026-09-01 10:00:00+00:00` 这种带空格的形式，
+    同一份数据在面板和别处显示得不一样（且前端 `new Date(...)` 在部分浏览器上解析不了）。
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ''
+    to_iso = getattr(value, 'isoformat', None)
+    if callable(to_iso):
+        try:
+            return str(to_iso())
+        except Exception:  # noqa: BLE001 - 坏值按空串
+            return ''
+    return str(value)
+
+
 def _record(value: Any) -> dict[str, Any]:
     """dict 取值：非 dict（旧库的 null、字符串）一律当空记录，不给控制台抛异常。"""
     return value if isinstance(value, dict) else {}
@@ -440,6 +688,23 @@ def _safe_all(
         return []
 
 
+#: 权限四档 → （中文标签，一句话说明）。顺序与 `platform_actions.PERMISSION_TIERS` 一致，
+#: 面板的下拉与统计卡都读它——档位名是**权限表里的值**，不能各写一份。
+PERMISSION_TIER_LABELS: dict[str, tuple[str, str]] = {
+    'global': ('所有人', '任何会话里都能用'),
+    'groupadmin': ('仅群主 / 管理员', '只在群里、且发言者是群主或管理员时能用'),
+    'admin': ('仅插件管理员', '只有 HDSI 管理员能用'),
+    'disabled': ('关闭', '任何会话都不能用这一条'),
+}
+
+#: 风险级别 → 中文标签（面板的风险徽章）。
+RISK_LABELS: dict[str, str] = {
+    'safe': '安全',
+    'sensitive': '敏感',
+    'dangerous': '危险',
+}
+
+
 class ConsoleApi:
     """控制台的数据来源。所有方法都是协程或纯同步读，返回可 JSON 序列化的 dict。"""
 
@@ -447,8 +712,42 @@ class ConsoleApi:
         self.bridge = bridge
 
     # ------------------------------------------------------------------ #
+    # Token 统计（本移植版新增）
+    # ------------------------------------------------------------------ #
+
+    async def token_stats(self, kind: str = 'day', from_value: str = '', to_value: str = '') -> dict[str, Any]:
+        """按天 / 周 / 月 / 自选范围汇总 Token 账本。
+
+        取数在 `console_api`（见 §29 的约定），数学在 `core/token_stats.py`（纯函数）。
+        表可能很大（一天一行 × 多个模型 × 多部剧本），所以**只取区间内的行**，
+        并把上限卡在 5000 行——真到那个量级说明跑了很久，页面要的是聚合而不是全量。
+        """
+        database = self.bridge.db
+        bounds = range_bounds(kind, datetime.now(), from_value, to_value)
+        rows = _safe_all(database, 'interlude_token_usage', None, 'day DESC', 5_000)
+        summary = summarize_usage(rows, bounds)
+        return {
+            'range': normalize_range(kind),
+            'from': bounds['from'],
+            'to': bounds['to'],
+            'timezone': 'server-local',
+            **summary,
+        }
+
+    # ------------------------------------------------------------------ #
     # 总览
     # ------------------------------------------------------------------ #
+
+    def health_snapshot(self, story_id: str = '') -> dict[str, Any]:
+        """读 service 的健康快照；service 未起或没有该能力时回零值空壳。"""
+        service = getattr(self.bridge, 'service', None)
+        reader = getattr(service, 'health_snapshot', None)
+        if not callable(reader):
+            return {}
+        try:
+            return reader(story_id) or {}
+        except Exception:  # noqa: BLE001 - 面板取数永远不许把整页打成 500
+            return {}
 
     async def overview(self, story_id: str = '') -> dict[str, Any]:
         database = self.bridge.db
@@ -479,6 +778,15 @@ class ConsoleApi:
                 'entry_count': entries,
             },
             'story': self._story_brief(current) if current else None,
+            # 上游 1.0.1-rc28 `health.ts`：自插件重载以来的滚动健康指标。
+            # 没有样本时返回零值快照（面板显示 0 而不是 500，见 §29 的控制台取数约定）。
+            'health': self.health_snapshot(_text(current.get('id'))) if current else {
+                'narrativeTotal': 0, 'narrativeFailed': 0, 'structureMissing': 0,
+                'recoverySaved': 0, 'replyModes': {}, 'sideTaskTotal': 0, 'sideTaskFailed': 0,
+                'proactiveTotal': 0, 'proactiveSent': 0, 'inputTokens': 0, 'cachedTokens': 0,
+                'latenciesMs': [], 'sinceAt': '', 'successRate': 1, 'structureMissingRate': 0,
+                'cacheHitRate': 0, 'proactiveRate': 0, 'medianLatencyMs': 0,
+            },
             'stories': [self._story_brief(item) for item in stories],
             'flags': self._flags(),
             'routing': self._routing_rows(),
@@ -487,6 +795,46 @@ class ConsoleApi:
                 'audio': self._note('audio'),
             },
             'counts': counts,
+            'context_metrics': self._context_metrics(current),
+        }
+
+    def _context_metrics(self, story: Any) -> dict[str, Any]:
+        """上轮上下文构成（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.4）。
+
+        存在剧本 `state.extensions.last_context_metrics` 里，只保留最近一轮。
+        读的时候顺手把 wire 段名翻成人话，前端不用再维护一份映射。
+        """
+        if not story:
+            return {}
+        try:
+            state = decode_story_state(story.get('state'))
+        except Exception:  # noqa: BLE001 - 旧库的 state 可能不成形状
+            return {}
+        extensions = state.get('extensions') if isinstance(state.get('extensions'), dict) else {}
+        metrics = extensions.get('last_context_metrics')
+        if not isinstance(metrics, dict):
+            return {}
+        sections = metrics.get('sections') if isinstance(metrics.get('sections'), dict) else {}
+        rows = [
+            {
+                'key': key,
+                'label': CONTEXT_SECTION_LABELS.get(key, key),
+                'items': int((value or {}).get('items') or 0),
+                'characters': int((value or {}).get('characters') or 0),
+            }
+            for key, value in sections.items()
+        ]
+        rows.sort(key=lambda row: -row['characters'])
+        return {
+            'at': _text(metrics.get('at')),
+            'phase': _text(metrics.get('phase')),
+            'participant_id': _text(metrics.get('participant_id')),
+            'assembly_ms': int(metrics.get('assembly_ms') or 0),
+            'items': int(metrics.get('items') or 0),
+            'characters': int(metrics.get('characters') or 0),
+            'payload_characters': int(metrics.get('payload_characters') or 0),
+            'estimated_tokens': int(metrics.get('estimated_tokens') or 0),
+            'sections': rows,
         }
 
     # ------------------------------------------------------------------ #
@@ -526,18 +874,27 @@ class ConsoleApi:
         vision = section.get('vision') or {}
         audio = section.get('audio') or {}
 
+        task_models = {
+            key: {
+                'label': label,
+                'astrbot_provider': self.bridge.task_model_id(key),
+                'modalities': sorted(self.bridge.task_provider_modalities(key)),
+            }
+            for key, label in (*CONSOLE_TASKS, ('audio', '语音转写'))
+        }
+        # v1.7.9：共同作品的独立写手也能指名 AstrBot Provider，但它的值还有一套
+        # "点名连接行"的老口径——所以这里用双读判定，老口径的值不会被报成 Provider。
+        task_models['works'] = {
+            'label': '共同作品写手',
+            'astrbot_provider': self.bridge.works_writer_named_provider(),
+            'modalities': sorted(self.bridge.task_provider_modalities('works')),
+        }
+
         return {
             'tasks': self._routing_rows(),
             # `audio` 不是聊天任务（它是"语音→文字"的转写模型，不参与叙事路由），
             # 所以不进 `tasks`，但页面要显示它，仍然放进 task_models。
-            'task_models': {
-                key: {
-                    'label': label,
-                    'astrbot_provider': self.bridge.task_model_id(key),
-                    'modalities': sorted(self.bridge.task_provider_modalities(key)),
-                }
-                for key, label in (*CONSOLE_TASKS, ('audio', '语音转写'))
-            },
+            'task_models': task_models,
             'connections': connections,
             'astrbot_providers': self._astrbot_providers(),
             'embedding': {
@@ -754,6 +1111,224 @@ class ConsoleApi:
         }
 
     # ------------------------------------------------------------------ #
+    # 平台动作目录与权限（唯一事实源：`core/platform_actions.py`）
+    # ------------------------------------------------------------------ #
+
+    async def actions_catalog(self) -> dict[str, Any]:
+        """「动作」面板的全部数据：动作目录 + 当前生效档位 + 统计。
+
+        三件事必须说清（与运行期**同源**，别在控制台里重算一套）：
+
+        1. `permission` = **权限表里的档位**（`effective_permission(..., None)`，
+           即用户在下拉里选的那个值；没选过就是目录声明的默认档）；
+        2. `enabled` = **实际能不能用**（`is_action_enabled(...)`）= 权限表档位
+           **与**配置开关的与关系：开关关掉时档位无论选什么都不生效；
+        3. `config_enabled` = 那个开关的原始值（`True` / `False` / `None` = 未配置）。
+
+        另外每条动作带 `backends`（人话标签，**顺序 = 优先级**）与 `napcat_only`，
+        顶层再给一份 `napcat_only` id 清单——面板的「只看 NapCat 专属（N）」筛选与徽章
+        都读它，**不在前端重算**（`backends` 的顺序就是运行期的通道优先级）。
+
+        配置开关的分组由 `platform_actions.action_config_group()` 给出（**按类别，点分路径**：
+        群管理类进 `robot_actions.group`、空间类进 `robot_actions.qzone`、其余进
+        `robot_actions.chat`，危险动作没有单独的组），子键 = 动作 id。
+        **分组不存在 = 未配置 = 不限制**，
+        所以旧版本升级上来的用户不会因为 schema 还没落地就整页显示"全关"。
+        """
+        table = self._action_permissions()
+        switches = self._action_switches()
+        actions: list[dict[str, Any]] = []
+        risk_counts = {level: 0 for level in platform_actions.RISK_LEVELS}
+        tier_counts = {tier: 0 for tier in platform_actions.PERMISSION_TIERS}
+        enabled_total = 0
+        risky_enabled = 0
+        for item in platform_actions.ACTIONS.values():
+            switch = switches.get(item.id)
+            permission = platform_actions.effective_permission(item.id, table, None)
+            enabled = platform_actions.is_action_enabled(item.id, table, switch)
+            risk_counts[item.risk] = risk_counts.get(item.risk, 0) + 1
+            tier_counts[permission] = tier_counts.get(permission, 0) + 1
+            if enabled:
+                enabled_total += 1
+                if item.risk == 'dangerous':
+                    risky_enabled += 1
+            actions.append({
+                'id': item.id,
+                'category': item.category,
+                'category_label': platform_actions.ACTION_CATEGORIES.get(item.category, item.category),
+                'label': item.label,
+                'summary': item.summary,
+                'risk': item.risk,
+                'default_permission': item.default_permission,
+                'permission': permission,
+                'enabled': enabled,
+                'config_enabled': switch,
+                'group': platform_actions.action_config_group(item),
+                'returns': item.returns,
+                # 后端标注（顺序 = 优先级）：面板据此打徽章、聚「NapCat 专属」。
+                # `napcat_only` 与 core 的 `PlatformAction.napcat_only` 同源，前端不再自己判。
+                'backends': platform_actions.backend_labels(item),
+                'napcat_only': item.napcat_only,
+                # 适用范围与**这条动作实际适用**的档位：非群聊动作不下发「仅群管」
+                # （选了等于关掉，界面上不该出现），前端下拉直接读它。
+                'scopes': list(item.scopes),
+                'tiers': list(platform_actions.permission_tiers_for(item.id)),
+                'params': [
+                    {
+                        'name': param.name,
+                        'label': param.label,
+                        'type': param.type,
+                        'required': bool(param.required),
+                        'minimum': param.minimum,
+                        'maximum': param.maximum,
+                        'choices': list(param.choices),
+                        'note': param.note,
+                    }
+                    for param in item.params
+                ],
+            })
+        return {
+            'actions': actions,
+            'tiers': [
+                {
+                    'id': tier,
+                    'label': PERMISSION_TIER_LABELS.get(tier, (tier, ''))[0],
+                    'description': PERMISSION_TIER_LABELS.get(tier, (tier, ''))[1],
+                }
+                for tier in platform_actions.PERMISSION_TIERS
+            ],
+            'groups': self._action_groups(),
+            # 逐字用 core 的常量（面板要显示的就是这句原话）。
+            'risk_warning': platform_actions.RISK_WARNING,
+            'risk_labels': dict(RISK_LABELS),
+            'risky': [item.id for item in platform_actions.risky_actions()],
+            # NapCat 专属动作（含"走 NapCat WS 拿 cookie 打 QZone CGI"的空间动作）：
+            # 面板的「只看 NapCat 专属」筛选与说明区都用它，顺序与 core 一致。
+            'napcat_only': [item.id for item in platform_actions.napcat_actions()],
+            'backend_labels': dict(platform_actions.BACKEND_LABELS),
+            'permissions_path': self._action_permissions_file(),
+            'stats': {
+                'total': len(actions),
+                'enabled': enabled_total,
+                'disabled': len(actions) - enabled_total,
+                'risky': risk_counts.get('dangerous', 0),
+                'risky_enabled': risky_enabled,
+                'napcat_only': sum(1 for row in actions if row['napcat_only']),
+                'risk': risk_counts,
+                'permissions': tier_counts,
+            },
+        }
+
+    async def set_action_permission(self, action_id: Any, tier: Any) -> dict[str, Any]:
+        """把某个动作写进权限表（`action_permissions.json`），返回归一化后的整表。
+
+        未知动作 / 未知档位**一律拒绝**（映射成 400）：权限表是安全边界，
+        静默接受一个拼错的动作 id 等于让用户以为"我关了它"，其实什么都没关。
+        """
+        action = platform_actions.ACTIONS.get(_text(action_id).strip())
+        if action is None:
+            raise ConsoleError('未知动作：%s' % (_text(action_id).strip() or '(空)'))
+        level = _text(tier).strip().lower()
+        if level not in platform_actions.PERMISSION_TIERS:
+            raise ConsoleError('未知权限档位：%s（可选：%s）' % (
+                _text(tier) or '(空)', ' / '.join(platform_actions.PERMISSION_TIERS),
+            ))
+        allowed = platform_actions.permission_tiers_for(action.id)
+        if level not in allowed:
+            # 「仅群管」对私聊动作没有意义：存下去只会变成一个永远不生效的档位。
+            raise ConsoleError('「%s」不适用于动作「%s」（可选：%s）' % (
+                PERMISSION_TIER_LABELS.get(level, (level, ''))[0], action.label,
+                ' / '.join(PERMISSION_TIER_LABELS.get(t, (t, ''))[0] for t in allowed),
+            ))
+        table = self._action_permissions()
+        table[action.id] = level
+        saved = self._save_action_permissions(table)
+        return {
+            'action': action.id,
+            'tier': level,
+            'permissions': saved,
+            'permissions_path': self._action_permissions_file(),
+            'changed': '%s 的权限档位 → %s' % (
+                action.label, PERMISSION_TIER_LABELS.get(level, (level, ''))[0],
+            ),
+        }
+
+    async def reset_action_permissions(self) -> dict[str, Any]:
+        """清空权限表：所有动作回到目录声明的默认档（危险动作仍然默认关闭）。"""
+        saved = self._save_action_permissions({})
+        return {
+            'permissions': saved,
+            'permissions_path': self._action_permissions_file(),
+            'changed': '动作权限表已清空（全部回到默认档位）',
+        }
+
+    def _action_permissions(self) -> dict[str, str]:
+        """当前权限表（归一化；读不到就当空表 = 全部走默认档，绝不抛）。
+
+        坏文件由桥接侧 `_load_action_permissions()` 负责 warn，这里只保证面板能打开。
+        """
+        try:
+            raw = self.bridge.action_permissions()
+        except Exception:  # noqa: BLE001 - 权限表读取失败不该让面板打不开
+            return {}
+        return platform_actions.normalize_permissions(raw)
+
+    def _save_action_permissions(self, table: dict[str, str]) -> dict[str, str]:
+        """写权限表。桥接不支持（老版本 / 测试桩）或写盘失败时给**可读的 400**。"""
+        saver = getattr(self.bridge, 'save_action_permissions', None)
+        if not callable(saver):
+            raise ConsoleError('当前桥接不支持写入动作权限表，请升级插件后重试')
+        try:
+            return platform_actions.normalize_permissions(saver(table))
+        except ConsoleError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 写不进去要说出来，不能假装成功
+            raise ConsoleError('写入动作权限表失败：%s' % error)
+
+    def _action_switches(self) -> dict[str, Any]:
+        """每个动作的配置开关值：`True` / `False` / `None`（分组或键不存在 = 未配置）。
+
+        只读 `bridge.section(分组)`，读不到就是未配置——总闸没配等于不限制，
+        与 `effective_permission(enabled=None)` 的语义一致。
+        """
+        sections: dict[str, dict[str, Any]] = {}
+        switches: dict[str, Any] = {}
+        for item in platform_actions.ACTIONS.values():
+            group = platform_actions.action_config_group(item)
+            if group not in sections:
+                try:
+                    section = self.bridge.section(group)
+                except Exception:  # noqa: BLE001 - 取配置失败按"未配置"处理
+                    section = None
+                sections[group] = section if isinstance(section, dict) else {}
+            value = sections[group].get(item.id)
+            switches[item.id] = value if isinstance(value, bool) else None
+        return switches
+
+    def _action_groups(self) -> dict[str, str]:
+        """配置分组 id → 组标题（面板用它说明"开关在哪一组"）。
+
+        标题来自 `platform_actions.ACTION_CONFIG_GROUP_LABELS`——父组下面三个子组
+        （会话动作 / 群管理动作 / QQ 空间动作），是点分路径的键。表里没有的分组
+        才回落到类别标签（"先到的类别定标签"会把一整组标成「互动」，而那一组里
+        还有消息 / 历史 / 状态 / 资料 / 语音 / 联系人）。
+        """
+        groups: dict[str, str] = {
+            group: label
+            for group, label in platform_actions.ACTION_CONFIG_GROUP_LABELS.items()
+        }
+        for category, label in platform_actions.ACTION_CATEGORIES.items():
+            group = platform_actions.ACTION_CONFIG_GROUPS.get(category)
+            if group:
+                groups.setdefault(group, label)
+        return groups
+
+    def _action_permissions_file(self) -> str:
+        """权限表文件的实际路径（页面上写出来，用户能自己去看 / 备份）。"""
+        data_dir = _text(getattr(self.bridge, 'data_dir', ''))
+        return os.path.join(data_dir, 'action_permissions.json') if data_dir else 'action_permissions.json'
+
+    # ------------------------------------------------------------------ #
     # 配置页（schema 驱动：所有可配置项都能在控制台改）
     # ------------------------------------------------------------------ #
 
@@ -770,13 +1345,30 @@ class ConsoleApi:
         for group_key, group_spec in schema.items():
             if not isinstance(group_spec, dict) or group_spec.get('type') != 'object':
                 continue
-            current = raw.get(group_key)
-            current = current if isinstance(current, dict) else {}
+            # 当前值取**读取侧看到的那一份**（含 `LEGACY_SECTION_MERGES` 的 N:1 归并）：
+            # 配置页显示的必须是运行期真正生效的值，否则又会出现"界面开着、行为关着"
+            # （坑 34 的老病）。归并不是目标的普通分组原样返回。
+            current = merge_legacy_section_values(raw, group_key, raw.get(group_key))
             fields: list[dict[str, Any]] = []
             for field_key, spec in (group_spec.get('items') or {}).items():
                 if not isinstance(spec, dict):
                     continue
                 path = '%s.%s' % (group_key, field_key)
+                # 这个字段**本身就是归并目标**时（v1.7.4 起：`robot_actions.chat` /
+                # `runtime.input_status` 这类嵌套子组；v1.7.5 起还有键级搬迁的
+                # `model_center.audio`），当前值也必须取"读取侧看到的那一份"——否则内嵌
+                # 表单会拿磁盘上的默认值渲染，用户在控制台里改一项就把旧位置里没读出来的
+                # 用户选择整块覆盖掉（坑 34 的同款：界面显示与运行期不一致）。
+                if path in LEGACY_MERGE_TARGETS:
+                    # 组级归并 + **键级搬迁**（v1.7.5：语音两项 → `model_center.audio`）
+                    # 共用同一张判定表：配置页显示的必须是运行期真正生效的那一份。
+                    field_value = merge_legacy_section_values(
+                        raw, path, read_section_path(raw, path),
+                    )
+                    field_present = bool(field_value)
+                else:
+                    field_value = current.get(field_key, None)
+                    field_present = field_key in current
                 row = schema_row_fields(spec)
                 fields.append({
                     'key': field_key,
@@ -803,8 +1395,8 @@ class ConsoleApi:
                     'special': _text(spec.get('_special')),
                     'invisible': bool(spec.get('invisible')),
                     'advanced': bool(spec.get('advanced')),
-                    'value': _mask_secrets(current.get(field_key, None)),
-                    'present': field_key in current,
+                    'value': _mask_secrets(field_value),
+                    'present': field_present,
                     'note': host_editor_note(path, spec),
                     'delegated': path in DELEGATED_FIELDS,
                 })
@@ -830,6 +1422,14 @@ class ConsoleApi:
         这条接口把老版本的"手写白名单"升级成"整份 schema 白名单"：
         控制台现在能改所有可配置项，但仍然改不动 schema 之外的东西。
         写盘走 `Bridge.save_raw_config()`（与配置导入同一条路径），并在内存里立即生效。
+
+        路径可以是**嵌套的**（`robot_actions.chat.send_poke` / `runtime.input_status`）：
+        `_resolve_schema_field` 只沿 `type: object` 的 `items` 往下走，`_set_schema_path`
+        沿途浅拷贝父字典，所以父组的其它子组不会被连带覆盖。
+
+        v1.7.4 起不再需要 v1.7.3 那个 `_sync_shared_legacy_switches`：`actions_risks`
+        已退出归并（每个旧组只供给一个目标），折叠会把旧组清空，新路径说了算（见
+        `core/service/config.py` 的 `LEGACY_SECTION_MERGES`）。
         """
         schema = load_config_schema()
         spec = _resolve_schema_field(schema, path)
@@ -902,8 +1502,36 @@ class ConsoleApi:
         return {
             'select_provider': providers,
             'select_provider_stt': providers,
+            # 语音走的是**宿主的 TTS 服务商**，不是对话模型：复用 `_astrbot_providers()`
+            # 会选出一个发不出语音的 id（用户会以为"配了没用"）。
+            'select_provider_tts': self._tts_choices(),
             'select_persona': await self._persona_choices(),
         }
+
+    def _tts_choices(self) -> list[dict[str, str]]:
+        """`_special: select_provider_tts` 的候选项：宿主里配好的 TTS 服务商。"""
+        choices: list[dict[str, str]] = [{'value': '', 'label': '（留空 = 默认 TTS）'}]
+        lister = getattr(self.bridge, '_tts_providers', None)
+        rows = []
+        if callable(lister):
+            try:
+                rows = list(lister() or [])
+            except Exception as error:  # noqa: BLE001 - 读不到不影响整页
+                log_fallback('debug', '取 TTS 服务商候选项失败：%s', error)
+                rows = []
+        for provider in rows:
+            identifier = _text(
+                getattr(provider, 'provider_id', '') or getattr(provider, 'id', '')
+                or getattr(provider, 'name', '')
+            )
+            if not identifier:
+                continue
+            label = _text(getattr(provider, 'name', '')) or identifier
+            choices.append({
+                'value': identifier,
+                'label': '%s · %s' % (identifier, label) if label != identifier else identifier,
+            })
+        return choices
 
     async def _persona_choices(self) -> list[dict[str, str]]:
         """AstrBot 里的人格列表（`select_persona` 的候选项）。
@@ -932,6 +1560,10 @@ class ConsoleApi:
     CONNECTION_FIELDS: dict[str, str] = {
         'label': 'str', 'enabled': 'bool', 'mode': 'str', 'endpoint': 'str',
         'model': 'str', 'response_format': 'str',
+        # 协议（v1.7.0）：`chat-completions`（默认）/ `anthropic-messages`，
+        # 以及 Anthropic 的缓存标记。**漏进白名单 = 控制台保存时静默丢掉这两项**
+        # （schema 加了也没用，用户填了不生效）。
+        'protocol': 'str', 'anthropic_cache': 'bool',
         'temperature': 'float', 'top_p': 'float', 'max_tokens': 'int', 'timeout': 'int',
         'extra_headers': 'str', 'extra_body': 'str',
         'reasoning_effort': 'str', 'deepseek_thinking': 'str', 'deepseek_reasoning_effort': 'str',
@@ -943,6 +1575,8 @@ class ConsoleApi:
     TASK_FLAGS: tuple[str, ...] = (
         'use_for_main', 'use_for_compaction', 'use_for_alter',
         'use_for_embedding', 'use_for_stickers', 'use_for_vision',
+        # 上游 1.0.1-rc24：世界播种器的模型选择并入用途勾选。
+        'use_for_world_seeding',
     )
 
     async def save_connection(self, payload: Any) -> dict[str, Any]:
@@ -998,7 +1632,7 @@ class ConsoleApi:
 
         endpoint = _text(row.get('endpoint')).strip()
         if endpoint and not endpoint.lower().startswith(('http://', 'https://')):
-            raise ConsoleError('地址要以 http:// 或 https:// 开头（填完整的 Chat Completions 地址）')
+            raise ConsoleError('地址要以 http:// 或 https:// 开头（填完整的地址：Chat Completions 是 …/chat/completions，Anthropic 是 …/messages）')
         row['endpoint'] = endpoint
 
         label = _text(row.get('label')).strip()
@@ -1323,6 +1957,1100 @@ class ConsoleApi:
         }
 
     # ------------------------------------------------------------------ #
+    # 共同作品（上游 rc28 `works.ts` 的界面；面板「作品」）
+    #
+    # 上游只有纯逻辑 + 存储抽象，service 层一行都没接——配置组、payload 与这里的
+    # 面板入口都是本移植版补的。有一条语义不能含糊：**只有用户能接受 / 驳回**，
+    # 她只能"提议"（模型侧的提案在 `chunk14.apply_work_proposal` 里落成待决）。
+    # 所以这一页的写操作全是"用户动作"，没有"让模型自己接受"的入口。
+    #
+    # 取数走服务层（`chunk14` 的 `works_snapshot` / `shared_work_state`），拿不到就回
+    # 空壳 + 说明（§29），绝不 500；写操作只在**用户看得懂的事实**上给 400
+    # （未知作品 / 未知或已决提案 / 超长正文），其余异常也压成 400 文案。
+    # ------------------------------------------------------------------ #
+
+    async def works_overview(self, story_id: str = '') -> dict[str, Any]:
+        """「作品」面板的清单：这部剧本里每个参与者的共同作品各一行。
+
+        行里只放清单要用的东西（标题、当前版本号、待决提案数、运行中的写手任务数、
+        最后修改时间）；正文在 `work_detail` 里给。`broken` 那一行代表"库里有这件作品
+        但数据形状不被识别"——照实报出来，别让它静默消失。
+        """
+        config = self._works_config()
+        enabled = bool(config['enabled'])
+        service = self._works_service()
+        story = self._current_story(story_id)
+        if service is None:
+            payload = self._works_shell('works_snapshot')
+            payload['story'] = self._story_brief(story) if story else None
+            payload['works'] = []
+            return payload
+        if not story:
+            return {
+                'available': True,
+                'enabled': enabled,
+                'generation_mode': _text(config.get('generation_mode')),
+                'explain': self._works_explain(),
+                'story': None,
+                'works': [],
+                'hint': '还没有剧本：先和她聊一句，剧本会自动建起来',
+            }
+        sid = _text(story.get('id'))
+        names = self._participant_names(sid)
+        works: list[dict[str, Any]] = []
+        for row in _safe_all(self.bridge.db, 'interlude_work', {'storyId': sid}, None, WORK_ROW_LIMIT):
+            if not isinstance(row, dict):
+                continue
+            participant_id = _text(row.get('participantId'))
+            snapshot = await self._works_snapshot(service, sid, participant_id)
+            works.append(self._work_brief(
+                row, snapshot, participant_id,
+                names.get(participant_id) or participant_id, enabled,
+            ))
+        works.sort(
+            key=lambda item: (_text(item.get('updated_at')), _text(item.get('participant'))),
+            reverse=True,
+        )
+        return {
+            'available': True,
+            'enabled': enabled,
+            'generation_mode': _text(config.get('generation_mode')),
+            'explain': self._works_explain(),
+            'story': self._story_brief(story),
+            'works': works,
+            'hint': '',
+        }
+
+    async def work_detail(self, work_id: str) -> dict[str, Any]:
+        """一件作品的全貌：当前正文、版本时间线、提案、写手任务、能不能起草。
+
+        正文是**创作素材**，原样回，这里不做任何"安全改写"（上游把这条写进了提示词：
+        文本本身绝不能被当成指令）。历史版本只带 `content_chars` + `preview`，
+        只有 head 带全文——64 个版本 × 8000 字不该塞进一次面板响应。
+        """
+        config = self._works_config()
+        enabled = bool(config['enabled'])
+        service = self._works_service()
+        wid = _text(work_id).strip()
+        if service is None:
+            payload = self._works_shell('works_snapshot')
+            payload['work_id'] = wid
+            return payload
+        if not wid:
+            raise ConsoleError('请选择一件共同作品')
+        row = self._work_row(wid)
+        if row is None:
+            raise ConsoleError('找不到这件共同作品：%s' % wid)
+        sid = _text(row.get('storyId'))
+        participant_id = _text(row.get('participantId'))
+        story = self._story_by_id(sid)
+        record = self._participant_row(sid, participant_id)
+        name = _text(record.get('displayName')) or participant_id
+        snapshot = await self._works_snapshot(service, sid, participant_id)
+        if snapshot is None:
+            # 坏行：原数据一律保留、绝不覆盖（`core/works.py` 的硬校验），控制台照实说。
+            return {
+                'available': True,
+                'enabled': enabled,
+                'generation_mode': _text(config.get('generation_mode')),
+                'explain': self._works_explain(),
+                'broken': True,
+                'work_id': wid,
+                'story': self._story_brief(story) if story else None,
+                'participant_id': participant_id,
+                'participant': name,
+                'title': '',
+                'head': '',
+                'generation': _int(row.get('generation')),
+                'content': '',
+                'content_chars': 0,
+                'revision': 0,
+                'revision_count': 0,
+                'revisions': [],
+                'proposals': [],
+                'jobs': [],
+                'pending_count': 0,
+                'jobs_running': 0,
+                'job_count': 0,
+                'may_propose': False,
+                'may_propose_reason': '这件作品的数据形状不被识别，先别动它',
+                'last_failure': None,
+                'limits': self._work_limits(),
+                'hint': '这件作品的数据形状不被识别：原数据已保持原样，控制台没有做任何写入。',
+            }
+        state = self._work_state(row)
+        revisions = [item for item in (snapshot.get('revisions') or []) if isinstance(item, dict)]
+        proposals = [item for item in (snapshot.get('proposals') or []) if isinstance(item, dict)]
+        jobs = [item for item in (snapshot.get('jobs') or []) if isinstance(item, dict)]
+        head = _text(snapshot.get('head') or state.get('head'))
+        head_revision = next((item for item in revisions if _text(item.get('id')) == head), None)
+        content = _text((head_revision or {}).get('content'))
+        projection = await self._works_state(service, sid, participant_id)
+        may_propose, reason = self._work_may_propose(enabled, jobs, projection)
+        # 服务层的投影比行内 state 更权威（`running` 但进程里没有的已经改标 `interrupted`），
+        # 但它只在启用时存在；两边都拿不到就不编一条假的失败记录。
+        last_failure = _record_or_none((projection or {}).get('lastFailure'))
+        if last_failure is None:
+            last_failure = _record_or_none(state.get('lastFailure'))
+        return {
+            'available': True,
+            'enabled': enabled,
+            'generation_mode': _text(config.get('generation_mode')),
+            'explain': self._works_explain(),
+            'broken': False,
+            'work_id': wid,
+            'story': self._story_brief(story) if story else None,
+            'participant_id': participant_id,
+            'participant': name,
+            'title': _text(snapshot.get('title') or state.get('title')),
+            'head': head,
+            'generation': _int(snapshot.get('generation', row.get('generation'))),
+            'content': content,
+            'content_chars': len(content),
+            'revision': self._revision_ordinal(revisions, head),
+            'revision_count': len(revisions),
+            'revisions': [
+                self._revision_brief(item, index, head)
+                for index, item in enumerate(revisions, 1)
+            ],
+            'proposals': [
+                self._proposal_brief(item, self._revision_ordinal(revisions, _text(item.get('baseRevisionId'))))
+                for item in proposals
+            ],
+            'jobs': [self._job_brief(item) for item in jobs],
+            'pending_count': len([item for item in proposals if _text(item.get('status')) == 'pending']),
+            'jobs_running': len([item for item in jobs if _text(item.get('status')) == 'running']),
+            'job_count': len(jobs),
+            'may_propose': may_propose,
+            'may_propose_reason': reason,
+            'last_failure': last_failure,
+            'limits': self._work_limits(),
+            'hint': '',
+        }
+
+    async def accept_work_proposal(self, work_id: str, proposal_id: str) -> dict[str, Any]:
+        """接受一条提案 → 立刻多一个版本（**只有用户能做这件事**）。"""
+        return await self._resolve_work_proposal(work_id, proposal_id, accept=True)
+
+    async def reject_work_proposal(self, work_id: str, proposal_id: str) -> dict[str, Any]:
+        """驳回一条提案 → 正文不动，只留一条结论（同样只有用户能做）。"""
+        return await self._resolve_work_proposal(work_id, proposal_id, accept=False)
+
+    async def create_work(
+        self,
+        story_id: Any = '',
+        participant_id: Any = '',
+        title: Any = '',
+        content: Any = '',
+    ) -> dict[str, Any]:
+        """用户建**第一件**作品（面板「新建作品」）。
+
+        为什么必须有这个入口：上游 `SharedWorks.create` 是整条链唯一的起点——保存提案 /
+        手改 / 起草都要求作品已经存在，没有它面板就是"只能看不能开始"。
+
+        「已有共同作品」时服务层会拒（**绝不覆盖**），那条文案原样透给用户。
+        """
+        service = self._works_service()
+        member = getattr(service, 'create_work', None) if service is not None else None
+        if not callable(member):
+            return self._works_shell('create_work')
+        sid = await self._story_id_for_write(story_id)
+        pid = _text(participant_id).strip()
+        if not pid:
+            raise ConsoleError('请选择这件作品属于哪个私聊（参与者）')
+        if not self._participant_exists(sid, pid):
+            raise ConsoleError('这个参与者不在当前剧本里：%s（先让她和这个账号说过话）' % pid)
+        name = _text(title)
+        if not name.strip():
+            raise ConsoleError('给这件作品起个标题')
+        if _text_length(name) > WORK_TITLE_MAX:
+            raise ConsoleError('标题最多 %d 字（当前 %d 字）' % (WORK_TITLE_MAX, _text_length(name)))
+        text = content if isinstance(content, str) else ''
+        if not text.strip():
+            raise ConsoleError('作品正文不能为空')
+        if _text_length(text) > WORK_CONTENT_MAX:
+            raise ConsoleError('作品正文最多 %d 字（当前 %d 字）' % (WORK_CONTENT_MAX, _text_length(text)))
+        try:
+            result = await member(sid, pid, name, text)
+        except Exception as error:  # noqa: BLE001
+            raise ConsoleError('新建作品失败：%s' % error) from error
+        self._require_work_ok(result, '新建作品')
+        wid = _text((result or {}).get('workId')) if isinstance(result, dict) else ''
+        if not wid:
+            raise ConsoleError('新建作品失败：服务层没有返回 workId')
+        payload = await self.work_detail(wid)
+        payload['result'] = _work_result_brief(result)
+        payload['changed'] = 'work-create %s' % wid
+        return payload
+
+    async def cancel_work_generation(self, work_id: Any, job_id: Any) -> dict[str, Any]:
+        """取消一个还在跑的写手任务（迟到的结果会被丢弃）。
+
+        `interrupted`（插件重启过、库里还留着 `running`）的任务也允许取消——它一直压着
+        `mayPropose`，取消是把它放开的唯一入口。
+        """
+        service = self._works_service()
+        member = getattr(service, 'cancel_work_generation', None) if service is not None else None
+        if not callable(member):
+            return self._works_shell('cancel_work_generation')
+        wid, row = self._work_row_for_write(work_id)
+        jid = _text(job_id).strip()
+        if not jid:
+            raise ConsoleError('请选择要取消的写手任务')
+        sid = _text(row.get('storyId'))
+        participant_id = _text(row.get('participantId'))
+        snapshot = await self._works_snapshot(service, sid, participant_id)
+        jobs = [
+            item for item in ((snapshot or {}).get('jobs') or []) if isinstance(item, dict)
+        ] or [
+            item for item in (self._work_state(row).get('jobs') or []) if isinstance(item, dict)
+        ]
+        job = next((item for item in jobs if _text(item.get('id')) == jid), None)
+        if job is None:
+            raise ConsoleError('找不到这个写手任务：%s' % jid)
+        status = _text(job.get('status'))
+        if status not in ('running', 'interrupted'):
+            raise ConsoleError('这个任务已经结束了（%s），不需要取消' % (status or '未知状态'))
+        try:
+            result = await member(sid, participant_id, jid)
+        except Exception as error:  # noqa: BLE001
+            raise ConsoleError('取消任务失败：%s' % error) from error
+        self._require_work_ok(result, '取消任务')
+        payload = await self.work_detail(wid)
+        payload['changed'] = 'work-cancel %s' % jid
+        return payload
+
+    async def edit_work(self, work_id: str, content: Any, reason: Any = '') -> dict[str, Any]:
+        """用户手改：登记一条用户提案并立即接受 → 一条新 revision（head 前移）。
+
+        `reason` 是提案的理由（服务层要求非空、≤500 字）。界面把它当可选输入，
+        所以留空时补一句"由用户手动修改"——**不伪造**，只是把"这是谁改的"说清楚。
+        """
+        service = self._works_service()
+        member = getattr(service, 'edit_work', None) if service is not None else None
+        if not callable(member):
+            return self._works_shell('edit_work')
+        wid, row = self._work_row_for_write(work_id)
+        text = content if isinstance(content, str) else ''
+        if not text.strip():
+            raise ConsoleError('作品正文不能为空')
+        if _text_length(text) > WORK_CONTENT_MAX:
+            raise ConsoleError(
+                '作品正文最多 %d 字（当前 %d 字）' % (WORK_CONTENT_MAX, _text_length(text)),
+            )
+        note = _text(reason).strip()
+        if _text_length(note) > WORK_REASON_MAX:
+            raise ConsoleError('修改理由最多 %d 字（当前 %d 字）' % (WORK_REASON_MAX, _text_length(note)))
+        snapshot = await self._works_snapshot(service, _text(row.get('storyId')), _text(row.get('participantId')))
+        head = _text((snapshot or {}).get('head'))
+        if not head:
+            raise ConsoleError('这件作品的数据形状不被识别，先别改它')
+        edit = {
+            'baseRevisionId': head,
+            'content': text,
+            'reason': note or '由用户手动修改',
+        }
+        try:
+            result = await self._call_work_edit(
+                member, _text(row.get('storyId')), _text(row.get('participantId')), edit,
+            )
+        except Exception as error:  # noqa: BLE001 - 写失败要说出来，不能假装成功
+            raise ConsoleError('保存失败：%s' % error) from error
+        self._require_work_ok(result, '保存')
+        payload = await self.work_detail(wid)
+        payload['result'] = _work_result_brief(result)
+        payload['changed'] = 'work-edit %s' % wid
+        return payload
+
+    async def start_work_generation(self, work_id: str, brief: Any) -> dict[str, Any]:
+        """「让她起草」：起一次异步写手任务（结果会作为**待决提案**回来）。"""
+        service = self._works_service()
+        member = getattr(service, 'start_work_generation', None) if service is not None else None
+        if not callable(member):
+            return self._works_shell('start_work_generation')
+        wid, row = self._work_row_for_write(work_id)
+        text = brief if isinstance(brief, str) else ''
+        if not text.strip():
+            raise ConsoleError('起草前先写一句创作意图')
+        if _text_length(text) > WORK_BRIEF_MAX:
+            raise ConsoleError('创作意图最多 %d 字（当前 %d 字）' % (WORK_BRIEF_MAX, _text_length(text)))
+        sid = _text(row.get('storyId'))
+        participant_id = _text(row.get('participantId'))
+        snapshot = await self._works_snapshot(service, sid, participant_id)
+        head = _text((snapshot or {}).get('head'))
+        if not head:
+            raise ConsoleError('这件作品的数据形状不被识别，先别让它起草')
+        try:
+            result = await self._call_work_generate(member, sid, participant_id, {
+                'baseRevisionId': head,
+                'brief': text,
+            })
+        except Exception as error:  # noqa: BLE001
+            raise ConsoleError('起草任务没能开始：%s' % error) from error
+        self._require_work_ok(result, '起草任务')
+        payload = await self.work_detail(wid)
+        payload['job'] = (result or {}).get('job') if isinstance(result, dict) else None
+        payload['model_id'] = _text((result or {}).get('modelId')) if isinstance(result, dict) else ''
+        payload['changed'] = 'work-generate %s' % wid
+        return payload
+
+    async def export_work(self, work_id: str) -> dict[str, Any]:
+        """导出整件作品：`{parts, count}`，每段都在单条 QQ 消息的安全长度内。
+
+        分段**由服务层的 `works_dump` 做**（`split_dump_parts`），控制台不再切一遍
+        ——二次切分会把 `''.join(parts)` 的还原语义搞坏。
+        """
+        config = self._works_config()
+        service = self._works_service()
+        wid = _text(work_id).strip()
+        if service is None:
+            payload = self._works_shell('works_dump')
+            payload.update({'work_id': wid, 'title': '', 'parts': [], 'count': 0, 'chars': 0})
+            return payload
+        if not wid:
+            raise ConsoleError('请选择一件共同作品')
+        row = self._work_row(wid)
+        if row is None:
+            raise ConsoleError('找不到这件共同作品：%s' % wid)
+        sid = _text(row.get('storyId'))
+        participant_id = _text(row.get('participantId'))
+        snapshot = await self._works_snapshot(service, sid, participant_id)
+        title = _text((snapshot or {}).get('title') or self._work_state(row).get('title'))
+        parts = await self._works_dump(service, sid, participant_id)
+        if not parts:
+            return {
+                'available': True,
+                'enabled': bool(config['enabled']),
+                'work_id': wid,
+                'title': title,
+                'parts': [],
+                'count': 0,
+                'chars': 0,
+                'hint': '这件作品还没有正文，没有可导出的内容',
+            }
+        return {
+            'available': True,
+            'enabled': bool(config['enabled']),
+            'work_id': wid,
+            'title': title,
+            'parts': parts,
+            'count': len(parts),
+            'chars': sum(len(part) for part in parts),
+            'hint': '',
+        }
+
+    # ------------------------------------------------------------------ #
+    # 表情库面板（v1.8.0）
+    # ------------------------------------------------------------------ #
+
+    async def stickers(
+        self,
+        status: str = '',
+        kind: str = '',
+        source: str = '',
+        query: str = '',
+        limit: Any = 60,
+        offset: Any = 0,
+        group: str = '',
+    ) -> dict[str, Any]:
+        """本地表情库清单（**空库返回空壳，从不 500**）。
+
+        取数走窗口（`STICKER_ROW_LIMIT`）+ `truncated`，与 `_chat_rows()` 同一套做法：
+        素材库可以很大，把整张表拉进内存是控制台最容易犯的错（坑 54）。
+
+        筛选（都可选）：`status` = `active` / `pending` / `missing` / `disabled`；
+        `kind` = `animated` / `image`；`source` = `auto` / `manual`；
+        `group` = **分组 id**（`console/sticker-groups` 的 `groupId`，精确匹配；
+        留空 = 不过滤——与其他筛选项同一条"空即不过滤"的规矩）；
+        `query` 在描述 / 名字 / assetId 里做子串匹配（大小写不敏感）。
+        """
+        rows = [
+            row for row in _safe_all(
+                self.bridge.db, 'interlude_sticker', None, 'createdAt DESC', STICKER_ROW_LIMIT,
+            ) if isinstance(row, dict)
+        ]
+        # 旧库 / 缺列时 `createdAt` 可能是空串：稳定地按 id 倒序兜一层。
+        rows.sort(
+            key=lambda row: (_timestamp_text(row.get('createdAt')), _int(row.get('id'), 0)),
+            reverse=True,
+        )
+        truncated = len(rows) >= STICKER_ROW_LIMIT
+        names = await self._sticker_group_names()
+        items = [sticker_item(row, names) for row in rows]
+        wanted_status = _text(status).strip().lower()
+        wanted_kind = _text(kind).strip().lower()
+        wanted_source = _text(source).strip().lower()
+        wanted_group = _text(group).strip()
+        needle = _text(query).strip().lower()
+        if wanted_status:
+            items = [item for item in items if _text(item.get('status')).lower() == wanted_status]
+        if wanted_kind:
+            items = [item for item in items if item.get('kind') == wanted_kind]
+        if wanted_source:
+            items = [item for item in items if item.get('source') == wanted_source]
+        if wanted_group:
+            items = [item for item in items if _text(item.get('groupId')) == wanted_group]
+        if needle:
+            items = [
+                item for item in items
+                if needle in _text(item.get('description')).lower()
+                or needle in _text(item.get('name')).lower()
+                or needle in _text(item.get('assetId')).lower()
+            ]
+        total = len(items)
+        size = max(1, min(STICKER_PAGE_MAX, _int(limit, 60) or 60))
+        start = max(0, _int(offset, 0))
+        window = items[start:start + size]
+        counts = {'total': total, 'active': 0, 'pending': 0, 'missing': 0, 'disabled': 0}
+        for item in items:
+            key = _text(item.get('status')).lower()
+            if key in counts:
+                counts[key] += 1
+
+        root = ''
+        config: dict[str, Any] = {}
+        service = self._service()
+        reader = getattr(service, 'sticker_library_root', None)
+        if callable(reader):
+            try:
+                root = _text(reader())
+            except Exception:  # noqa: BLE001 - 路径推导失败不影响列表
+                root = ''
+        if not root:
+            section = self.bridge.section('stickers')
+            directory = _text(section.get('directory')).strip() or 'data/hds-interlude/stickers'
+            root = os.path.abspath(os.path.join(_text(self.bridge.data_dir), directory))
+        try:
+            config = dict(self.bridge.section('stickers'))
+        except Exception:  # noqa: BLE001
+            config = {}
+        return {
+            'items': window,
+            'total': total,
+            'truncated': truncated,
+            'limit': size,
+            'offset': start,
+            'counts': counts,
+            #: 面板顶部的"总闸"提示：库关着 / 自动收藏关着都得让用户看见。
+            'enabled': config.get('enabled') is True,
+            'auto_collect': config.get('autoCollect', config.get('auto_collect')) is not False,
+            'directory': _text(config.get('directory')),
+            'root': root,
+        }
+
+    async def sticker_file(self, asset_id: Any) -> str:
+        """按 `assetId` 解析图片的**绝对路径**（调用方用 `file_response` 回字节）。
+
+        只认库里那一行记着的 `filePath` 的 basename，并且再确认一次解析结果确实落在
+        表情库根目录里——`filePath` 是继承来的数据，不能让一个被改坏的值读任意文件。
+        非法 `assetId` 一律 `ConsoleError`（400），文件不在就是 404。
+        """
+        row = self._sticker_row_for_write(asset_id)
+        name = sticker_relative_file(row)
+        if not name:
+            raise ConsoleError('这条素材没有记录文件名')
+        root = self._sticker_root()
+        target = os.path.abspath(os.path.join(root, name))
+        if os.path.commonpath([target, root]) != root or not os.path.isfile(target):
+            raise FileNotFoundError('表情包文件不存在')
+        return target
+
+    async def sticker_file_inline(self, asset_id: Any) -> dict[str, Any]:
+        """同一张图，改成回 **base64 JSON 信封**（`sticker-file?inline=1` 分支）。
+
+        为什么需要它：插件页跑在无 `allow-same-origin` 的沙箱 iframe 里，`<img src>` 是
+        cross-site、拿不到宿主的 `SameSite=Strict` 登录 cookie（401）；而宿主 bridge 只有
+        JSON 通道（`apiGet` 走 axios 默认的 text 解码，PNG 字节按 UTF-8 解会丢字节）。
+        所以图片必须由后端包成 JSON 里的一串 base64（形状冻结在 `docs/PORTING_NOTES.md`
+        §45.8，前端 `src/sticker-images.ts` 按这个形状接）。
+
+        纪律：**取文件逻辑只有一条**——先走 `sticker_file()` 那套（白名单 / basename 收敛 /
+        库外文件不许读 / 缺失即 404），这里只把读出来的字节包一层，不另写一份校验；
+        错误措辞因此与字节分支逐字一致（同一批异常、调用方同一批 `except`）。
+        超过 `STICKER_INLINE_MAX_BYTES` 直接 400（防轰挂控制台，见该常量的注释）。
+        """
+        row = self._sticker_row_for_write(asset_id)
+        path = await self.sticker_file(asset_id)
+        try:
+            size = os.path.getsize(path)
+        except OSError as error:  # 拿到路径后文件被删了：与"文件不在"同一种结果
+            raise FileNotFoundError('表情包文件不存在') from error
+        # 先看体积再读字节：超限时**一个字节都不读进内存**（大 GIF 就不该走 JSON 通道）。
+        if size > STICKER_INLINE_MAX_BYTES:
+            raise ConsoleError(
+                '这张表情包太大（%.1f MB），不能内联显示（上限 %.0f MB）：请改用「保存原图」'
+                % (size / (1024 * 1024), STICKER_INLINE_MAX_BYTES / (1024 * 1024))
+            )
+        try:
+            with open(path, 'rb') as handle:
+                data = handle.read()
+        except OSError as error:
+            raise FileNotFoundError('表情包文件不存在') from error
+        return {
+            # 回显归一化后的 assetId（客户端用它把并发回来的信封对回自己那张图）。
+            'assetId': _text(asset_id).strip(),
+            # MIME 与字节分支同源：库里记的 `mimeType` 优先，没有才按魔数嗅探。
+            'mimeType': guess_image_mime(data, row.get('mimeType')) or 'image/png',
+            'size': len(data),
+            'data': base64.b64encode(data).decode('ascii'),
+        }
+
+    async def update_sticker(self, payload: Any) -> dict[str, Any]:
+        """改一个素材的**描述 / 名字 / 是否停用**（白名单之外一律 400）。
+
+        三条纪律（与 `set_config_value` 同源）：
+
+        1. **白名单**：只认 `description` / `name` / `disabled`，多一个键就 400
+           （静默丢字段会让用户以为改了、其实没改）。
+        2. **先校验后写**：`assetId` 必须命中库里的行，否则 400。
+        3. **写什么就生效什么**：写回走服务层的既有方法（`save_sticker_description`
+           / `rename_sticker` / `set_sticker_disabled`），写完立刻刷新
+           `sticker_catalog` —— 下一次 payload 里的目录文本就是新的描述。
+        """
+        body = _record(payload)
+        asset_id = _text(body.get('assetId') or body.get('asset_id')).strip()
+        if not asset_id:
+            raise ConsoleError('缺少 assetId')
+        unknown = sorted(
+            key for key in body
+            if key not in STICKER_EDITABLE_FIELDS and key not in ('assetId', 'asset_id')
+        )
+        if unknown:
+            raise ConsoleError(
+                '只能修改 %s；不认识这些字段：%s'
+                % ('、'.join(STICKER_EDITABLE_FIELDS), '、'.join(unknown)),
+            )
+        service = self._require_service()
+        row = self._sticker_row_for_write(asset_id)
+        row_id = row.get('id')
+        changed: list[str] = []
+
+        if 'description' in body:
+            description = body.get('description')
+            if description is None:
+                raise ConsoleError('description 不能是 null（清空请传空串）')
+            text = _text(description).strip()
+            if len(text) > STICKER_DESCRIPTION_MAX:
+                raise ConsoleError('描述最长 %d 个字符' % STICKER_DESCRIPTION_MAX)
+            await self._call_service(
+                'save_sticker_description', row_id, text, replace_aliases=True,
+            )
+            changed.append('description')
+        if 'name' in body:
+            name = body.get('name')
+            if name is None:
+                raise ConsoleError('name 不能是 null（清空请传空串）')
+            text = _text(name).strip()
+            if len(text) > STICKER_NAME_MAX:
+                raise ConsoleError('名字最长 %d 个字符' % STICKER_NAME_MAX)
+            await self._call_service('rename_sticker', row_id, text)
+            changed.append('name')
+        if 'disabled' in body:
+            disabled = body.get('disabled')
+            if not isinstance(disabled, bool):
+                raise ConsoleError('disabled 必须是布尔值')
+            await self._call_service('set_sticker_disabled', row_id, disabled)
+            changed.append('disabled')
+        if not changed:
+            raise ConsoleError('没有要修改的字段（%s）' % '、'.join(STICKER_EDITABLE_FIELDS))
+        await self._refresh_sticker_catalog()
+        return {
+            'assetId': asset_id,
+            'changed': changed,
+            'item': self._sticker_item_by_id(row_id),
+        }
+
+    async def delete_sticker(self, payload: Any) -> dict[str, Any]:
+        """删除一个素材：**默认只标记，`purge=true` 才真删文件**。
+
+        为什么默认不删文件：这是用户自己攒的表情库，"删错了"没有回收站；
+        标记成 `missing` 就足够让它从模型目录里消失（`refresh_sticker_catalog`
+        只取 `status='active'`），而文件留着还能靠一次重扫复活。
+        """
+        body = _record(payload)
+        asset_id = _text(body.get('assetId') or body.get('asset_id')).strip()
+        if not asset_id:
+            raise ConsoleError('缺少 assetId')
+        purge = body.get('purge')
+        if purge is not None and not isinstance(purge, bool):
+            raise ConsoleError('purge 必须是布尔值')
+        service = self._require_service()
+        row = self._sticker_row_for_write(asset_id)
+        row_id = row.get('id')
+        file_name = sticker_relative_file(row)
+        deleted_file = False
+        if purge:
+            root = self._sticker_root()
+            target = os.path.abspath(os.path.join(root, file_name)) if file_name else ''
+            if target and os.path.commonpath([target, root]) == root and os.path.isfile(target):
+                try:
+                    await asyncio.to_thread(os.remove, target)
+                    deleted_file = True
+                except OSError as error:
+                    raise ConsoleError('删除文件失败：%s' % error) from error
+        await self._call_service('delete_sticker', row_id, purge=purge is True)
+        await self._refresh_sticker_catalog()
+        return {
+            'assetId': asset_id,
+            'purged': purge is True,
+            'deletedFile': deleted_file,
+            'file': file_name,
+            'changed': ['deleted'],
+        }
+
+    async def restore_sticker_description(self, payload: Any) -> dict[str, Any]:
+        """把一条素材交回**自动描述**（摘掉"这是人写的"标记）。
+
+        配套 `sticker-update` 的 `description`：手工描述压过自动描述之后，
+        用户需要一个明确的"我不要这条手写的了、让模型重写"的入口。摘完标记
+        状态回到 `pending`，下一次 `sticker-rescan` 会用视觉模型重新描述它。
+        """
+        body = _record(payload)
+        asset_id = _text(body.get('assetId') or body.get('asset_id')).strip()
+        if not asset_id:
+            raise ConsoleError('缺少 assetId')
+        row = self._sticker_row_for_write(asset_id)
+        await self._call_service('restore_sticker_description', row.get('id'))
+        await self._refresh_sticker_catalog()
+        return {
+            'assetId': asset_id,
+            'changed': ['description'],
+            'item': self._sticker_item_by_id(row.get('id')),
+            'hint': '已交回自动描述；点「重扫表情库」会用视觉模型重新描述它。',
+        }
+
+    async def rescan_stickers(self, payload: Any = None) -> dict[str, Any]:
+        """触发一次完整的 `scan_sticker_library()`（**同步等它跑完**）。
+
+        等它跑完而不是甩个后台任务：扫描会顺带用视觉模型描述新素材，用户点完按钮
+        需要知道"跑完了、发现了几张"；单飞标志保证重复点击不会并发两轮。
+        """
+        service = self._service()
+        scanner = getattr(service, 'scan_sticker_library', None)
+        if not callable(scanner):
+            raise ConsoleError('表情库服务未就绪，稍后再试')
+        before = _safe_count(self.bridge.db, 'interlude_sticker')
+        section = self.bridge.section('stickers')
+        if section.get('enabled') is not True:
+            raise ConsoleError('本地表情包库未启用（配置 → 本地表情包 → 启用本地表情包库）')
+        await self._call_service('scan_sticker_library')
+        after = _safe_count(self.bridge.db, 'interlude_sticker')
+        return {
+            'scanned': True,
+            'assets': after,
+            'added': max(0, after - before),
+        }
+
+    # ---- 表情库分组（v1.8.3，§47）：列表 / 新建改名 / 删除 / 批量移动 ---- #
+
+    async def sticker_groups(self) -> dict[str, Any]:
+        """分组列表（**空库 / 没建表 / 服务层没起来都是空壳 + 内置默认组**）。
+
+        三条口径（都是"磁盘目录结构是分组的唯一事实来源"的推论）：
+
+        1. **内置默认组永远在列表里**——哪怕没有素材、表里也没有行。否则自动收藏的
+           素材会无所属（它们落在 `collected/`，那正是默认组）；
+        2. **磁盘上有目录的、或者库里有素材挂着的，一律是一个正常分组**：前者让
+           "新建分组 / 手动 `mkdir` 的空目录"看得见，后者让"没写描述的老目录"
+           不至于因为少一行记录就让素材消失。表里的行**只是描述**；
+        3. **计数是精确的**：一次 `GROUP BY`（`Database.count_by`）拿到每组的张数，
+           不把整张素材表拉进内存（每行还带 `embedding`，几千行就是几十 MB）。
+        """
+        items, truncated = await self._sticker_group_view()
+        return {
+            'items': items,
+            'total': len(items),
+            'truncated': truncated,
+            #: 默认分组的 id（"删除分组时素材挪去哪" / "上传不给 groupId 落哪"都是它）。
+            #: 前端不该把这个字符串写死在自己的代码里。
+            'defaultGroupId': COLLECTED_STICKER_GROUP_ID,
+        }
+
+    async def save_sticker_group(self, payload: Any) -> dict[str, Any]:
+        """新建 / 改名 / 写描述一个分组；回 `{groupId, item}`。
+
+        请求体**只认** `groupId` / `name` / `description`，多一个键就 400
+        （与 `sticker-update` 同一条白名单纪律：静默丢字段会让用户以为改了、其实没改）。
+        **语义只有一条：`groupId` 的字面量就是磁盘目录名。**
+
+        * 没有 `groupId` = **新建分组** → `name` 就是新目录名（服务层建目录）；
+        * 有 `groupId` 且 `name` 与它相同 = 只写描述（"给一个老目录补描述"也是这条路，
+          不再有单独的"采纳"动作）；
+        * 有 `groupId` 且 `name` 不同 = **改名** → 重命名目录 + 批量改该组素材的行。
+        """
+        body = _record(payload)
+        unknown = sorted(
+            key for key in body
+            if key not in ('groupId', 'group_id', 'name', 'description')
+        )
+        if unknown:
+            raise ConsoleError(
+                '只能提交 groupId、name、description；不认识这些字段：%s' % '、'.join(unknown),
+            )
+        group_id = _text(body.get('groupId', body.get('group_id'))).strip()
+        if group_id:
+            # 它会被当目录名用；不合法就当场拒，别留到落盘那一步。
+            problem = sticker_group_name_problem(group_id)
+            if problem:
+                raise ConsoleError(problem)
+        name = body.get('name')
+        if not isinstance(name, str):
+            raise ConsoleError('缺少 name（必须是字符串）')
+        description = body.get('description')
+        if description is not None and not isinstance(description, str):
+            raise ConsoleError('description 必须是字符串（清空请传空串）')
+        self._require_service()
+        row = await self._call_service('save_sticker_group', group_id, name, description)
+        record = _record(row)
+        saved_id = _text(record.get('groupId')).strip() or group_id
+        items, _truncated = await self._sticker_group_view()
+        return {
+            'groupId': saved_id,
+            'item': self._sticker_group_item(items, saved_id),
+        }
+
+    async def delete_sticker_group(self, payload: Any) -> dict[str, Any]:
+        """删一个分组：**组内素材先搬进目标目录**（默认内置默认组），再删目录与描述行。
+
+        红线：**绝不悄悄删素材**。内置默认组不许删（400）。`moveTo` 指向不存在的
+        分组也是 400——"挪到一个拼错的地方"意味着素材会落到一个没人认得的组里。
+        """
+        body = _record(payload)
+        unknown = sorted(
+            key for key in body
+            if key not in ('groupId', 'group_id', 'moveTo', 'move_to')
+        )
+        if unknown:
+            raise ConsoleError(
+                '只能提交 groupId、moveTo；不认识这些字段：%s' % '、'.join(unknown),
+            )
+        group_id = _text(body.get('groupId', body.get('group_id'))).strip()
+        if not group_id:
+            raise ConsoleError('缺少 groupId')
+        if group_id == COLLECTED_STICKER_GROUP_ID:
+            raise ConsoleError('内置分组不能删除（%s）' % COLLECTED_STICKER_GROUP_NAME)
+        move_to = _text(body.get('moveTo', body.get('move_to'))).strip()
+        if move_to:
+            problem = sticker_group_name_problem(move_to, reserved=True)
+            if problem:
+                raise ConsoleError(problem)
+        self._require_service()
+        result = await self._call_service('delete_sticker_group', group_id, move_to)
+        outcome = _record(result)
+        await self._refresh_sticker_catalog()
+        return {
+            'groupId': group_id,
+            'deleted': True,
+            'moved': _int(outcome.get('moved'), 0),
+            'moveTo': _text(outcome.get('moveTo')).strip() or COLLECTED_STICKER_GROUP_ID,
+        }
+
+    async def move_stickers(self, payload: Any) -> dict[str, Any]:
+        """批量改归属：`{assetIds:[…], groupId}` → `{moved, item:[…]}`。
+
+        **先校验后写**（用户点名的那条）：所有 `assetId` 都必须命中库里的行、
+        目标分组必须存在，任何一条不合法就 400 且**一条都不写**——
+        批量操作里"改了一半"是最难收拾的状态。返回的 `item` 是改完之后**库里那一行**
+        （前端据此就地刷新，不必再拉一次整页）。
+        """
+        body = _record(payload)
+        unknown = sorted(
+            key for key in body
+            if key not in ('assetIds', 'asset_ids', 'groupId', 'group_id')
+        )
+        if unknown:
+            raise ConsoleError(
+                '只能提交 assetIds、groupId；不认识这些字段：%s' % '、'.join(unknown),
+            )
+        raw_ids = body.get('assetIds', body.get('asset_ids'))
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ConsoleError('缺少 assetIds（非空数组）')
+        if len(raw_ids) > STICKER_MOVE_MAX:
+            raise ConsoleError('一次最多移动 %d 条素材' % STICKER_MOVE_MAX)
+        asset_ids: list[str] = []
+        for value in raw_ids:
+            text = _text(value).strip()
+            if not text:
+                raise ConsoleError('assetIds 里有空值')
+            if len(text) > 255:
+                raise ConsoleError('assetId 过长')
+            if text not in asset_ids:
+                asset_ids.append(text)
+        group_id = _text(body.get('groupId', body.get('group_id'))).strip()
+        if not group_id:
+            raise ConsoleError('缺少 groupId')
+        problem = sticker_group_name_problem(group_id, reserved=True)
+        if problem:
+            raise ConsoleError(problem)
+        self._require_service()
+        items, _truncated = await self._sticker_group_view()
+        # 目标必须是**列表里看得见的组**（磁盘上有目录 / 有描述行 / 有素材挂着）：
+        # 空 `group` 桶不进 `known`，其他一律可以当目标（"目录即分组"没有第二等公民）。
+        known = {_text(item.get('groupId')) for item in items if _text(item.get('groupId'))}
+        if group_id not in known:
+            raise ConsoleError('找不到这个分组（先在「分组」里新建它）：%s' % group_id)
+        rows = [self._sticker_row_for_write(asset_id) for asset_id in asset_ids]
+        moved = await self._call_service(
+            'move_sticker_assets', [row.get('id') for row in rows], group_id,
+        )
+        await self._refresh_sticker_catalog()
+        return {
+            'moved': _int(moved, 0),
+            'item': [self._sticker_item_by_id(row.get('id')) for row in rows],
+        }
+
+    async def upload_sticker(
+        self, data: Any, group_id: Any = '', description: Any = None, name: Any = '',
+    ) -> dict[str, Any]:
+        """上传一张表情进库；回 `{assetId, duplicated, item}`。
+
+        字节已经在手上（multipart 的 `file` 字段，文件名**一律不信、也不落库**），
+        校验 / 去重 / 落盘 / 建档 / 描述全在服务层的 `upload_sticker_asset()` 里——
+        控制台这里只做"字节是不是字节"和错误映射，不另写一份判据。
+
+        库总闸关着时 400（与「重扫表情库」同一句话）：让用户先看见"这个库现在是关的"，
+        而不是上传成功、模型却永远看不到。
+        """
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            raise ConsoleError('没有收到文件内容（multipart 的 file 字段）')
+        section = self.bridge.section('stickers')
+        if section.get('enabled') is not True:
+            raise ConsoleError('本地表情包库未启用（配置 → 本地表情包 → 启用本地表情包库）')
+        description_text = None if description is None else _text(description)
+        name_text = '' if name is None else _text(name)
+        self._require_service()
+        result = await self._call_service(
+            'upload_sticker_asset',
+            bytes(data),
+            _text(group_id).strip(),
+            description_text,
+            name_text,
+        )
+        outcome = _record(result)
+        row = _record(outcome.get('row'))
+        row_id = row.get('id')
+        item = self._sticker_item_by_id(row_id) if row_id is not None else {}
+        if not item:
+            # 服务层没回 id（旧版服务层 / 极旧的库）：至少把这一行按素材项的形状回出去。
+            item = sticker_item(row, await self._sticker_group_names())
+        return {
+            'assetId': _text(outcome.get('assetId')).strip() or _text(row.get('assetId')),
+            'duplicated': outcome.get('duplicated') is True,
+            'item': item,
+        }
+
+    # ---- 表情库面板的内部工具 ---- #
+
+    async def _sticker_group_rows(self) -> tuple[list[dict[str, Any]], bool]:
+        """分组**描述**表的行（窗口 + `truncated`；表没建 / 读失败都是空列表）。
+
+        实现只有同步那一份（`_sticker_group_rows_sync`）：写路径在同步上下文里
+        要回一条 item，读路径是协程——两处各写一份就迟早分家（读的窗口、排序、
+        容错必须完全一致）。
+        """
+        return self._sticker_group_rows_sync()
+
+    def _sticker_group_dirs(self) -> list[str]:
+        """表情库根下的一级子目录名（**目录即分组**：磁盘上有的就是分组）。
+
+        读不出来（没配置 / 目录不存在 / 服务层没起来）一律空列表——分组视图的
+        主体仍是"素材挂着的 group 值 + 描述表的行"，这条只是让**刚建好还没素材**
+        的目录也看得见。`os.listdir` 一次，不递归。
+        """
+        try:
+            root = self._sticker_root()
+        except Exception:  # noqa: BLE001 - 路径推不出来就不列目录
+            return []
+        try:
+            return sorted(
+                name for name in os.listdir(root)
+                if os.path.isdir(os.path.join(root, name))
+            )
+        except OSError:  # 目录不存在 / 没权限：不是错误，只是没有目录可列
+            return []
+
+    async def _sticker_group_view(self) -> tuple[list[dict[str, Any]], bool]:
+        """分组视图：内置默认组 + 描述表 + 磁盘目录 + 有用它的素材（唯一实现处）。
+
+        列表与校验（移动 / 上传的目标分组）都读这一份，避免"校验认得的组"与
+        "列表里看得见的组"两处推导漂移。
+
+        `name` 一律等于 `groupId`（**组名就是目录名**），只有内置组那一条例外
+        （`collected` 显示成「未整理」，见 §47）。`registered` 是**留给旧前端的
+        兼容字段**：新模型里"磁盘上有目录 / 表里有行 / 有素材挂着"都算正式分组，
+        所以它恒为 `true`——下一轮前端会把这个字段删掉。
+        """
+        rows, truncated = await self._sticker_group_rows()
+        counts = self._sticker_group_counts()
+        described: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            group_id = _text(row.get('groupId')).strip()
+            if group_id and group_id not in described:
+                described[group_id] = row
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(group_id: str, name: str, description: str, row: Any, builtin: bool) -> None:
+            if group_id in seen:
+                return
+            seen.add(group_id)
+            record = _record(row)
+            items.append({
+                'groupId': group_id,
+                'name': name,
+                'description': description,
+                'count': _int(counts.get(group_id), 0),
+                'builtin': builtin,
+                #: 兼容字段（恒 true）：新模型里表里有行 = 有描述，不是"注册"。
+                'registered': True,
+                #: 这一组是不是**模型自动归组**建出来的（只有它占自动建组额度）；
+                #: 前端要不要显示成徽章由前端定，这里只如实带出来。
+                'autoCreated': bool(record.get('autoCreated')) if row else False,
+                'createdAt': _timestamp_text(record.get('createdAt')),
+                'updatedAt': _timestamp_text(record.get('updatedAt')),
+            })
+
+        # 1. 内置默认组：**永远第一条**（没素材、表里没行也照样有）。
+        #    名字固定「未整理」（唯一一个"显示名 ≠ 目录名"的特例），描述在描述行
+        #    **没写**时回落到内置常量（v1.8.4，§48.5）：控制台与模型目录看到的必须是
+        #    **同一句话**——两处说法不一致就是"两处判据"。
+        builtin_row = described.get(COLLECTED_STICKER_GROUP_ID) or {}
+        add(
+            COLLECTED_STICKER_GROUP_ID,
+            COLLECTED_STICKER_GROUP_NAME,
+            _text(builtin_row.get('description')).strip() or COLLECTED_STICKER_GROUP_DESCRIPTION,
+            builtin_row, True,
+        )
+        # 2. 描述表里其余分组：按 `createdAt` 升序（= 建组顺序），同刻按目录名定序。
+        for group_id in sorted(described, key=lambda key: (_text(described[key].get('createdAt')), key)):
+            add(group_id, group_id, _text(described[group_id].get('description')), described[group_id], False)
+        # 3. 剩下的分组：**磁盘上有目录的**与**有素材挂着的**——表里没有行只说明"还没描述"，
+        #    绝不是"未注册"，更不许因此让素材消失。
+        for group_id in sorted(set(counts) | set(self._sticker_group_dirs())):
+            if group_id:
+                add(group_id, group_id, '', {}, False)
+        # 4. 空 `group` 的旧行（没有分组可归属）：单列一个"未分组"桶，计数不被吞掉。
+        if counts.get(''):
+            add('', STICKER_UNGROUPED_NAME, '', {}, False)
+        return items, truncated
+
+    def _sticker_group_counts(self) -> dict[str, int]:
+        """每个 `group` 值下的素材张数（精确计数，失败回空表）。"""
+        try:
+            return dict(self.bridge.db.count_by('interlude_sticker', 'group') or {})
+        except Exception:  # noqa: BLE001 - 表没建 / 旧库缺列都不该让面板打不开
+            return {}
+
+    async def _sticker_group_names(self) -> dict[str, str]:
+        """`groupId → 显示名`；**只有内置组那一条**（其余组的显示名就是目录名）。"""
+        return {COLLECTED_STICKER_GROUP_ID: COLLECTED_STICKER_GROUP_NAME}
+
+    def _sticker_group_item(self, items: list[dict[str, Any]], group_id: str) -> dict[str, Any]:
+        """从分组视图里取一条（写完之后回**库里那一份**，而不是回显请求）。"""
+        for item in items:
+            if _text(item.get('groupId')) == group_id:
+                return item
+        return {}
+
+    def _service(self) -> Any:
+        """拿服务层（未就绪时是 `None`，调用方自己决定回空壳还是报错）。"""
+        service = getattr(self.bridge, 'service', None)
+        return service if service is not None else None
+
+    def _require_service(self) -> Any:
+        service = self._service()
+        if service is None or not hasattr(service, 'db_get'):
+            raise ConsoleError('服务层尚未就绪')
+        return service
+
+    async def _call_service(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        """调服务层的一个方法；缺失时报 400（旧版服务层不该表现为 500）。"""
+        service = self._require_service()
+        method = getattr(service, name, None)
+        if not callable(method):
+            raise ConsoleError('当前服务层不支持这个操作（%s）' % name)
+        try:
+            return await method(*args, **kwargs)
+        except ConsoleError:
+            raise
+        except ValueError as error:
+            raise ConsoleError(str(error)) from error
+
+    async def _refresh_sticker_catalog(self) -> None:
+        """写完立刻刷新内存目录：**下一次 payload 里的 `stickerCatalog` 就是新的**。"""
+        service = self._service()
+        refresh = getattr(service, 'refresh_sticker_catalog', None)
+        if callable(refresh):
+            await refresh()
+
+    def _sticker_root(self) -> str:
+        """表情库根目录的绝对路径（服务层优先，回落到 bridge 数据目录 + 配置）。"""
+        service = self._service()
+        reader = getattr(service, 'sticker_library_root', None)
+        if callable(reader):
+            try:
+                root = _text(reader())
+                if root:
+                    return os.path.abspath(root)
+            except Exception:  # noqa: BLE001 - 回落
+                pass
+        section = self.bridge.section('stickers')
+        directory = _text(section.get('directory')).strip() or 'data/hds-interlude/stickers'
+        return os.path.abspath(os.path.join(_text(self.bridge.data_dir), directory))
+
+    def _sticker_row(self, asset_id: Any) -> Optional[dict[str, Any]]:
+        """按 `assetId` 取一行（取不到回 `None`）。"""
+        wanted = _text(asset_id).strip()
+        if not wanted:
+            return None
+        rows = _safe_all(self.bridge.db, 'interlude_sticker', {'assetId': wanted}, None, 1)
+        for row in rows:
+            if isinstance(row, dict):
+                return row
+        return None
+
+    def _sticker_row_for_write(self, asset_id: Any) -> dict[str, Any]:
+        """按 `assetId` 取一行；非法 / 不存在一律 `ConsoleError`（映射成 400）。"""
+        wanted = _text(asset_id).strip()
+        if not wanted:
+            raise ConsoleError('缺少 assetId')
+        if len(wanted) > 255:
+            raise ConsoleError('assetId 过长')
+        row = self._sticker_row(wanted)
+        if row is None:
+            raise ConsoleError('找不到这条素材：%s' % wanted)
+        return row
+
+    def _sticker_row_by_id(self, row_id: Any) -> Optional[dict[str, Any]]:
+        rows = _safe_all(self.bridge.db, 'interlude_sticker', {'id': row_id}, None, 1)
+        for row in rows:
+            if isinstance(row, dict):
+                return row
+        return None
+
+    def _sticker_item_by_id(self, row_id: Any) -> dict[str, Any]:
+        """写完之后回**库里那一行**（而不是回显请求），界面才是真值。
+
+        组名（`groupName`）现在只有内置组那一个特例（其余组的显示名就是目录名），
+        所以不必再读描述表——`sticker_item()` 缺省就按目录名回显。
+        """
+        row = self._sticker_row_by_id(row_id)
+        if row is None:
+            return {}
+        names = {COLLECTED_STICKER_GROUP_ID: COLLECTED_STICKER_GROUP_NAME}
+        return sticker_item(row, names)
+
+    def _sticker_group_rows_sync(self) -> tuple[list[dict[str, Any]], bool]:
+        """`_sticker_group_rows()` 的同步版（写路径在同步上下文里回 item 用）。"""
+        rows = [
+            row for row in _safe_all(
+                self.bridge.db, 'interlude_sticker_groups', None,
+                'createdAt ASC', STICKER_GROUP_ROW_LIMIT,
+            ) if isinstance(row, dict)
+        ]
+        return rows, len(rows) >= STICKER_GROUP_ROW_LIMIT
+
+    # ------------------------------------------------------------------ #
     # 内部
     # ------------------------------------------------------------------ #
 
@@ -1523,6 +3251,57 @@ class ConsoleApi:
         payload['changed'] = 'story-promote %s → %s' % (source, payload['promoted']['target'])
         return payload
 
+    async def decide_patch(
+        self, story_id: Any, patch_id: Any, action: Any, note: Any = '',
+    ) -> dict[str, Any]:
+        """审批（approve）或驳回（reject）一条设定改写候选。
+
+        与自动闸门的关系：闸门保证"没证据不上"，用户拍板允许"证据够了但还没攒够回合"
+        的那条直接生效，或者把已经生效的一条驳回撤下来。
+        """
+        service = getattr(self.bridge, 'service', None)
+        if service is None or not callable(getattr(service, 'decide_state_patch', None)):
+            raise ConsoleError('插件服务尚未就绪，稍后再试')
+        sid = await self._story_id_for_write(story_id)
+        decision = _text(action).strip().lower()
+        if decision not in ('approve', 'reject'):
+            raise ConsoleError('未知的操作：%s' % (_text(action) or '（空）'))
+        try:
+            result = await service.decide_state_patch(
+                sid, _int_or_none(patch_id), decision, _text(note),
+            )
+        except ValueError as error:
+            raise ConsoleError(_patch_error_text(_text(error))) from error
+        payload = await self.memory(sid)
+        payload['patch'] = result
+        payload['changed'] = 'patch-%s #%s' % (decision, _text(result.get('id')))
+        return payload
+
+    async def rollback_patch(
+        self, story_id: Any, patch_id: Any, note: Any = '',
+    ) -> dict[str, Any]:
+        """把一条已生效的设定改写候选撤下来（非破坏性）。"""
+        service = getattr(self.bridge, 'service', None)
+        if service is None or not callable(getattr(service, 'rollback_state_patch', None)):
+            raise ConsoleError('插件服务尚未就绪，稍后再试')
+        sid = await self._story_id_for_write(story_id)
+        try:
+            result = await service.rollback_state_patch(sid, _int_or_none(patch_id), _text(note))
+        except ValueError as error:
+            raise ConsoleError(_patch_error_text(_text(error))) from error
+        payload = await self.memory(sid)
+        payload['patch'] = result
+        payload['changed'] = 'patch-rollback #%s' % _text(result.get('id'))
+        return payload
+
+    async def _story_id_for_write(self, story_id: Any) -> str:
+        """写操作必须落在**存在的**剧本上，空 id 也要能解析成当前那部。"""
+        stories = _safe_all(self.bridge.db, 'interlude_story', order='updatedAt DESC', limit=50)
+        current = self._pick_story(stories, _text(story_id))
+        if not current:
+            raise ConsoleError('没有找到对应剧本')
+        return _text(current.get('id'))
+
     async def merge_story(self, source_story_id: Any, target_story_id: Any = '') -> dict[str, Any]:
         """把一部旧剧本并入共享主剧本（控制台「并入主剧本」）。
 
@@ -1675,10 +3454,21 @@ class ConsoleApi:
                 'provider_type': _text(config.get('provider_type')) if isinstance(config, dict) else '',
                 'modalities': sorted(self.bridge.provider_modalities(provider)),
                 'used_by': [
-                    label for key, label in CONSOLE_TASKS if self.bridge.task_model_id(key) == identifier
+                    label for key, label in (*CONSOLE_TASKS, ('works', '共同作品写手'))
+                    if self._task_uses_provider(key, identifier)
                 ],
             })
         return rows
+
+    def _task_uses_provider(self, task: str, identifier: str) -> bool:
+        """该任务是不是指名了这个 AstrBot Provider（`used_by` 用）。
+
+        `works` 要过双读判定：它的值还有一套"点名连接行"的老口径，那种值不该被算成
+        "用了某个 AstrBot Provider"（否则控制台会指着一个不存在的东西说它在用）。
+        """
+        if task == 'works':
+            return bool(identifier) and self.bridge.works_writer_named_provider() == identifier
+        return self.bridge.task_model_id(task) == identifier
 
     def _note(self, kind: str) -> str:
         try:
@@ -1768,6 +3558,8 @@ class ConsoleApi:
             'impact': _text(row.get('impact')),
             'status': _text(row.get('status')),
             'created_at': _text(row.get('createdAt')),
+            'decided_at': _text(row.get('decidedAt')),
+            'decision_note': _text(row.get('decisionNote'))[:200],
         }
 
     def _overlay_brief(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -1792,4 +3584,412 @@ class ConsoleApi:
             'has_state': bool(state),
         }
 
+    # ---- 共同作品：取服务、读行、把 state 翻成面板要的形状 ---- #
+
+    def _works_service(self) -> Optional[Any]:
+        """能干活的作品服务层；没有（旧版本 / 还没接线）就回 `None`。
+
+        判据是**读快照这个成员在不在**：面板的取数与写操作都建立在"能读到这件作品"
+        之上，缺了它就只剩空壳可回（§29）。
+        """
+        service = getattr(self.bridge, 'service', None)
+        if service is None:
+            return None
+        if not callable(getattr(service, 'works_snapshot', None)):
+            return None
+        return service
+
+    def _works_config(self) -> dict[str, Any]:
+        """`works` 配置段（优先服务层归一化后的那份）。
+
+        语义与 `chunk14.works_config()` 一致：缺键按默认（**关闭**），键存在时只有显式
+        `false` 才算关（坑 36：别把 `0` / 缺失一律当"关闭"）。
+        """
+        service = getattr(self.bridge, 'service', None)
+        reader = getattr(service, 'works_config', None)
+        if callable(reader):
+            try:
+                data = reader()
+                if isinstance(data, dict):
+                    return data
+            except Exception:  # noqa: BLE001 - 配置坏了不该让面板打不开
+                pass
+        try:
+            section = self.bridge.section('works')
+        except Exception:  # noqa: BLE001
+            section = {}
+        section = section if isinstance(section, dict) else {}
+        value = section.get('enabled')
+        return {
+            'enabled': value is not False and value is not None,
+            'generation_mode': _text(section.get('generation_mode') or section.get('generationMode')) or 'main',
+            'model_id': _text(section.get('model_id') or section.get('modelId')),
+        }
+
+    def _works_explain(self) -> str:
+        """服务层自己那句结论（`explain_works_state`）：现在是哪个模式、没生效是为什么。
+
+        面板的空态与禁用提示直接用它，别在控制台重写一遍配置语义。
+        """
+        service = getattr(self.bridge, 'service', None)
+        reader = getattr(service, 'explain_works_state', None)
+        if not callable(reader):
+            return ''
+        try:
+            return _text(reader()).strip()
+        except Exception:  # noqa: BLE001
+            return ''
+
+    def _works_unavailable_hint(self, member: str = '') -> str:
+        """空壳的说明文案：带上服务层自己那句"为什么没生效"（`explain_works_state`）。"""
+        explain = self._works_explain()
+        suffix = '（缺少 %s）' % member if member else ''
+        return '%s%s%s' % (WORKS_UNAVAILABLE_HINT, suffix, ' ｜%s' % explain if explain else '')
+
+    def _works_shell(self, member: str = '') -> dict[str, Any]:
+        """服务层没就绪时的统一空壳（**不抛**：面板得能打开并说明原因）。"""
+        config = self._works_config()
+        return {
+            'available': False,
+            'enabled': bool(config['enabled']),
+            'generation_mode': _text(config.get('generation_mode')),
+            'explain': self._works_explain(),
+            'hint': self._works_unavailable_hint(member),
+        }
+
+    async def _works_snapshot(self, service: Any, story_id: str, participant_id: str) -> Optional[dict[str, Any]]:
+        """读一件作品的全貌；坏行 / 读取异常一律 `None`（原数据不动），不抛给前端。"""
+        reader = getattr(service, 'works_snapshot', None)
+        if not callable(reader) or not story_id or not participant_id:
+            return None
+        try:
+            # 服务层的 `_entity_id` 认得 id 字符串（不必先取出整个剧本 / 参与者对象）。
+            snapshot = await reader(story_id, participant_id)
+        except Exception:  # noqa: BLE001 - 坏行是"读不出来"，不是"控制台出错"
+            return None
+        return snapshot if isinstance(snapshot, dict) else None
+
+    async def _works_state(self, service: Any, story_id: str, participant_id: str) -> Optional[dict[str, Any]]:
+        """payload 用的那份投影（`sharedWork`）：`mayPropose` / `lastFailure` 的权威来源。
+
+        未启用 / 没有作品时服务层回 `None`，这里照收——面板不会凭空编出一个投影。
+        """
+        reader = getattr(service, 'shared_work_state', None)
+        if not callable(reader) or not story_id or not participant_id:
+            return None
+        try:
+            state = await reader(story_id, participant_id)
+        except Exception:  # noqa: BLE001
+            return None
+        return state if isinstance(state, dict) else None
+
+    async def _works_dump(self, service: Any, story_id: str, participant_id: str) -> list[str]:
+        """分段导出：`works_dump` 已经是**分好段**的列表，这里只做形状归一。"""
+        reader = getattr(service, 'works_dump', None)
+        if not callable(reader):
+            return []
+        try:
+            parts = await reader(story_id, participant_id)
+        except Exception:  # noqa: BLE001
+            return []
+        if isinstance(parts, (list, tuple)):
+            return [_text(part) for part in parts if _text(part)]
+        if isinstance(parts, str) and parts:
+            # 兜底：万一某版服务层回的是整串（不是本移植版的契约），这里补一次切分。
+            return split_dump_parts(parts)
+        return []
+
+    async def _call_work_edit(self, member: Any, story_id: str, participant_id: str, edit: dict[str, Any]) -> Any:
+        """调用户的 `edit_work`——服务层有两种可能的签字，按签名把参数放对位置。
+
+        本移植版实际是 `edit_work(story, participant, edit)`（`edit` 是
+        `{baseRevisionId, content, reason}` 对象，与上游 wire 形状一致）；契约摘要里
+        写的是 `(story, participant, content, reason)`。两种都认，别把字典塞进正文位置。
+        """
+        if 'content' in _work_signature_names(member):
+            return await member(story_id, participant_id, edit['content'], edit['reason'])
+        return await member(story_id, participant_id, edit)
+
+    async def _call_work_generate(self, member: Any, story_id: str, participant_id: str, request: dict[str, Any]) -> Any:
+        """同上：`start_work_generation(story, participant, request|brief)` 两种签字都认。"""
+        if 'brief' in _work_signature_names(member):
+            return await member(story_id, participant_id, request['brief'])
+        return await member(story_id, participant_id, request)
+
+    def _work_row(self, work_id: str) -> Optional[dict[str, Any]]:
+        """按主键读 `interlude_work` 的一行（控制台自己读行，写操作仍然交给服务层）。"""
+        rows = _safe_all(self.bridge.db, 'interlude_work', {'id': work_id}, None, 1)
+        return rows[0] if rows and isinstance(rows[0], dict) else None
+
+    def _work_row_for_write(self, work_id: Any) -> tuple[str, dict[str, Any]]:
+        """写操作的入口校验：件必须存在，且 id 不能空（未知 id 按本文件约定 400）。"""
+        wid = _text(work_id).strip()
+        if not wid:
+            raise ConsoleError('请选择一件共同作品')
+        row = self._work_row(wid)
+        if row is None:
+            raise ConsoleError('找不到这件共同作品：%s' % wid)
+        return wid, row
+
+    def _participant_exists(self, story_id: str, participant_id: str) -> bool:
+        """这个参与者在这部剧本里登记过吗（表里一行都没有时不拦，别把旧库挡在门外）。"""
+        rows = self._participant_rows(story_id)
+        if not rows:
+            return True
+        return any(_text(row.get('id')) == participant_id for row in rows)
+
+    def _story_by_id(self, story_id: str) -> Optional[dict[str, Any]]:
+        """按 id 精确取剧本（**不用** `_current_story`：它取不到会回落到最近那一部）。"""
+        if not story_id:
+            return None
+        rows = _safe_all(self.bridge.db, 'interlude_story', {'id': story_id}, None, 1)
+        return rows[0] if rows and isinstance(rows[0], dict) else None
+
+    @staticmethod
+    def _work_state(row: dict[str, Any]) -> dict[str, Any]:
+        """行里的 `state`（json 列已解码；万一拿到的是字符串就再解一次）。"""
+        state = row.get('state') if isinstance(row, dict) else None
+        if isinstance(state, str):
+            try:
+                state = json.loads(state)
+            except (TypeError, ValueError):
+                state = None
+        return state if isinstance(state, dict) else {}
+
+    @staticmethod
+    def _revision_ordinal(revisions: list[Any], revision_id: str) -> int:
+        """版本号（从 1 数）：head 在时间线里的位置；找不到就退回版本总数。"""
+        for index, item in enumerate(revisions, 1):
+            if isinstance(item, dict) and _text(item.get('id')) == revision_id:
+                return index
+        return len(revisions) if revision_id else 0
+
+    def _work_brief(
+        self,
+        row: dict[str, Any],
+        snapshot: Optional[dict[str, Any]],
+        participant_id: str,
+        name: str,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        """清单里的一行（快照拿不到也照出，`broken` 标出来）。"""
+        state = self._work_state(row)
+        source = snapshot if isinstance(snapshot, dict) else {}
+        revisions = source.get('revisions') if isinstance(source.get('revisions'), list) else [
+            item for item in (state.get('revisions') or []) if isinstance(item, dict)
+        ]
+        proposals = [
+            item for item in (source.get('proposals') or []) if isinstance(item, dict)
+        ] or [
+            item for item in (state.get('proposals') or []) if isinstance(item, dict)
+        ]
+        jobs = [item for item in (source.get('jobs') or []) if isinstance(item, dict)] or [
+            item for item in (state.get('jobs') or []) if isinstance(item, dict)
+        ]
+        head = _text(source.get('head') or state.get('head'))
+        running = len([item for item in jobs if _text(item.get('status')) == 'running'])
+        return {
+            'work_id': _text(row.get('id')),
+            'participant_id': participant_id,
+            'participant': name or participant_id,
+            'title': _text(source.get('title') or state.get('title')),
+            'head': head,
+            'revision': self._revision_ordinal(revisions, head),
+            'revision_count': len(revisions),
+            'pending_count': len([item for item in proposals if _text(item.get('status')) == 'pending']),
+            'jobs_running': running,
+            'job_count': len(jobs),
+            'generation': _int(row.get('generation')),
+            'updated_at': _work_updated_at(revisions, proposals, jobs),
+            'may_propose': bool(enabled) and running == 0,
+            'last_failure': _record_or_none(state.get('lastFailure')),
+            'broken': snapshot is None,
+        }
+
+    def _revision_brief(self, item: dict[str, Any], ordinal: int, head: str) -> dict[str, Any]:
+        """时间线里的一条版本：head 给全文，历史版本给长度 + 预览。"""
+        content = _text(item.get('content'))
+        revision_id = _text(item.get('id'))
+        is_head = bool(head) and revision_id == head
+        brief = {
+            'id': revision_id,
+            'ordinal': ordinal,
+            'parent_id': _text(item.get('parentId')),
+            'author': _text(item.get('author')),
+            'proposal_id': _text(item.get('proposalId')),
+            'created_at': _text(item.get('createdAt')),
+            'current': is_head,
+            'content_chars': len(content),
+            'preview': content[:WORK_REVISION_PREVIEW],
+        }
+        if is_head:
+            brief['content'] = content
+        return brief
+
+    def _proposal_brief(self, item: dict[str, Any], base_ordinal: int) -> dict[str, Any]:
+        """提案卡：正文原样给（用户要能看到她到底想改成什么），理由与基础版本一起给。"""
+        content = _text(item.get('content'))
+        return {
+            'id': _text(item.get('id')),
+            'status': _text(item.get('status')),
+            'pending': _text(item.get('status')) == 'pending',
+            'author': _text(item.get('author')),
+            'reason': _text(item.get('reason')),
+            'content': content,
+            'content_chars': len(content),
+            'base_revision_id': _text(item.get('baseRevisionId')),
+            'base_revision': base_ordinal,
+            'created_at': _text(item.get('createdAt')),
+            'source_entry_id': _int(item.get('sourceEntryId'), 0),
+        }
+
+    def _job_brief(self, item: dict[str, Any]) -> dict[str, Any]:
+        """写手任务的一行（`interrupted` = 进程重载过，永远不会自己重放）。"""
+        status = _text(item.get('status'))
+        return {
+            'id': _text(item.get('id')),
+            'status': status,
+            'interrupted': status == 'interrupted',
+            'model_id': _text(item.get('modelId')),
+            'brief': _text(item.get('brief')),
+            'created_at': _text(item.get('createdAt')),
+            'proposal_id': _text(item.get('proposalId')),
+            'source_entry_id': _int(item.get('sourceEntryId'), 0),
+        }
+
+    def _work_may_propose(
+        self,
+        enabled: bool,
+        jobs: list[dict[str, Any]],
+        projection: Optional[dict[str, Any]],
+    ) -> tuple[bool, str]:
+        """能不能让她起草：服务层投影优先，拿不到就按"没有在跑的任务"自己判。
+
+        返回 `(能不能, 不能的原因)`——界面明说原因，别只给一个灰按钮。
+        """
+        if not enabled:
+            return False, '共同作品没启用：去「配置」页打开「共同作品」'
+        if isinstance(projection, dict) and 'mayPropose' in projection:
+            may = bool(projection.get('mayPropose'))
+        else:
+            may = not any(_text(item.get('status')) == 'running' for item in jobs)
+        if may:
+            return True, ''
+        return False, '已有一次写手任务在跑：等她写完，或先取消那个任务'
+
+    @staticmethod
+    def _work_limits() -> dict[str, int]:
+        return {'content': WORK_CONTENT_MAX, 'brief': WORK_BRIEF_MAX, 'reason': WORK_REASON_MAX}
+
+    def _require_work_ok(self, result: Any, action: str) -> None:
+        """服务层用 `{'ok': False, 'error': …}` 表达失败（不抛），转成用户看得懂的 400。"""
+        if isinstance(result, dict) and result.get('ok') is not False:
+            return
+        reason = _text((result or {}).get('error')) if isinstance(result, dict) else ''
+        raise ConsoleError('%s失败：%s' % (action, reason or '服务层没有给出原因'))
+
+    async def _resolve_work_proposal(self, work_id: Any, proposal_id: Any, accept: bool) -> dict[str, Any]:
+        """接受 / 驳回的公共路径。
+
+        顺序刻意是"先自己看一眼，再交给服务层"：未知作品、未知提案、已经处理过的提案
+        都能立刻给 400（本文件既有约定），服务层那边的 CAS / 基础版本校验照旧再兜一次。
+        """
+        label = '接受' if accept else '驳回'
+        service = self._works_service()
+        name = 'accept_work_proposal' if accept else 'reject_work_proposal'
+        member = getattr(service, name, None) if service is not None else None
+        if not callable(member):
+            return self._works_shell(name)
+        wid, row = self._work_row_for_write(work_id)
+        pid = _text(proposal_id).strip()
+        if not pid:
+            raise ConsoleError('请选择一条提案')
+        # 提案清单以服务层快照为准（它是解码 + 校验过的那份）；坏行才回落到裸 state。
+        sid = _text(row.get('storyId'))
+        snapshot = await self._works_snapshot(service, sid, _text(row.get('participantId')))
+        proposals = [
+            item for item in ((snapshot or {}).get('proposals') or []) if isinstance(item, dict)
+        ] or [
+            item for item in (self._work_state(row).get('proposals') or []) if isinstance(item, dict)
+        ]
+        proposal = next((item for item in proposals if _text(item.get('id')) == pid), None)
+        if proposal is None:
+            raise ConsoleError('找不到这条提案：%s' % pid)
+        status = _text(proposal.get('status'))
+        if status != 'pending':
+            raise ConsoleError('这条提案已经处理过了（%s），结论不能改' % (status or '未知状态'))
+        try:
+            result = await member(wid, pid)
+        except Exception as error:  # noqa: BLE001
+            raise ConsoleError('%s提案失败：%s' % (label, error)) from error
+        self._require_work_ok(result, '%s提案' % label)
+        payload = await self.work_detail(wid)
+        payload['result'] = _work_result_brief(result)
+        payload['changed'] = 'work-%s %s' % ('accept' if accept else 'reject', pid)
+        return payload
+
+def _record_or_none(value: Any) -> Optional[dict[str, Any]]:
+    """dict 或 `None`（`lastFailure` 只可能是对象；空对象也当"没有失败记录"）。"""
+    return value if isinstance(value, dict) and value else None
+
+
+def _work_updated_at(*groups: Any) -> str:
+    """最后修改时间：版本 / 提案 / 任务里最新的那个 `createdAt`。
+
+    `interlude_work` 表只有 `id` / `storyId` / `participantId` / `generation` / `state`，
+    没有时间列（上游 `WorkRow` 也没有），所以"最后改过"只能从 state 里推。
+    ISO 8601（UTC、Z 结尾）字符串可以直接比大小。
+    """
+    stamps = [
+        _text(item.get('createdAt'))
+        for group in groups
+        for item in (group if isinstance(group, list) else [])
+        if isinstance(item, dict) and _text(item.get('createdAt'))
+    ]
+    return max(stamps) if stamps else ''
+
+
+def _text_length(value: str) -> int:
+    """与 `core/works.py::_js_length` 同口径（UTF-16 码元）：控制台和 core 别各算一套。"""
+    return len(value.encode('utf-16-le', errors='surrogatepass')) // 2
+
+
+def _work_signature_names(member: Any) -> frozenset[str]:
+    """服务层成员的参数名集合；拿不到签名就回空集（按本移植版的形状调）。"""
+    try:
+        return frozenset(inspect.signature(member).parameters)
+    except (TypeError, ValueError):  # pragma: no cover - 内建 / C 实现没有签名
+        return frozenset()
+
+
+def _work_result_brief(result: Any) -> dict[str, Any]:
+    """写操作的结果摘要：只挑几个键，别把整行塞进响应。"""
+    data = result if isinstance(result, dict) else {}
+    revision = data.get('revision') if isinstance(data.get('revision'), dict) else {}
+    return {
+        'work_id': _text(data.get('workId')),
+        'head': _text(data.get('head')),
+        'revisions': _int(data.get('revisions')),
+        'revision_id': _text(revision.get('id')),
+    }
+
+
+def _int_or_none(value: Any) -> Any:
+    """把控制台传来的 id 转成 int；转不动就原样回（让服务层报"找不到"）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _patch_error_text(reason: str) -> str:
+    """把服务层的错误码翻成用户看得懂的话。"""
+    return {
+        'patch-not-found': '这条设定候选不存在或已被清理',
+        'already-compacted': '这条候选已经并进周期摘要，不能再回滚'
+                             '（它已经成了她那段时间的经历；要改设定请走新的候选）',
+        'not-applied': '只有已经生效的候选才能回滚',
+        'invalid-action': '未知的操作',
+        'story-not-found': '没有找到对应剧本',
+    }.get(reason, '操作失败：%s' % reason)
 

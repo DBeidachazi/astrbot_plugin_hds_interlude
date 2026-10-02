@@ -397,7 +397,8 @@ class SupplementaryTests(unittest.TestCase):
             format_model_routing(routing),
             'main=未配置[unavailable] compaction=未配置[unavailable] timeline=未配置[unavailable] '
             'alter=未配置[unavailable] embedding=未配置[disabled] stickers=未配置[unavailable] '
-            'vision=未配置[unavailable]',
+            # 上游 1.0.1-rc24：世界播种器也是一个独立任务。
+            'vision=未配置[unavailable] world_seeding=未配置[unavailable]',
         )
 
     def test_format_model_routing_uses_assigned_provider_model_and_未指定_fallback(self):
@@ -428,6 +429,57 @@ class SupplementaryTests(unittest.TestCase):
         self.assertEqual(main_part(), 'main=P1/profile-model[model-profile]')
         table['main']['target'] = {'provider_id': 'p1', 'model': ''}
         self.assertEqual(main_part(), 'main=P1/m[model-profile]')
+
+
+class WorksWriterSelectorTests(unittest.TestCase):
+    """共同作品写手模型（v1.7.9）：`use_for_works` 这一个标志的三处消费点。
+
+    配置页把它渲染成 AstrBot 模型选择器，适配层为"指名了 Provider"合成一条只挂
+    `use_for_works` 的连接行，所以 core 必须：① 认这个标志；② 别把它当成叙事任务的
+    兜底候选（否则给写手选个模型会把主叙事也换掉）；③ 能按"连接行的 id / 模型名 /
+    标签"替适配层回答"这个值点到的是不是连接行"。
+    """
+
+    def test_works_is_a_recognized_task_flag(self):
+        self.assertTrue(is_assigned_to(provider('p', {'use_for_works': True}), 'works'))
+        self.assertFalse(is_assigned_to(provider('p'), 'works'))
+        # 只挂 works 的行不该被别的任务认领（含三元链最后一项 vision）。
+        only_works = provider('p', {'use_for_works': True})
+        for task in ('main', 'compaction', 'alter', 'embedding', 'stickers', 'vision', 'world_seeding'):
+            self.assertFalse(is_assigned_to(only_works, task), task)
+
+    def test_normalize_provider_keeps_the_works_flag_strict(self):
+        self.assertTrue(normalize_provider(provider('p', {'use_for_works': True}))['use_for_works'])
+        self.assertFalse(normalize_provider(provider('p', {'use_for_works': 1}))['use_for_works'])
+        self.assertFalse(normalize_provider(provider('p'))['use_for_works'])
+
+    def test_a_works_only_row_never_becomes_a_chat_fallback(self):
+        """给写手指名的那个模型**不能**顺手顶掉主叙事。"""
+        routing = resolve_model_routing(config([
+            provider('plain'),
+            provider('hdsi-astrbot-works', {
+                'use_for_works': True, 'endpoint': '', 'transport_target': 'astrbot:ollama',
+                'label': 'AstrBot · ollama', 'model': 'qwen2.5',
+            }),
+        ]))
+        self.assertEqual([item['id'] for item in routing['main']['providers']], ['plain'])
+        self.assertEqual(routing['main']['reason'], 'legacy-fallback')
+
+    def test_match_usable_connection_row_is_the_shared_legacy_lookup(self):
+        rows = [
+            provider('by-id'),
+            provider('p2', {'id': '', 'model': 'by-model'}),
+            provider('p3', {'label': 'by-label'}),
+            provider('off', {'enabled': False}),
+            provider('no-endpoint', {'endpoint': ''}),
+        ]
+        # id / 模型名 / 标签三种点名都认（返回的是原行，交给调用方自取）。
+        for value, expected in (('by-id', rows[0]), ('by-model', rows[1]), ('by-label', rows[2])):
+            self.assertEqual(model_routing.match_usable_connection_row(rows, value), [expected], value)
+        # 关掉的 / 没有请求目标的连接行不算"点到了一条连接行"（与 chunk14 老口径一致）。
+        for value in ('off', 'no-endpoint', '', 'nope'):
+            self.assertEqual(model_routing.match_usable_connection_row(rows, value), [], value)
+        self.assertEqual(model_routing.connection_row_names(rows[0]), {'by-id', 'by-id-model'})
 
 
 if __name__ == '__main__':

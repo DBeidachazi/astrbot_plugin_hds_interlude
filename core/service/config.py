@@ -33,7 +33,10 @@ TypedDict 不做运行期校验，键名表只表达**语义归属**；运行期
 from __future__ import annotations
 
 import copy
+import io
+import json
 import math
+import os
 import re
 from typing import Any, Literal, TypedDict
 
@@ -107,6 +110,19 @@ __all__ = [
     'CONFIG_DEFAULTS',
     'CONFIG_SECTION_ALIASES',
     'CONFIG_SECTION_ALIASES_REVERSE',
+    'LEGACY_SECTION_ALIASES',
+    'LEGACY_SECTION_MERGES',
+    'LEGACY_KEY_MERGES',
+    'LEGACY_MERGE_TARGETS',
+    'VOICE_SECTION',
+    'VOICE_LEGACY_SECTION',
+    'VOICE_FIELD_KEYS',
+    'merge_legacy_section_values',
+    'fold_legacy_section_merges',
+    'read_section_path',
+    'write_section_path',
+    'write_merge_target',
+    'schema_group_defaults',
     'apply_section_aliases',
     'to_schema_shape',
     'PROMPT_SECTION',
@@ -1030,6 +1046,283 @@ CONFIG_SECTION_ALIASES_REVERSE: dict[str, str] = {
     upstream: schema for schema, upstream in CONFIG_SECTION_ALIASES.items()
 }
 
+#: **只用于读取**的历史别名：旧版本里这些键存在过，老导出文件/老配置文件里有值。
+#:
+#: 与 `CONFIG_SECTION_ALIASES` 分开是刻意的：那张表会被**反向**用于持久化，
+#: 若把 `qzone_compat → qzone` 混进去，用户配好的 QQ 空间会被写回那个已经作废的
+#: 隐藏键（下次宿主按 schema 重建配置就清掉）——读得对、写回错，比不迁移更糟。
+LEGACY_SECTION_ALIASES: dict[str, str] = {
+    # v1.5.x 的 P3 隐藏兼容位 → v1.6.0 起 QQ 空间转正（见 PORTING_NOTES §32）。
+    'qzone_compat': 'qzone',
+    # 合并转发同理：v1.7.0 起 `forward_message_compat` → `forward_message`。
+    'forward_message_compat': 'forward_message',
+}
+
+#: **N:1 的历史分组归并（只用于读取）**：`新分组 → 一组旧分组`。
+#:
+#: **v1.7.4 起点分路径**：键是**目标路径**，可以是嵌套的（`robot_actions.chat` 指
+#: schema 里 `robot_actions.items.chat`；`runtime.input_status` 同理）。源永远是**顶层**
+#: 旧分组名（宿主按 schema 重建配置，旧组只能留在顶层）。语义是：
+#:
+#: * **用户写过的新分组值优先**——"写过"的判定是"不等于 schema 默认值"，理由见下；
+#: * 新分组里**没写过**的键，按顺序从这些旧分组里补，旧分组里也"没写过"（= 默认值）就跳过；
+#: * 只在**读**方向生效。写方向只写新路径（`to_schema_shape` / 控制台）——旧名写回去
+#:   等于把用户配置塞进一堆作废的隐藏键，下次宿主按 schema 重建时还要再迁一遍。
+#:
+#: 为什么旧分组必须继续留在 `_conf_schema.json` 里（**并且 `invisible: true`**）：
+#: 宿主每次加载插件都按 schema 重建配置，schema 里没有的分组会被**直接删掉**（AGENTS 坑 22）。
+#: 所以"把 `actions_interaction` 改名成 `actions_chat`"这种做法，会在用户**下次启动前**
+#: 就把他设过的开关全清空——旧组留着 + 读取侧归并，才是升级不丢配置的唯一走法。
+#: （与 `LEGACY_SECTION_ALIASES` 的 1:1 别名同一套思路，只是这里是 N:1。）
+#:
+#: 为什么"新分组的值优先"要加"等于默认值不算写过"这个前提（**真机行为，别删**）：
+#: 宿主 `AstrbotConfig.check_config_integrity()` 在每次加载时把 schema 里**缺的键连默认值
+#: 一起补进配置文件**并落盘。升级后的第一次加载，`robot_actions` 就是这样被整组补上默认值
+#: （全 true）的——而用户真正的选择还留在旧分组里。若按字面"新分组一律优先"，宿主补的默认值
+#: 会顶掉用户的选择：关掉的开关全部自己打开（静默丢配置，正是本次收敛最要避免的事）。
+#: 规则与坑 33 的提示词搬迁同源：**等于内置默认值 = 视为没写过**。
+#:
+#: v1.7.3 曾为"`actions_risks` 同时供给三个新组"加过两条细化规则（按键分流 / 按源分组
+#: 默认值判定）与写方向的 `_sync_shared_legacy_switches`。**v1.7.4 起全部删掉**：
+#: `actions_risks` 不再参与归并（用户判断那些配置目前没人用，见 `docs/PORTING_NOTES.md` §37），
+#: 于是每个旧组只供给**一个**目标，源键集合本来就是目标的子集、"共用源"也不存在了。
+LEGACY_SECTION_MERGES: dict[str, tuple[str, ...]] = {
+    'robot_actions.chat': (
+        'actions_chat',
+        'actions_interaction', 'actions_message', 'actions_history', 'actions_status',
+        'actions_profile', 'actions_voice', 'actions_contact',
+    ),
+    'robot_actions.group': ('actions_group',),
+    'robot_actions.qzone': ('actions_qzone',),
+    # v1.7.4：输入状态从顶层组挪进「运行时」当子配置（键、默认值、hint 逐字未动）。
+    'runtime.input_status': ('input_status',),
+}
+
+#: **键级搬迁**表（v1.7.5）：`目标路径 → ((目标键, 源路径, 源键), …)`。
+#:
+#: 与 `LEGACY_SECTION_MERGES` 的区别：那个是**整组** N:1 归并（源永远是顶层旧组名，
+#: 组里每个键都往目标走）。这里搬的是"**同一个可见组**里的几个键 → 另一个组的几个键"，
+#: 组级那套表达不了（源不是一整组，目标也不是一整组），所以单开一张表；规则完全同源
+#: （"用户写过 = 不等于 schema 默认值"），并且**三个读取点共用它**：
+#: `normalize_config`（core 侧）、`AstrbotBridge.section()`（适配层）、
+#: 控制台配置页（`console_api.config_schema` 用 `LEGACY_MERGE_TARGETS` 判"这段要归并"）。
+#: 一处实现、三处生效，不会出现"运行期读了、配置页没读"的漂移（坑 34）。
+#:
+#: v1.7.5 的第一条：语音的 `tts_provider_id` / `default_voice` 从「机器人动作 → 会话动作」
+#: （`robot_actions.chat`，**可见组**）搬进「模型中心 → 语音 / 音频理解设置」
+#: （`model_center.audio`）。旧位置**不能**就地删掉：宿主每次加载都按 schema 重建配置，
+#: schema 里没有的键会被连值一起删（坑 22/72）——所以旧键留在 schema 里、标
+#: **字段级 `invisible: true`**（宿主配置页与控制台都按这个字段隐藏，实测两者都认），
+#: 值就不会丢；读取侧按本表优先读新位置、旧位置兜底，写方向只写新位置
+#: （`fold_legacy_section_merges` 顺手把旧键清回默认值，避免"改了没反应"，坑 72）。
+LEGACY_KEY_MERGES: dict[str, tuple[tuple[str, str, str], ...]] = {
+    'model_center.audio': (
+        ('tts_provider_id', 'robot_actions.chat', 'tts_provider_id'),
+        ('default_voice', 'robot_actions.chat', 'default_voice'),
+    ),
+}
+
+#: 语音两项的**权威分组**（点分路径）与旧位置。
+VOICE_SECTION = 'model_center.audio'
+VOICE_LEGACY_SECTION = 'robot_actions.chat'
+VOICE_FIELD_KEYS: tuple[str, ...] = ('tts_provider_id', 'default_voice')
+
+#: 所有"读取侧要归并"的目标路径（组级 + 键级）：控制台配置页据此判断某个字段/子组
+#: 的值该从"运行期真正生效的那一份"取（`console_api.config_schema`）。
+LEGACY_MERGE_TARGETS: frozenset[str] = frozenset(LEGACY_SECTION_MERGES) | frozenset(LEGACY_KEY_MERGES)
+
+#: `plugin/_conf_schema.json` 的 `items.<键>.default` 缓存（懒加载一次，按**点分路径**）。
+_SCHEMA_DEFAULTS: dict[str, dict[str, Any]] | None = None
+
+
+def read_section_path(config: Any, path: str) -> Any:
+    """按**点分路径**读一个嵌套配置值（读不到回 `None`）。
+
+    `path` 既可以是顶层组名（`runtime`），也可以是嵌套段（`robot_actions.chat` /
+    `runtime.input_status`）。core 侧所有"按分组名读配置"的地方都走它，别各写一套
+    `dict.get` 链（漏一层就是静默读空，AGENTS 坑 66 那类事故）。
+    """
+    if not isinstance(config, dict):
+        return None
+    node: Any = config
+    for step in str(path).split('.'):
+        if not step:
+            continue
+        if not isinstance(node, dict):
+            return None
+        node = node.get(step)
+        if node is None:
+            return None
+    return node
+
+
+def write_section_path(config: dict[str, Any], path: str, value: Any) -> None:
+    """按点分路径写一个嵌套值，**沿途浅拷贝父字典**（不改调用方手里的嵌套对象）。
+
+    "只在顶层换引用"是折叠函数的契约（`fold_legacy_section_merges` 的调用方可能还
+    拿着原始配置），写 `runtime.input_status` 这种两层路径时必须逐层复制，否则会连带
+    改掉 `raw['runtime']`——那份可能是 `raw_config()` 的返回值。
+    """
+    parts = [step for step in str(path).split('.') if step]
+    if not parts:
+        return
+    node = config
+    for step in parts[:-1]:
+        child = node.get(step)
+        node[step] = dict(child) if isinstance(child, dict) else {}
+        node = node[step]
+    node[parts[-1]] = value
+
+
+def write_merge_target(config: dict[str, Any], path: str, value: Any) -> None:
+    """把归并结果写回归并目标，**顺带写它的分组别名拼写**。
+
+    为什么不能只写一条：`model_center` 与它的别名 `model` 在 `apply_section_aliases`
+    里是**同一个对象**，而 `write_section_path` 沿途浅拷贝——一旦动
+    `model_center.audio`，两边的共享就断了，core 读的 `model.audio` 会停在旧值上
+    （v1.7.5 搬迁语音键时实测：新位置有值、`model.audio` 是空的）。所以凡是
+    "目标路径的第一段有别名"的情况，两条拼写都要写；别名那一段在配置里不存在就
+    不凭空建（上游形状的配置只有 `model`，schema 形状的只有 `model_center`）。
+    """
+    head, _, tail = str(path).partition('.')
+    alias = CONFIG_SECTION_ALIASES.get(head)
+    paths = [path]
+    if alias and tail and alias in config:
+        paths.append('%s.%s' % (alias, tail))
+    for item in paths:
+        write_section_path(config, item, dict(value) if isinstance(value, dict) else value)
+
+
+def _schema_default_map(schema: Any, prefix: str = '') -> dict[str, dict[str, Any]]:
+    """递归收集 `路径 → {键: schema 默认值}`（只沿 `type: object` 的 `items` 往下走）。"""
+    found: dict[str, dict[str, Any]] = {}
+    if not isinstance(schema, dict):
+        return found
+    for name, spec in schema.items():
+        if not isinstance(spec, dict):
+            continue
+        items = spec.get('items')
+        if not isinstance(items, dict):
+            continue
+        path = f'{prefix}{name}'
+        found[path] = {
+            key: item.get('default')
+            for key, item in items.items() if isinstance(item, dict)
+        }
+        if spec.get('type') == 'object':
+            found.update(_schema_default_map(items, f'{path}.'))
+    return found
+
+
+def schema_group_defaults(group: str) -> dict[str, Any]:
+    """某个分组的「键 → schema 默认值」（懒加载 + 缓存，读不到就回空 dict）。
+
+    `group` 是**点分路径**：顶层组名（`runtime`）与嵌套段（`robot_actions.chat` /
+    `runtime.input_status`）都认——宿主补默认值的规则就写在这份 schema 里
+    （`AstrbotConfig` 用 `_config_schema_to_default_config` 读同一个文件，对
+    `type: object` 的子项是**递归展开**的），所以这里也必须按路径取，拿顶层组名去比
+    嵌套段的默认值会永远对不上（归并规则会因此失效）。
+
+    唯一用途见 `merge_legacy_section_values`：区分"用户写过的值"与"宿主按 schema
+    补进来的默认值"。
+    """
+    global _SCHEMA_DEFAULTS
+    if _SCHEMA_DEFAULTS is None:
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            '_conf_schema.json',
+        )
+        try:
+            with io.open(path, encoding='utf-8-sig') as handle:
+                schema = json.load(handle)
+        except (OSError, ValueError):
+            # 读不到 schema（打包异常等）：退回"新分组一律优先"的老行为，绝不因为
+            # 读不到默认值就不归并（旧配置读不到才是更糟的那头）。
+            schema = {}
+        _SCHEMA_DEFAULTS = _schema_default_map(schema)
+    return _SCHEMA_DEFAULTS.get(group, {})
+
+
+def _legacy_value_is_written(source_defaults: dict[str, Any], key: Any, value: Any) -> bool:
+    """旧分组里的这个值是不是"用户写过的"。
+
+    判据用**源分组自己的** schema 默认值（宿主给旧组补的就是它自己的默认值）：
+    键在源里也查不到默认值就当成"写过"（宁可保守地把用户的值带过来）。
+    """
+    if key not in source_defaults:
+        return True
+    return value != source_defaults[key]
+
+
+def merge_legacy_section_values(
+    raw: Any, name: str, values: Any = None,
+) -> dict[str, Any]:
+    """读一个分组：**用户写过的新分组值优先，其余从旧分组补**（`LEGACY_SECTION_MERGES`）。
+
+    `name` 是点分路径（`robot_actions.chat` / `runtime.input_status` 这类嵌套目标也认）。
+    `values` 是调用方**已经读到**的"新分组"内容（宿主 `section()` 的返回、
+    上一级归并的产物、`read_section_path()` 的结果）——本函数不替调用方去
+    `raw[name]` 取，各读取路径的兜底各有各的写法（见 `apply_section_aliases` /
+    `AstrbotBridge.section` / `chunk12.action_group_values`）。
+    返回值永远是**新 dict**，不会改到 `raw` 里任何一个分组（调用方可能还拿着它）。
+
+    逐键规则（`defaults` = `schema_group_defaults(name)`）：
+
+    * 新分组的值**不等于** schema 默认值 → 用户写过，用它；
+    * 新分组的值**等于**默认值（含键不存在）→ 看旧分组：旧分组**写过**（不等于**它自己**的
+      默认值）且值也不是目标默认值 → 用旧分组的；
+    * 两边都"没写过" → 就是默认值，谁说话都一样（没写过的默认值照搬也无害，保留旧行为）。
+
+    不是归并目标的分组原样返回 `values`（浅拷贝一份，调用方拿去随便改）。
+
+    `LEGACY_KEY_MERGES` 的**键级搬迁**共用本函数（`name` 是键级目标路径时，
+    `sources` 为空、`moves` 非空）：规则逐字相同，只是"旧位置"是**某组里的某几个键**
+    （`源路径 + 源键`），而不是整组。
+    """
+    merged = dict(values) if isinstance(values, dict) else {}
+    sources = LEGACY_SECTION_MERGES.get(name)
+    moves = LEGACY_KEY_MERGES.get(name)
+    if not sources and not moves:
+        return merged
+    if not isinstance(raw, dict):
+        return merged
+    defaults = schema_group_defaults(name)
+    for source in sources or ():
+        section = raw.get(source)
+        if not isinstance(section, dict):
+            continue
+        source_defaults = schema_group_defaults(source)
+        for key, value in section.items():
+            if key not in merged:
+                merged[key] = value
+                continue
+            # 新分组里是"没写过"的默认值、而旧分组里是用户的选择 → 旧分组说了算。
+            if (key in defaults and merged[key] == defaults[key]
+                    and _legacy_value_is_written(source_defaults, key, value)
+                    and value != defaults[key]):
+                merged[key] = value
+    for target_key, source_path, source_key in moves or ():
+        section = read_section_path(raw, source_path)
+        if source_path in LEGACY_SECTION_MERGES:
+            # 源本身可能就是**组级归并的目标**（`robot_actions.chat` 就是）：只看它自己在
+            # 配置里那一份，会漏掉还留在更旧分组（`actions_voice`）里、尚未折过来的值
+            # ——用户升级后"我明明配了"就会变成静默回落。
+            section = merge_legacy_section_values(raw, source_path, section)
+        # 源键**不存在**（或显式 null）不算"写过"：`_legacy_value_is_written` 对
+        # "键不在源默认值表里"是保守判真的，这里先排除缺键，否则会把 `None` 搬过去。
+        if not isinstance(section, dict) or source_key not in section:
+            continue
+        value = section.get(source_key)
+        if value is None:
+            continue
+        source_defaults = schema_group_defaults(source_path)
+        # 新位置写过 → 新位置说了算（本轮不动它）。
+        if target_key in merged and target_key in defaults and merged[target_key] != defaults[target_key]:
+            continue
+        if _legacy_value_is_written(source_defaults, source_key, value) and value != defaults.get(target_key):
+            merged[target_key] = value
+    return merged
+
 #: 「提示词四件套」的**权威分组**（`plugin/_conf_schema.json` 的顶层 `prompts` 组）。
 #:
 #: 上游把四个提示词放在 `model` 组里（`src/index.ts` 的 `ModelConfig`），本移植版
@@ -1101,6 +1394,11 @@ def to_schema_shape(config: Any) -> dict[str, Any]:
     `resolve_prompt_fields` 裁决过：提示词组写了就以它为准，没写就沿用模型中心的兼容位），
     所以不会丢用户内容。摘副本时**复制**分组而不是原地 `pop`：入参与出参的嵌套
     dict 目前是共享引用（浅拷贝），原地改会连带改掉调用方手里那份配置。
+
+    v1.7.4 起收尾再跑一次 **旧分组折叠**（`fold_legacy_section_merges`）：写盘时
+    把旧分组里用户写过的值折进新路径（含嵌套的 `robot_actions.chat` /
+    `runtime.input_status`）、清空旧分组。这也是唯一的"迁移入口"——控制台
+    改任意一项、配置导入，都会顺手把动作开关配置迁到新分组名下（见该函数的说明）。
     """
     if not isinstance(config, dict):
         return {}
@@ -1125,7 +1423,7 @@ def to_schema_shape(config: Any) -> dict[str, Any]:
         for key in PROMPT_FIELD_KEYS:
             if key in effective:
                 prompts[key] = effective[key]
-    return out
+    return fold_legacy_section_merges(out)
 
 
 def _to_snake_key(key: str) -> str:
@@ -1180,6 +1478,97 @@ def _normalize_config_value(value: Any, depth: int, key: str | None = None) -> A
     return value
 
 
+def fold_legacy_section_merges(config: Any) -> dict[str, Any]:
+    """把旧分组里用户写过的值**折进新分组**（**写盘目标用**，幂等）。
+
+    目标可以是**嵌套路径**（`robot_actions.chat` / `runtime.input_status`）：写回时
+    沿途浅拷贝父字典（`write_section_path`），所以调用方手里那份配置的嵌套 dict
+    不会被连带改掉。
+
+    与 `merge_legacy_section_values` 共用同一套规则，差别是这里改的是"要落盘的那份"：
+
+    * 新分组拿到的是**生效值**（读取侧现在会给出什么，磁盘上就固化什么）；
+    * 旧分组折完**清空** —— 宿主下次加载会给它们补默认值（`check_config_integrity`），
+      而归并规则里"等于默认值不算写过"让新分组说了算。
+
+    为什么非折不可：不折的话，旧分组里那个非默认的旧值会**永远**压着新分组。
+    用户在新分组里把开关改回默认值（比如重新打开一个升级前关掉的语音开关）时，
+    读取侧会判"新值 == 默认值 = 没写过"，于是又读回旧分组的旧值——界面上看起来
+    就是"改了没反应"。折一次之后新旧两处不再打架。
+
+    **幂等**：只有"折一下真的会改动新分组"时才折（即旧组里存在"与新组当前值不一样、
+    且是用户写过"的键）；宿主每次加载都会把空掉的旧组补成默认值
+    （`check_config_integrity`），那不算用户写过，于是后续启动不会反复写盘。
+
+    v1.7.3 的"共用源不清空"分支随 `actions_risks` 退出归并一起删掉了（v1.7.4）：
+    现在每个旧组只供给一个目标，清空它不会影响别的目标（见 `LEGACY_SECTION_MERGES`）。
+
+    v1.7.5 起**先折组、再折键**：键级搬迁（`LEGACY_KEY_MERGES`）的源是
+    `robot_actions.chat` 这种**可见组**，而那一组本身可能是上一轮组级归并的目标——
+    顺序反了会从"还没合并的旧位置"取值（`actions_chat` 里那份）。键级折叠的写法与
+    组级同源：值折进新位置、旧键**清回 schema 默认值**（不是删键——键还在 schema 里，
+    删了宿主下次加载也会补回来，写默认值才让"没写过"这条判定稳定成立）。
+    """
+    if not isinstance(config, dict):
+        return config
+    for target, sources in LEGACY_SECTION_MERGES.items():
+        defaults = schema_group_defaults(target)
+        own = read_section_path(config, target)
+        own = dict(own) if isinstance(own, dict) else {}
+        pending = False
+        for source in sources:
+            section = config.get(source)
+            if not isinstance(section, dict) or not section:
+                continue
+            source_defaults = schema_group_defaults(source)
+            for key, value in section.items():
+                if _legacy_value_is_written(source_defaults, key, value):
+                    # 旧组里"用户写过"的东西：清空本身就是要做的事
+                    # （否则旧值会永远压着新组）。
+                    pending = True
+                    break
+            if pending:
+                break
+        if not pending:
+            continue
+        write_merge_target(config, target, merge_legacy_section_values(config, target, own))
+        for source in sources:
+            section = config.get(source)
+            if isinstance(section, dict) and section:
+                # 值已经（按规则）折进新分组了，旧分组留着只会继续产生歧义。
+                config[source] = {}
+    for target, moves in LEGACY_KEY_MERGES.items():
+        own = read_section_path(config, target)
+        own = dict(own) if isinstance(own, dict) else {}
+        pending = False
+        for _target_key, source_path, source_key in moves:
+            section = read_section_path(config, source_path)
+            if not isinstance(section, dict) or source_key not in section:
+                continue
+            if section.get(source_key) is None:
+                continue
+            if _legacy_value_is_written(
+                schema_group_defaults(source_path), source_key, section.get(source_key),
+            ):
+                pending = True
+                break
+        if not pending:
+            continue
+        write_merge_target(config, target, merge_legacy_section_values(config, target, own))
+        # 旧键清回默认值（沿途浅拷贝：不改调用方手里那份嵌套 dict）。
+        for _target_key, source_path, source_key in moves:
+            section = read_section_path(config, source_path)
+            if not isinstance(section, dict) or source_key not in section:
+                continue
+            default = schema_group_defaults(source_path).get(source_key)
+            if section.get(source_key) == default:
+                continue
+            patched = dict(section)
+            patched[source_key] = default
+            write_section_path(config, source_path, patched)
+    return config
+
+
 def apply_section_aliases(raw: Any) -> dict[str, Any]:
     """把 AstrBot schema 的顶层分组别名补成上游分组名（本模块是唯一实现源）。
 
@@ -1196,14 +1585,34 @@ def apply_section_aliases(raw: Any) -> dict[str, Any]:
       上游名也不会跟残留的别名打架；
     * `raw` 非 dict 时返回空 dict（调用方自行兜底）。
 
+    最后再跑一遍 **N:1 归并**（`LEGACY_SECTION_MERGES`）：把旧动作分组里剩下的键
+    补进新路径（`actions_interaction` … → `robot_actions.chat`；
+    `actions_chat` / `actions_group` / `actions_qzone` → 同名子组；
+    `input_status` → `runtime.input_status`）。目标可以是嵌套路径，沿途浅拷贝父字典
+    （`write_section_path`），所以 `raw` 里已有的 `runtime` 不会被原地改。
+    旧分组本身**不动**，所以"未知键不丢"照旧；新路径只在有东西可补时才建出来。
+
+    组级归并之后是 **键级搬迁**（`LEGACY_KEY_MERGES`，v1.7.5：语音两项 →
+    `model_center.audio`）。顺序不能反：键级的源（`robot_actions.chat`）本身可能是
+    组级归并的目标，得先让组级那一步把它填好。此刻 `model_center` 与它的别名 `model`
+    还是**同一个 dict 对象**，所以补一次两处都到位（之后 `merge()` 才会拆成两份）。
     适配层（`plugin/adapters/astrbot_bridge.py`）复用本函数，不另抄一份表。
     """
     if not isinstance(raw, dict):
         return {}
     source = dict(raw)
-    for alias, target in CONFIG_SECTION_ALIASES.items():
-        if alias in source and target not in source:
-            source[target] = source[alias]
+    for table in (CONFIG_SECTION_ALIASES, LEGACY_SECTION_ALIASES):
+        for alias, target in table.items():
+            if alias in source and target not in source:
+                source[target] = source[alias]
+    for target in LEGACY_SECTION_MERGES:
+        merged = merge_legacy_section_values(source, target, read_section_path(source, target))
+        if merged:
+            write_merge_target(source, target, merged)
+    for target in LEGACY_KEY_MERGES:
+        merged = merge_legacy_section_values(source, target, read_section_path(source, target))
+        if merged:
+            write_merge_target(source, target, merged)
     return source
 
 
@@ -1380,7 +1789,15 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     # ---- 【必填 2】model（index.ts Model） ----
     'model': {
         'vision': {'enabled': False, 'mode': 'native', 'detail': 'auto', 'max_image_dimension': 1024},
-        'audio': {'enabled': False, 'out_format': 'mp3', 'max_file_size_mb': 10, 'max_per_message': 1},
+        'audio': {
+            'enabled': False, 'out_format': 'mp3', 'max_file_size_mb': 10, 'max_per_message': 1,
+            # v1.7.7：文字转语音总开关（正文 `<tts/>` 标记 + `send_voice` 动作共用）。
+            # 默认 True = 保持今天的行为（发语音这条动作从 v1.7.2 起就是可用的）。
+            # 注意它**不进** `resolve_audio_config` 的输出形状：那个 dict 是上游
+            # `audioConfig` 的逐字对应物，多一个键会让 `audio_config` 的相等断言漂移；
+            # 读它的是 `ServiceBase.voice_reply_enabled`。
+            'tts_enabled': True,
+        },
         'providers': [],
         'main_temperature': 0.8,
         'main_top_p': 1.0,
@@ -1419,6 +1836,13 @@ CONFIG_DEFAULTS: dict[str, Any] = {
             'fixed_prompt': '',
             'style_prompt': 'Concise, factual, chronological, and concrete.',
         },
+        # v1.4.0：模型调用治理（`docs/MEMORY_MAINTENANCE.md` §5.6）。默认关闭。
+        'governor_enabled': False,
+        'governor_max_concurrency': 4,
+        'governor_max_requests_per_minute': 0,
+        'governor_min_call_interval_ms': 0,
+        'governor_breaker_failures': 5,
+        'governor_breaker_cooldown_seconds': 60,
     },
     # ---- 【必填 3】onebot（index.ts OneBot） ----
     'onebot': {
@@ -1560,6 +1984,20 @@ CONFIG_DEFAULTS: dict[str, Any] = {
         'overlay_monthly_window_days': 10,
         'overlay_weekly_summary_characters': 1_600,
         'overlay_monthly_summary_characters': 3_200,
+        'facts_dedupe_enabled': True,
+        'facts_contradiction_enabled': True,
+        'temporal_anchor_enabled': True,
+        'forgetting_enabled': False,
+        'forgetting_threshold': 0.25,
+        'forgetting_retention_days': 14,
+        'forgetting_half_life_days': 30,
+        'maintenance_max_llm_calls': 12,
+        'maintenance_max_runtime_minutes': 10,
+        'maintenance_min_call_interval_ms': 500,
+        'hybrid_retrieval_enabled': True,
+        'hybrid_rrf_k': 60,
+        'query_rewrite_enabled': True,
+        'context_metrics_enabled': True,
     },
     # ---- 【内在 13】alterSystem（index.ts AlterSystem） ----
     'alter_system': {

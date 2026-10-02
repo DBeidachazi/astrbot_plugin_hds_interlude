@@ -62,7 +62,7 @@
 * Puppeteer 的降采样 / 抽帧 → `PIL`（try-import）。`PIL` 缺失时
   `downscale_image_for_vision` / `render_animated_image_frame` 返回 `None`，
   调用方继续透传原图并记一条 debug 日志，**不抛异常**。
-* `onebot-file:` 语音的 SnowLuma 服务端转码 → `session.bot.internal._request`
+* `onebot-file:` 语音的服务端转码（NapCat `get_record`）→ `session.bot.internal._request`
   或 `Transport.transcode_record` 的可选钩子；两者都不可用时返回 `None`
   （等价上游 `typeof internal?._request !== 'function' ? undefined`）。
 * 图片 `content-type` 头：`Transport.fetch_image` 只回字节，故 MIME 走魔数嗅探
@@ -85,10 +85,15 @@ from ..script.commit_builder import find_outgoing_script_event
 from ..script.delivery_ledger import platform_action_reference
 from ..script.intent_lifecycle import consumed_live_intent_ids, live_narrative_intents
 from ..story_state import decode_story_state, encode_story_state
-from ..time import format_log_time, iso, parse_dt
+from ..time import dt_ms, format_log_time, iso, parse_dt
 from .base import ServiceBase, pick
 from .config import RECALLABLE_ENTRY_KINDS, is_trusted_image_host
 from .helpers import (
+    IMAGE_HASH_TOLERANCE,
+    hamming_distance,
+    image_perceptual_hash,
+    remember_described_hashes,
+    split_described_images,
     _turn_get,
     _turn_set,
     guess_audio_format,
@@ -98,6 +103,7 @@ from .helpers import (
     narrative_cursor,
     normalize_participant_state,
     should_downscale_image,
+    wire_media_kind,
 )
 
 try:  # pragma: no cover - 取决于同批任务的落地顺序
@@ -139,6 +145,18 @@ DEFAULT_AUDIO_MAX_PER_MESSAGE = 1
 # =========================================================================== #
 # 通用小工具
 # =========================================================================== #
+
+
+def _image_bytes(image: Any) -> bytes:
+    """从 Data URI 里取回原始字节（算感知哈希用）；形状不对给空字节。"""
+    uri = _text(_value(image, 'data_uri'))
+    marker = ';base64,'
+    if marker not in uri:
+        return b''
+    try:
+        return base64.b64decode(uri.split(marker, 1)[1])
+    except Exception:  # noqa: BLE001 - 坏 base64 只是"算不出哈希"
+        return b''
 
 def _to_snake(name: str) -> str:
     """`camelCase` → `snake_case`（只用于生成双读的第二个键名）。"""
@@ -343,27 +361,67 @@ def _local_image_path(value: Any) -> str:
     return text.strip()
 
 
-def _fallback_extract_session_image_sources(session: Any) -> list[str]:
-    """上游 `extractSessionImageSources`（`src/service.ts:7036`）逐字移植。
+#: **文本来源的惰性前缀**（受控偏离 §46.8）。
+#:
+#: `session.content` 是用户可写的字符串：谁都能在里面手打 `<img src="…"/>` 或
+#: `[CQ:image,url=…]`。上游把 `[CQ:image,…]` 的 url 记成 `onebot-url:…` —— 那是
+#: "适配器提供"的坐标，取回时**跳过主机白名单**；于是"原生视觉"能被一段正文指向
+#: 任意地址。这里把所有**从正文读出来**的坐标一律标成 `text:`：
+#:
+#: * 条目照常出现（`imageCount`、附件条目、`[图片]` 那份叙事文本都不变）；
+#: * `fetch_native_image()` 见到它直接回 `None` —— **永不取回**；
+#: * 它也没有本地读文件的口子（`file=` token 同样惰性化）。
+TEXT_SOURCE_PREFIX = 'text:'
 
-    只解析这条消息的原始内容（`session.elements` 归适配器所有，可能被别的
-    中间件跨回合复用，否则旧图片元素会被误挂到后续纯文本回合上）。
+#: 「这个宿主没有结构化媒体观测通道」这条能力缺失告警的最短间隔（毫秒，按会话节流）。
+#: 与 `STICKER_COLLECT_WARN_INTERVAL_MS` / `note_access_skip` 同一条纪律：能力缺失必须
+#: 让人看见，但同一条原因不能刷屏（一条图片消息每分钟能来十几条）。
+MEDIA_OBSERVABILITY_WARN_INTERVAL_MS = 10 * 60 * 1000
+
+
+def _fallback_extract_session_image_sources(session: Any) -> list[str]:
+    """上游 `extractSessionImageSources`（`src/service.ts:7036`）+ **文本来源惰性化**。
+
+    这一份只用于**没有结构化媒体观测通道**的会话（`SessionView.media is None`：
+    老宿主 / 只给了 `message_str` / 自己搓 `SessionView` 的调用方）。有结构化媒体表时
+    走 `_structured_image_sources()`，**绝不看文本**（§46.8）。
+
+    与上游的两处受控偏离：
+
+    * 正文里读出来的 http(s) 坐标一律加 `text:`（上游是裸 URL；`[CQ:image,…]` 更是
+      `onebot-url:` —— 后者正是"手打一个 CQ 码就能让她下载任意地址"的入口）；
+    * 正文里的 `file=` token 同样惰性化（上游会去读本地文件）。
+
+    **适配器直给的元素**（`session.elements`）**不变**：那一份仍然记成 `onebot-file:`，
+    仍然允许读本地文件（可信坐标），与正文无关。只解析这条消息的原始内容
+    （`session.elements` 归适配器所有，可能被别的中间件跨回合复用，否则旧图片元素
+    会被误挂到后续纯文本回合上）。
     """
     raw = _text(_member(session, 'content'))
     sources: list[str] = []
 
     def add(value: Any, kind: str = 'url') -> None:
         source = _text(value).strip()
-        if not source or source in sources:
-            return
-        if len(source) > 8 * 1024 * 1024:
+        if not source or len(source) > 8 * 1024 * 1024:
             return
         if re.match(r'^https?://', source, re.IGNORECASE):
-            sources.append('onebot-url:%s' % source if kind == 'adapter-url' else source)
+            # 上游这里是裸 URL / `onebot-url:`；本移植版一律惰性（§46.8）。
+            entry = '%s%s' % (TEXT_SOURCE_PREFIX, source)
         elif re.match(r'^data:image/', source, re.IGNORECASE):
-            sources.append(source)
+            # 内联图片就地解码、没有取回动作，照上游保留。
+            entry = source
+        elif kind == 'element-file':
+            # 适配器直给的本地路径：唯一允许读本地文件的坐标。
+            entry = 'onebot-file:%s' % source
         elif kind == 'file':
-            sources.append('onebot-file:%s' % source)
+            # 来自正文的 `file=` token：惰性（上游会去读本地文件，那等于给正文开一个
+            # 本地读文件的口子）。
+            entry = '%s%s' % (TEXT_SOURCE_PREFIX, source)
+        else:
+            return
+        # 去重按**最终坐标**（上游按原文去重，带前缀的那几种会重复记账）。
+        if entry not in sources:
+            sources.append(entry)
 
     def image_src(element: Any) -> Any:
         if not is_record(element):
@@ -386,7 +444,7 @@ def _fallback_extract_session_image_sources(session: Any) -> list[str]:
         for element in trusted:
             src = image_src(element)
             if src and not re.match(r'^(?:https?://|data:image/)', _text(src), re.IGNORECASE):
-                add(_local_image_path(src), 'file')
+                add(_local_image_path(src), 'element-file')
 
     parse = _helper('_parse_mini_xml_elements')
     visit_elements = _helper('_visit_elements')
@@ -420,14 +478,175 @@ def _fallback_extract_session_image_sources(session: Any) -> list[str]:
     return sources
 
 
+def _structured_image_sources(entries: Any) -> list[str]:
+    """结构化媒体表 → 视觉来源表（`[{'source',…}]` → `[str]`）。
+
+    与 `_structured_session_media()` 是**同一份数据**（`SessionView.media`）：
+    图片来源就是媒体来源，payload 的 `attachments` 才能按 `source` 对齐种类（§29/§45）。
+
+    `file://…`（适配器把图落到本地）归一成 `onebot-file:…`，与上游从 `session.elements`
+    认本地路径的那套坐标**同形** —— 那是本移植版里唯一允许读本地文件的坐标。
+    卡片（`source` 为空）不产生来源。
+    """
+    sources: list[str] = []
+    for entry in entries or []:
+        if not is_record(entry):
+            continue
+        source = _text(pick(entry, 'source')).strip()
+        if not source or source in sources:
+            continue
+        source_kind = _text(pick(entry, 'source_kind')).strip().lower()
+        if source.startswith('onebot-file:'):
+            sources.append(source)
+        elif source_kind == 'path' or re.match(r'^file://', source, re.IGNORECASE):
+            sources.append('onebot-file:%s' % _local_image_path(source))
+        elif (
+            re.match(r'^https?://', source, re.IGNORECASE)
+            or re.match(r'^data:image/', source, re.IGNORECASE)
+            or source_kind in ('url', 'data', 'file')
+        ):
+            # `source_kind == 'file'` 但没带前缀（桌面桥的自造坐标）：补上与上游同形的前缀，
+            # 否则它既取不回、也和媒体表对不上。
+            sources.append(
+                'onebot-file:%s' % _local_image_path(source) if source_kind == 'file' else source
+            )
+        elif re.match(r'^(?:[A-Za-z]:[\\/]|/)', source):
+            # 没标注种类的绝对路径（手搓媒体条目）：当适配器给的本地坐标处理。
+            sources.append('onebot-file:%s' % _local_image_path(source))
+    return sources
+
+
+def _structured_session_media(session: Any) -> list[dict[str, Any]]:
+    """读适配层写下来的**结构化媒体表**（`session.media`）→ `[{source,kind,summary,label}]`。
+
+    为什么必须结构化（`docs/PORTING_NOTES.md` §46）：这条链路上的判据是"这张图是不是
+    表情包"，而旧的实现是从 `session.content` 的 `<img kind=…>` 文本里正则反解析的。
+    正文是**用户可写**的——谁都能在消息里手打一个
+    `<img src="http://任意地址" kind="sticker"/>`，于是"收藏表情包"会真的去下载那个
+    地址（SSRF-lite）并往库里塞垃圾。判据只能来自适配器**观测到的原始段**。
+
+    入口与形状：
+
+    * 产出口：`astrbot_bridge.serialize_message_chain(..., media=[…])`（图片的
+      `kind` / `summary` 来自 OneBot 原始段的 `sub_type` / `summary`，卡片来自
+      `Json` 组件），随 `SessionView.media` 一起下来；
+    * 每项：`kind`（`image` / `sticker` / `animated` / `market` / `card`）、
+      `source`（归一化来源；视觉来源表就是它的规范化形式，见
+      `_structured_image_sources`）、`summary`（平台原文）、`raw`（原始判据，
+      core 侧不用，只做透传的余量）；
+    * `label` 在这里由 `helpers.media_kind_label` / `helpers.card_media_label`
+      算出来 —— 文案只有一处（见 §46）。
+
+    ⚠️ **种类这一半没有文本降级**：`media` 不是 list（`None` / 缺失：老宿主、
+    `message_str` 兜底、手搓 `SessionView`）就回空表 —— 不收藏、payload 里没有
+    attachments、也没有媒体事实。**绝不**回退去解析文本。（"来源"那一半的降级见
+    `_extract_session_image_sources`：文本坐标带 `text:` 惰性前缀，永不取回。）
+    """
+    entries = pick(session, 'media')
+    if not isinstance(entries, list):
+        return []
+    label_of_image = _helper('media_kind_label')
+    label_of_card = _helper('card_media_label')
+    media: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not is_record(entry):
+            continue
+        kind = _text(pick(entry, 'kind')).strip().lower()
+        if kind == 'card':
+            # 卡片没有可下载来源：只留一条"他转了个什么"，给 payload 与叙事用。
+            raw = pick(entry, 'raw')
+            attributes = raw if is_record(raw) else {}
+            label = (
+                label_of_card(attributes.get('app'), attributes.get('title') or attributes.get('prompt'))
+                if callable(label_of_card) else '[分享卡片]'
+            )
+            media.append({'source': '', 'kind': 'card', 'summary': '', 'label': label})
+            continue
+        source = _text(pick(entry, 'source')).strip()
+        if not source or source in seen:
+            continue
+        seen.add(source)
+        summary = _text(pick(entry, 'summary')).strip()
+        label = (
+            label_of_image(kind or 'image', summary) if callable(label_of_image) else '[图片]'
+        )
+        media.append({'source': source, 'kind': kind or 'image', 'summary': summary, 'label': label})
+    return media
+
+
+def _extract_session_media(session: Any) -> list[dict[str, Any]]:
+    """入站媒体 → `[{source, kind, summary, label}]`；**唯一入口**，只读结构化数据。
+
+    旧实现（从 `session.content` 里的 `<img kind=…>` 文本反解析）已经**整段删除**，
+    别接回来：那条路把用户手打的文本当判据（§46）。
+    """
+    return _structured_session_media(session)
+
+
 def _format_buffered_user_messages(messages: list[Any]) -> str:
     """`format_buffered_user_messages`：优先 helpers.py 的移植版。"""
     return (_helper('format_buffered_user_messages') or _fallback_format_buffered_user_messages)(messages)
 
 
+#: 没有观测通道时，正文里"有图"的可见痕迹：坐标之外的第二种判据。
+#: 有些宿主只给 `message_str`，而它把图片渲染成 `[图片]` / `[动画表情]` 这种占位。
+#: ⚠️ 用户自己也能打出这几个字 —— 在没有观测通道的宿主上我们分不清，而"看不见图"
+#: 这件事必须至少说一次（节流 10 分钟一条），所以这里刻意宁可多报一次。
+_MEDIA_PLACEHOLDER_RE = re.compile(r'\[\s*(?:图片|表情包|动画表情|QQ\s*商城表情|视频)\s*\]')
+
+
+def _note_missing_media_observability(service: Any, session: Any, sources: Any) -> None:
+    """`media is None`（没有观测通道）而这条消息确实有图 → 一条**节流 warn**（§46.9.2）。
+
+    判据（`media is None` 先短路，所以 `[]` 场景永远不会走到下面）：
+
+    * `pick(session, 'media') is None`：适配层根本没交结构化媒体表（老宿主 / 只给
+      `message_str` / 手搓 `SessionView`）——`[]` **不算**（那是"观测到零媒体"）；
+    * 且"确实有图"命中二者之一：
+      1. `sources` 非空（正文里解析出了图片坐标，`currentEvent.imageCount` 就是它）；
+      2. 正文里有 `[图片]` / `[动画表情]` 这类**占位文本**（宿主把图渲染成了文字，
+         连坐标都没有）。
+
+    为什么必须可见（坑 25）：这种宿主拿不到原生图片输入 —— 图片只会以 `[图片]` 文本
+    告知模型、**永不取回**（§46.7）。用户看不到就会以为"她瞎了"。
+    节流照 `note_access_skip`（键里带会话坐标与原因，同一条原因 10 分钟一条）。
+    """
+    if pick(session, 'media') is not None:
+        return
+    if not sources and not _MEDIA_PLACEHOLDER_RE.search(_text(_member(session, 'content'))):
+        return
+    note = getattr(service, 'note_access_skip', None)
+    if not callable(note):
+        return
+    platform = _text(_member(session, 'platform')) or '?'
+    self_id = _text(_member(session, 'selfId', 'self_id')) or '?'
+    scope = (
+        _text(_member(session, 'channelId', 'channel_id'))
+        or _text(_member(session, 'userId', 'user_id'))
+        or '?'
+    )
+    note(
+        'media-observability|%s|%s|%s' % (platform, self_id, scope),
+        MEDIA_OBSERVABILITY_WARN_INTERVAL_MS,
+        '当前平台没有提供结构化媒体（只能拿到文本），原生图片输入不可用：'
+        '图片只会以 [图片] 文本告知模型，不会被取回。若是 OneBot 适配器，请检查适配器版本。',
+    )
+
+
 def _extract_session_image_sources(session: Any) -> list[str]:
-    """`extract_session_image_sources`：优先 helpers.py 的移植版。"""
-    return (_helper('extract_session_image_sources') or _fallback_extract_session_image_sources)(session)
+    """入站图片来源（视觉路径 `sources`）：**结构化优先**，只在没有观测通道时回退文本。
+
+    * `SessionView.media` 是 list（含空表）→ 只读结构化那份（`_structured_image_sources`），
+      **绝不看文本**：正文里手打的 `<img src=…>` / `[CQ:image,…]` 一条都不进来源表；
+    * `media` 是 `None` / 缺失 / 不是 list（老宿主、只给 `message_str`、手搓 `SessionView`
+      的调用方）→ 上游那套文本抽取，但**所有文本坐标带 `text:` 惰性前缀**（永不取回）。
+      见 `docs/PORTING_NOTES.md` §46.8。
+    """
+    entries = pick(session, 'media')
+    if isinstance(entries, list):
+        return _structured_image_sources(entries)
+    return _fallback_extract_session_image_sources(session)
 
 
 # =========================================================================== #
@@ -459,7 +678,7 @@ async def _archive_window_after(service: Any, story_id: str, cursor: int) -> lis
 async def _request_record_transcode(
     service: Any, session: Any, file: str, out_format: str, max_bytes: int,
 ) -> Optional[dict[str, Any]]:
-    """上游 `fetchNativeAudio` 的 `onebot-file:` 分支（SnowLuma 服务端转码）。
+    """上游 `fetchNativeAudio` 的 `onebot-file:` 分支（服务端转码）。
 
     优先走适配器原生 `session.bot.internal._request('get_record', ...)`，
     其次走 `Transport.transcode_record(file, out_format)` 可选钩子；两条路都
@@ -501,7 +720,7 @@ async def _request_record_transcode(
         base64_text = ''
     base64_text = re.sub(r'\s+', '', _text(base64_text))
     if not base64_text:
-        raise RuntimeError('SnowLuma get_record returned no transcoded payload')
+        raise RuntimeError('get_record returned no transcoded payload')
     if _base64_bytes_length(base64_text) > max_bytes:
         return None
     return {'format': out_format, 'base64': base64_text}
@@ -527,6 +746,55 @@ async def _fetch_remote_bytes(service: Any, url: str, kind: str) -> Optional[byt
             return None
         return bytes(data) if data else None
     return None
+
+
+async def _load_group_batch_audio(
+    service: Any, story: Any, batch: list[Any], session: Any = None,
+) -> list[Any]:
+    """群聊的**音频批次预算**（上游 `src/service.ts:2197-2215`，v1.7.6 补上的消费点）。
+
+    上游在这里才真正用满 `audioConfig`：条数上限 = `maxPerMessage × 4`、字节上限 =
+    `maxFileSizeMB × 1_000_000 × 4`（一个群里连发好几条语音时，不能让一次回合把整个
+    上下文塞满）；超出的部分**延后 / 跳过当前回合**，并各留一条 warn。
+
+    与上游的差异只有两处、都是本移植版既有的形状：逐条消息的 `audioSession` 我们只留
+    一份最新的会话（`latest_session`），附件 id 用 `group-audio-N`（上游还带说话人昵称）。
+    """
+    config = _audio_config(service)
+    max_count = max(1, _int_value(
+        _value(config, 'maxPerMessage', DEFAULT_AUDIO_MAX_PER_MESSAGE),
+        DEFAULT_AUDIO_MAX_PER_MESSAGE,
+    ) * 4)
+    max_bytes = max(1, int(_number_value(
+        _value(config, 'maxFileSizeMB', DEFAULT_AUDIO_MAX_FILE_SIZE_MB),
+        float(DEFAULT_AUDIO_MAX_FILE_SIZE_MB),
+    ) * 1_000_000 * 4))
+    audio: list[Any] = []
+    total_bytes = 0
+    for message in batch:
+        sources = _turn_get(message, 'audioSources', 'audio_sources') or []
+        if not sources:
+            continue
+        remaining = max_count - len(audio)
+        if remaining <= 0 or total_bytes >= max_bytes:
+            service.report(
+                'warn', story, 'user-message',
+                '群音频批次达到资源上限，剩余音频延后处理 附件上限=%d 字节上限=%d',
+                max_count, max_bytes,
+            )
+            continue
+        loaded = await service.load_native_audio(story, list(sources), session, remaining)
+        for item in loaded:
+            payload_size = len(_text(_value(item, 'base64', '')))
+            if total_bytes + payload_size > max_bytes:
+                service.report(
+                    'warn', story, 'user-message',
+                    '群音频批次达到字节上限，剩余音频跳过当前回合 字节上限=%d', max_bytes,
+                )
+                break
+            audio.append({**item, 'id': 'group-audio-%d' % (len(audio) + 1)})
+            total_bytes += payload_size
+    return audio
 
 
 def _pil_downscale(data: bytes, max_dimension: int) -> Optional[bytes]:
@@ -776,11 +1044,17 @@ class ServiceChunk3(ServiceBase):
     # 原生音视频（上游 2651–2717）
     # ------------------------------------------------------------------ #
 
-    async def load_native_audio(self, story: Any, sources: list[str], session: Any = None) -> list[Any]:
-        """上游 `loadNativeAudio(story, sources, session?)`（`src/service.ts:2651`）逐条移植。
+    async def load_native_audio(
+        self, story: Any, sources: list[str], session: Any = None, max_count: Optional[int] = None,
+    ) -> list[Any]:
+        """上游 `loadNativeAudio(story, sources, session?, maxCount = maxPerMessage)`
+        （`src/service.ts:3058`）逐条移植。
 
         QQ 语音是 SILK，多模态模型读不了，所以 `onebot-file:` 一律要求服务端
         转码（`out_format`）后回传 base64；本方法只返回瞬时附件，**不落库**。
+
+        `max_count`（v1.7.6 补上，上游第 4 个参数）：群聊批次按预算算出的"还能收几条"，
+        上游取 `min(maxPerMessage, maxCount)`；缺省（私聊路径）就是 `maxPerMessage`。
         """
         config = _audio_config(self)
         if not _value(config, 'enabled', False) or not sources:
@@ -788,6 +1062,8 @@ class ServiceChunk3(ServiceBase):
         audio: list[Any] = []
         max_per_message = _int_value(_value(config, 'maxPerMessage', DEFAULT_AUDIO_MAX_PER_MESSAGE),
                                     DEFAULT_AUDIO_MAX_PER_MESSAGE)
+        if max_count is not None:
+            max_per_message = min(max_per_message, max(0, _int_value(max_count, 0)))
         for index, source in enumerate(sources[:max(0, max_per_message)]):
             try:
                 item = await self.fetch_native_audio(source, session)
@@ -860,24 +1136,83 @@ class ServiceChunk3(ServiceBase):
 
         附件本身走原生多模态通道；普通文本里**不留**图片占位符：抓取失败/被过滤
         必须表现为「没有视觉输入」，而不是邀请模型编一个。
+
+        本移植版追加一件事：**没有观测通道**（`session.media is None`）而这条消息
+        确实有图片时，打一条节流 warn（能力缺失，§46.9 / 坑 25）。
         """
         raw = _text(_member(session, 'content'))
         sources = _extract_session_image_sources(session)
+        media = _extract_session_media(session)
+        _note_missing_media_observability(self, session, sources)
         text = normalize_qq_native_face_segments(raw)
-        text = re.sub(r'</?(?:img|image|audio|record|file)\b[^>]*>', '', text, flags=re.IGNORECASE)
+        describe_card = _helper('describe_card_media')
+        if callable(describe_card):
+            text = re.sub(
+                r'<card\b([^>]*?)/?>(?:</card>)?',
+                lambda match: describe_card(match.group(1)),
+                text, flags=re.IGNORECASE,
+            )
+        # 图片标记仍然从正文里拿掉（上游：抓不到视觉内容就必须表现为"没有视觉输入"，
+        # 而不是邀请模型编一张图）。**卡片例外**：它本身就是可读的文字内容
+        # （`[QQ小程序：QQ经典农场]`），留下比删掉更有用，也免得裸标签漏进提示词。
+        text = re.sub(r'<(?:img|image)\b[^>]*/?>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'</(?:img|image|audio|record|file)>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'<(?:audio|record|file)\b[^>]*/?>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'\[CQ:(?:image|record|file),[^\]]*\]', '', text, flags=re.IGNORECASE)
-        return {'content': text.strip(), 'sources': sources}
+        return {'content': text.strip(), 'sources': sources, 'media': media}
 
-    async def load_native_images(self, story: Any, sources: list[str], session: Any = None) -> list[Any]:
-        """上游 `loadNativeImages(story, sources, session?)`（`src/service.ts:2733`）逐条移植。"""
+    async def load_native_images(
+        self,
+        story: Any,
+        sources: list[str],
+        session: Any = None,
+        media: Optional[list[dict[str, Any]]] = None,
+    ) -> list[Any]:
+        """上游 `loadNativeImages(story, sources, session?)`（`src/service.ts:2733`）逐条移植。
+
+        `media` 是本移植版追加的末位可选参数：本轮每张图的**媒体种类**
+        （照片 / 表情包 / 动画表情），随图一起带走，供提示词区分
+        「他发了张实拍照片」和「他甩了个表情包」。
+        """
         if not _value(_vision_config(self), 'enabled', False) or not sources:
             return []
+        kind_by_source: dict[str, dict[str, Any]] = {}
+        for item in media or []:
+            key = _text(pick(item, 'source'))
+            if key and key not in kind_by_source:
+                kind_by_source[key] = item
         images: list[Any] = []
+        turn_hashes: list[str] = []
         for index, source in enumerate(sources[:3]):
             try:
                 image = await self.fetch_native_image(source, _member(session, 'bot'))
                 if image:
-                    images.append({'id': 'turn-image-%d' % (index + 1), **image})
+                    entry = {'id': 'turn-image-%d' % (index + 1), **image}
+                    found = kind_by_source.get(_text(source))
+                    if found:
+                        # 候选档（`sticker-candidate`）是**内部**状态：出 wire 前收口成普通图，
+                        # 提示词只认 `image / sticker / animated / market / card`（§49.1）。
+                        entry['media_kind'] = wire_media_kind(_text(pick(found, 'kind')) or 'image')
+                        entry['media_label'] = _text(pick(found, 'label')) or '[图片]'
+                        summary = _text(pick(found, 'summary'))
+                        if summary:
+                            entry['media_summary'] = summary
+                    # 感知哈希（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）：同一条消息里
+                    # 重复贴同一张图（很常见）只留一张，识图也就不必花两次钱。
+                    digest = image_perceptual_hash(_image_bytes(entry))
+                    if digest:
+                        entry['perceptualHash'] = digest
+                        if any(
+                            hamming_distance(digest, seen) <= IMAGE_HASH_TOLERANCE
+                            for seen in turn_hashes
+                        ):
+                            self.report_operation(
+                                'diagnostic', 'debug', story, 'user-message',
+                                '同一张图在本条消息里出现了两次，只保留一张（哈希=%s）', digest,
+                            )
+                            continue
+                        turn_hashes.append(digest)
+                    images.append(entry)
             except Exception as error:
                 self.report('warn', story, 'user-message', '图片读取失败，已继续处理文字消息 错误=%s', error)
         return images
@@ -892,6 +1227,22 @@ class ServiceChunk3(ServiceBase):
         """
         if not images:
             return None
+        # 同一张图最近识过就不重复识图（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）。
+        registry = getattr(self, '_described_image_hashes', None)
+        if registry is None:
+            registry = {}
+            self._described_image_hashes = registry
+        skipped: list[str] = []
+        known = list(registry.get(_text(_value(story, 'id'))) or [])
+        if known:
+            images, skipped = split_described_images(images, known)
+            if skipped:
+                self.report_operation(
+                    'diagnostic', 'debug', story, 'user-message',
+                    '同一张图最近已经识过，跳过侧端识图 张数=%d', len(skipped),
+                )
+            if not images:
+                return None
         describer = self.vision_describer
         available = getattr(describer, 'available', None)
         if describer is None or not callable(available) or not available():
@@ -903,8 +1254,15 @@ class ServiceChunk3(ServiceBase):
         try:
             observations = await describer.describe_images(
                 images, user_message or '', _value(_vision_config(self), 'detail', 'auto') or 'auto',
+                # 种类一起交给识图模型：它是唯一能回答「实拍 / 截图 / 网图 / 表情包」
+                # 的那一层（元数据只能告诉我们"是不是表情包"，分不出实拍与网图）。
+                [_text(item.get('media_kind')) or 'image' for item in images if isinstance(item, dict)],
             )
             if observations:
+                story_id = _text(_value(story, 'id'))
+                registry[story_id] = remember_described_hashes(
+                    registry.get(story_id) or [], images,
+                )
                 self.report_operation(
                     'diagnostic', 'debug', story, 'user-message',
                     '侧端识图完成 图片=%d 观察=%d', len(images), len(observations),
@@ -930,8 +1288,14 @@ class ServiceChunk3(ServiceBase):
 
         只有 QQ/OneBot 的 CDN 主机在原生视觉路径里被取回，避免任意用户 URL
         变成内网抓取代理；适配器直接给的 URL（`adapterProvided`）例外。
+
+        ⚠️ `text:` 前缀（正文里读出来的坐标）**永不取回**：它既不算适配器提供，
+        也不认主机白名单 —— 否则手打一句 `[CQ:image,url=…]` 就能让她下载任意地址
+        （受控偏离 §46.8）。
         """
         value = _text(source).strip()
+        if value.startswith(TEXT_SOURCE_PREFIX):
+            return None
         if value.startswith('onebot-url:'):
             return await self.fetch_native_image(value[len('onebot-url:'):], bot, True)
         if value.startswith('onebot-file:'):
@@ -1200,6 +1564,8 @@ class ServiceChunk3(ServiceBase):
             snapshot = await self.serial(story_id, snapshot_task)
             if not snapshot:
                 return
+            # 上游 1.0.1-rc21：以「叙事请求发起时刻」为基准算首条发言的打字时间下限。
+            request_started_at = self.now()
             user_message = _format_buffered_user_messages(batch)
             trimmed = (user_message or '').strip()
             turn_query_embedding = None
@@ -1214,20 +1580,55 @@ class ServiceChunk3(ServiceBase):
                 if quote:
                     # `messageIndex` 是发给模型的 wire format（上游 camelCase）。
                     quoted_messages.append({**_mapping(quote), 'messageIndex': index + 1})
-            sticker_catalog = await self.sticker_catalog_for_session(latest_session, turn_query_embedding)
+            # 两级表情选择（§48 甲）：一处判"这一回合平铺条目还是只给分组目录"。
+            sticker_selection = await self.sticker_selection_for_session(
+                latest_session, turn_query_embedding,
+            )
+            sticker_catalog = sticker_selection['assets']
+            sticker_groups = sticker_selection['groups']
             chat_capabilities = self.private_chat_capabilities(latest_session)
             image_sources = _unique([
                 source for message in batch
                 for source in (_turn_get(message, 'imageSources', 'image_sources') or [])
             ])[:3]
-            loaded_images = await self.load_native_images(snapshot['story'], image_sources, latest_session)
+            # 媒体种类按来源对齐（`extract_session_media` 与来源抽取同一套归一化），
+            # 对不上的按普通图片处理——宁可不区分，也不乱认。
+            media_by_source: dict[str, dict[str, Any]] = {}
+            media_cards: list[dict[str, Any]] = []
+            for message in batch:
+                for item in (_turn_get(message, 'media') or []):
+                    if not isinstance(item, dict):
+                        continue
+                    source = _text(item.get('source'))
+                    if source:
+                        media_by_source.setdefault(source, item)
+                    else:
+                        media_cards.append(item)
+            attachments = [
+                {
+                    'index': index + 1,
+                    'kind': wire_media_kind(_text(pick(media_by_source.get(source), 'kind')) or 'image'),
+                    'label': _text(pick(media_by_source.get(source), 'label')) or '[图片]',
+                    'summary': _text(pick(media_by_source.get(source), 'summary')),
+                }
+                for index, source in enumerate(image_sources)
+            ]
+            attachments.extend(
+                {'index': 0, 'kind': 'card', 'label': _text(pick(card, 'label')) or '[分享卡片]', 'summary': ''}
+                for card in media_cards
+            )
+            loaded_images = await self.load_native_images(
+                snapshot['story'], image_sources, latest_session, list(media_by_source.values()),
+            )
             vision_mode = _value(_vision_config(self), 'mode', 'native') or 'native'
             visual_observations = (
                 await self.describe_current_images(snapshot['story'], loaded_images, user_message)
                 if vision_mode == 'sidecar' else None
             )
             images = loaded_images if vision_mode == 'native' else []
-            # 语音走原生音频通道：SnowLuma 服务端逐条转码，主模型以 input_audio 收到。
+            # 语音走原生音频通道：服务端（NapCat `get_record`）逐条转码，主模型以 input_audio 收到。
+            # **私聊**这一路与上游 3413-3414 一致：批次内去重后按 `maxPerMessage` 取，
+            # 不设群聊那套批次预算（那条在 `chunk1.flush_group_turn` 里）。
             audio_sources = _unique([
                 source for message in batch
                 for source in (_turn_get(message, 'audioSources', 'audio_sources') or [])
@@ -1260,8 +1661,12 @@ class ServiceChunk3(ServiceBase):
                 snapshot['story'], snapshot['participant'], 'user-message',
                 snapshot['from'], snapshot['now'], user_message, snapshot['due'], superseded,
                 None, images, audio, chat_capabilities, quoted_messages, sticker_catalog,
-                turn_query_embedding, visual_observations, on_early_reply,
+                turn_query_embedding, visual_observations, on_early_reply, attachments,
+                sticker_groups,
             )
+            # 上游 M4：批次端点集合只描述刚被消费的这一批——标注算完即清空，
+            # 否则下一回合会把上一批的多端点事实当成自己的（规则 2 会误命中）。
+            _turn_set(turn, 'activeBatchEndpointIds', 'active_batch_endpoint_ids', [])
             succeeded = bool(pick(narrative, 'succeeded'))
             effective_now = pick(narrative, 'effectiveNow', 'effective_now')
             immediate_observations = pick(narrative, 'immediateObservations', 'immediate_observations') or []
@@ -1269,7 +1674,16 @@ class ServiceChunk3(ServiceBase):
             decision = dict(decision) if is_record(decision) else {}
             if early['delivered'] and early['interaction']:
                 decision = {**decision, 'interaction': early['interaction']}
-            sticker = self.resolve_sticker(pick(decision, 'localMedia', 'local_media'), sticker_catalog)
+            # 两级选择（§48 甲）：每回合一个**新的**追问预算（最多多问一次，铁律）。
+            # 首条回复已经提前投递（early）时不再追问——正文已经发出去了，追问改不动它，
+            # 只会在投递之后凭空多出一张图。
+            sticker_follow_up: dict[str, Any] = {}
+            sticker = (
+                self.resolve_sticker(pick(decision, 'localMedia', 'local_media'), sticker_catalog)
+                if early['delivered'] else await self.resolve_sticker_selection(
+                    decision, sticker_selection, sticker_follow_up,
+                )
+            )
             native_face = None if sticker else self.resolve_native_face(decision, chat_capabilities)
 
             async def commit_task() -> dict[str, Any]:
@@ -1393,6 +1807,10 @@ class ServiceChunk3(ServiceBase):
             if self.can_handle_participant(snapshot['participant']):
                 delivered = await self.send_outgoing_messages(
                     snapshot['story'], result['messages'], snapshot['participant'], latest_session,
+                    request_started_at=request_started_at,
+                    # 立即回复：逐条气泡在**发出之前**点亮「正在输入」并按它自己的打字
+                    # 时长等待，发出即熄灭（用户点名的语义；分段气泡另有自己的窗口）。
+                    typing_window=True,
                 )
                 await self.confirm_outgoing_deliveries(snapshot['story'], delivered)
                 channel_id = pick(snapshot['participant'], 'channelId', 'channel_id')
@@ -1412,9 +1830,55 @@ class ServiceChunk3(ServiceBase):
                             'native-face', native_face,
                         ),
                     )
+                # 本移植版：共同作品（works）——模型提的修改稿 / 起草请求在**回合落库之后**才处理。
+                # 上游语义：提案只有在脚本提交后才算数；保存失败记 lastFailure，**绝不抛**
+                # （回合主链不能因为一个可选特性回滚）。
+                work_entry_id = pick(result.get('script_entry'), 'id')
+                work_saver = getattr(self, 'apply_work_proposal', None)
+                proposal = pick(decision, 'workProposal', 'work_proposal')
+                if callable(work_saver) and proposal:
+                    await work_saver(
+                        snapshot['story'], snapshot.get('participant'), proposal,
+                        source_entry_id=work_entry_id,
+                    )
+                starter = getattr(self, 'start_work_generation', None)
+                work_request = pick(decision, 'workRequest', 'work_request')
+                if callable(starter) and work_request:
+                    await starter(
+                        snapshot['story'], snapshot.get('participant'), work_request,
+                        source_entry_id=work_entry_id,
+                    )
+                # 本移植版：决策里的平台动作（戳一戳/点赞/撤回/改状态/群管理…）在投递之后执行。
+                # 只调 chunk12 的方法，**不在本文件新增成员**——Chunk3 有「上游行段铁律」。
+                dispatcher = getattr(self, 'dispatch_platform_actions', None)
+                if callable(dispatcher):
+                    await dispatcher(
+                        snapshot['story'], decision,
+                        session=snapshot.get('participant'), channel_id=str(channel_id or ''),
+                    )
+            # 上游 rc28 健康指标：一次私聊主叙事回合的延迟与回复模式分桶。
+            # 回复模式取自 `interaction.reply.mode`；**没有结构化 interaction 时记
+            # `noDelivery`**（上游分桶的 else 分支）——"她没回"与"协议壳没写对"在面板上
+            # 是同一格，这正是该格存在的意义（见 `core/health.py`）。
+            # 这段刻意内联：Chunk3 的成员清单是「上游行段铁律」，不新增成员方法。
+            health = getattr(self, 'health', None)
+            if health is not None:
+                if succeeded:
+                    interaction = pick(decision, 'interaction')
+                    reply = pick(interaction, 'reply') if isinstance(interaction, dict) else None
+                    mode = pick(reply, 'mode') if isinstance(reply, dict) else None
+                    latency = 0.0
+                    if request_started_at is not None:
+                        latency = max(0.0, float(dt_ms(self.now()) - dt_ms(request_started_at)))
+                    health.record_narrative_complete(story_id, latency, mode or 'noDelivery')
+                else:
+                    health.record_narrative_failed(story_id)
             self.schedule_compaction(story_id)
         except Exception as error:
             self.report_standalone('warn', '合并写作任务失败：参与者=%s 错误=%s', participant_id, error)
+            health = getattr(self, 'health', None)
+            if health is not None:
+                health.record_narrative_failed(story_id)
         finally:
             if _turn_get(turn, 'inFlightRequestId', 'in_flight_request_id') == request_id:
                 _turn_set(turn, 'inFlightRequestId', 'in_flight_request_id', None)
@@ -1472,7 +1936,16 @@ class ServiceChunk3(ServiceBase):
         if not self.can_handle_story(story):
             return False
 
+        # 上游 1.0.1-rc26：进串行队列前捕获代际；队首等待期间发生的清库/暂停会让这次
+        # 压缩在执行时自认过期，迟到的模型结果不再写进新库。
+        generation = self.task_generation(pick(story, 'id'))
+
         async def task() -> bool:
+            if not self.task_generation_current(pick(story, 'id'), generation):
+                self.report_operation(
+                    'standard', 'info', story, 'advance', '压缩任务已过期，跳过本轮回写',
+                )
+                return False
             return await self.compact_unlocked(await self.get_story(pick(story, 'id')), self.now(), force)
 
         return await self.serial(pick(story, 'id'), task)

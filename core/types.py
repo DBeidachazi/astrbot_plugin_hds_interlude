@@ -396,6 +396,11 @@ class AgencyConfig(TypedDict, total=False):
     max_window_minutes: Required[int]
     minimum_proactive_interval_minutes: Required[int]
     max_candidate_hours: Required[int]
+    # 上游 1.0.1-rc25：三模式主动联系温度 + 每参与者每日上限。
+    contact_mode: str
+    natural_willingness_threshold: float
+    natural_minimum_interval_minutes: int
+    proactive_daily_cap: int
 
 
 class StorySettingOverlay(TypedDict, total=False):
@@ -796,10 +801,22 @@ class StickerCatalogEntry(TypedDict, total=False):
     animated: Required[bool]
 
 
+class StickerGroupCatalogEntry(TypedDict, total=False):
+    """表情包**分组目录**条目（两级选择的第一段，§48 甲；**不列条目**）。"""
+
+    group_id: Required[str]
+    name: Required[str]
+    description: Required[str]
+    count: Required[int]
+
+
 class LocalMediaDraft(TypedDict, total=False):
     """本地表情/图片的选用草稿。"""
 
     asset_id: Required[str]
+    #: 两级选择的第一段（§48 甲）：模型点名的分组；条目由宿主在同一回合的第二次
+    #: 请求里给出，那时才回 `assetId`。
+    sticker_group_id: str
     placement: Literal['standalone', 'after-text']
     willingness: float
 
@@ -935,7 +952,7 @@ class NarrativeImage(TypedDict, total=False):
 
 class NarrativeAudio(TypedDict, total=False):
     """当前私聊回合的瞬时原生音频附件。
-    载荷是 QQ 语音记录经 SnowLuma 服务端转码后的结果；
+    载荷是 QQ 语音记录经服务端（NapCat `get_record`）转码后的结果；
     它刻意永不写入剧本条目、记忆或事实。"""
 
     id: Required[str]
@@ -1032,6 +1049,8 @@ NarrativeRequest = TypedDict('NarrativeRequest', {
     'chat_capabilities': 'ChatActionCapabilities',
     # 除非本地表情库已启用、已填充且本回合可用，否则省略。
     'sticker_catalog': 'list[StickerCatalogEntry]',
+    #: 两级选择的第一段（§48 甲）：分组目录（与 `sticker_catalog` 互斥出现）。
+    'sticker_group_catalog': 'list[StickerGroupCatalogEntry]',
     'alter_enabled': 'bool',
     'emotional_offset': 'EmotionalOffsetPrompt | None',
     'agency_enabled': 'bool',

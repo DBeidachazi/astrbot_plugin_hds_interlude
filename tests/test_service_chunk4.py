@@ -445,8 +445,13 @@ class TryDecideTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result[camel], result[snake])
 
     @unittest.skipUnless(CHUNK4_READY, 'Chunk4 未就绪')
-    async def test_invisible_reply_recovery_rewrites_once_then_raises(self) -> None:
-        """实况用户回合缺结构化可见回复：重写一次，仍缺失则抛错（上游 :3785）。"""
+    async def test_invisible_reply_recovery_rewrites_once_then_degrades(self) -> None:
+        """实况用户回合缺结构化可见回复：重写一次；仍缺失则**降级提交**（上游 1.0.1-rc24+）。
+
+        rc24/rc28 把原来的 `throw` 改成降级：剧本是好的，一个传输字段缺失不该让整个
+        回合失败并进 60 秒重试队列（弱模型下那是失败循环）。断言随之改成"两稿都试过、
+        剧本保留、没有可见回复、警告可见"。
+        """
         host = Chunk4Host()
         calls: list[bool] = []
 
@@ -458,13 +463,13 @@ class TryDecideTests(unittest.IsolatedAsyncioTestCase):
         host.decide = decide  # type: ignore[assignment]
         participant = {'id': PARTICIPANT_ID, 'storyId': STORY_ID, 'platform': 'test', 'status': 'active'}
         result = await host.try_decide(_story(), participant, 'user-message', FROM, NOW, '在？', [])
-        # 上游把重写守卫的 throw 放在自己的 try 里，因此对外表现为一次失败的回合。
-        self.assertFalse(result['succeeded'])
+        self.assertTrue(result['succeeded'])
+        self.assertEqual(result['decision'].get('script'), '她在窗边。')
+        self.assertIsNone(result['decision'].get('interaction'))
         self.assertEqual(calls, [False, True])
-        self.assertTrue(
-            any('visible-reply structure' in str(item) or '结构化可见回复缺失' in str(item) for item in host.reports),
-            host.reports,
-        )
+        # `report_operation` 落在 `operations`（`report` 才是 `reports`），两个 sink 都扫。
+        seen = [str(item) for item in (list(host.operations) + list(host.reports))]
+        self.assertTrue(any('结构化回复两稿均缺失' in item for item in seen), seen)
 
     @unittest.skipUnless(CHUNK4_READY, 'Chunk4 未就绪')
     async def test_script_less_model_turn_is_a_provider_failure(self) -> None:
@@ -1436,6 +1441,78 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state['narrative_update_count'], 1)
 
     @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_the_turn_records_what_the_context_was_made_of(self) -> None:
+        """v1.4.0：上轮上下文构成落进 `state.extensions.last_context_metrics`。"""
+        self.db.insert('interlude_script_entry', {
+            'storyId': STORY_ID, 'kind': 'script', 'actor': 'narrator',
+            'content': '她把伞放在门口。', 'occurredAt': FROM, 'metadata': {},
+            'createdAt': FROM,
+        })
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        result = await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+        )
+        self.assertTrue(result['succeeded'])
+        state = decode_story_state((await self.service.get_story(STORY_ID))['state'])
+        metrics = (state.get('extensions') or {}).get('last_context_metrics')
+        self.assertIsInstance(metrics, dict, '记账是诊断用途，但必须真的写进去')
+        self.assertEqual(metrics['phase'], 'user-message')
+        self.assertEqual(metrics['participant_id'], PARTICIPANT_ID)
+        self.assertGreaterEqual(metrics['assembly_ms'], 0)
+        self.assertGreater(metrics['estimated_tokens'], 0)
+        self.assertGreater(metrics['payload_characters'], 0)
+        # 段名用 wire 键（与请求体一一对应），文字标签留给控制台。
+        self.assertIn('recentEntries', metrics['sections'])
+        self.assertEqual(
+            metrics['sections']['recentEntries']['items'],
+            len(self.narrator.requests[0]['recentEntries']),
+        )
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_a_quote_without_content_is_backfilled_from_our_own_record(self) -> None:
+        """平台只给一个 id 时，用 `msg-<条目id>` 从剧本里补出被引正文。"""
+        entry = self.db.insert('interlude_script_entry', {
+            'storyId': STORY_ID, 'kind': 'script', 'actor': 'character',
+            'content': '她把伞放在了门口。', 'occurredAt': FROM, 'metadata': {},
+            'createdAt': FROM,
+        })
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+            quoted_messages=[{'messageId': 'msg-%s' % entry['id'], 'user': {'id': '2'}}],
+        )
+        request = self.narrator.requests[-1]
+        quote = request['quotedMessages'][0]
+        self.assertEqual(quote['content'], '她把伞放在了门口。')
+        self.assertIs(quote['backfilled'], True, '补出来的引文要能被日志区分')
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_platform_supplied_quote_content_is_left_alone(self) -> None:
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+            quoted_messages=[{'messageId': 'msg-999999', 'content': '平台给的原文'}],
+        )
+        quote = self.narrator.requests[-1]['quotedMessages'][0]
+        self.assertEqual(quote['content'], '平台给的原文')
+        self.assertNotIn('backfilled', quote)
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_context_metrics_can_be_switched_off(self) -> None:
+        self.service.config = {
+            **self.service.config,
+            'memory': {**(_config_section(self.service.config, 'memory') or {}), 'contextMetricsEnabled': False},
+        }
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        await self.service.try_decide(story, participant, 'user-message', FROM, NOW, '在吗', [])
+        state = decode_story_state((await self.service.get_story(STORY_ID))['state'])
+        self.assertNotIn('last_context_metrics', state.get('extensions') or {})
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
     async def test_a_rejected_draft_says_why_where_operators_can_see_it(self) -> None:
         """被抛弃的草稿必须**在默认 verbosity 下可见**地说出原因（AGENTS.md 坑 25）。
 
@@ -1454,8 +1531,10 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         result = await self.service.try_decide(
             story, participant, 'user-message', FROM, NOW, '晚安', [],
         )
-        # 重写还是不合格 → 整回合失败（上游语义），但**原因**必须留在默认可见的日志里。
-        self.assertFalse(result['succeeded'])
+        # 重写还是不合格 → 降级为无可见回复提交（上游 1.0.1-rc24+），但**原因**必须留在
+        # 默认可见的日志里：草稿被抛弃这件事本身照旧要可见（AGENTS.md 坑 25）。
+        self.assertTrue(result['succeeded'])
+        self.assertIsNone(result['decision'].get('interaction'))
         reasons = [text for level, text in self.sink.records if level == 'warn']
         diagnostics = [text for text in reasons if '被抛弃草稿的结构化回复字段' in text]
         self.assertEqual(len(diagnostics), 1, reasons)

@@ -61,7 +61,7 @@ import asyncio
 from typing import Any, Optional
 
 from ..time import dt_ms, format_log_time, iso, parse_dt
-from ..group_willingness import consume_group_willingness, evaluate_group_willingness
+from ..group_willingness import consume_willingness_gate, evaluate_willingness_gate
 from ..script.commit_builder import find_group_script_event
 from ..script.contract import message_event_reference
 from ..script.delivery_ledger import platform_action_reference
@@ -82,6 +82,7 @@ from .helpers import (
     clip,
     describe_group_attachments,
     describe_quoted_message,
+    extract_session_audio_sources,
     extract_session_file_facts,
     extract_session_voice_count,
     format_group_speaker,
@@ -92,6 +93,11 @@ from .helpers import (
     normalize_participant_state,
     safe_json_preview,
 )
+# 群音频的批次预算（上游 2197-2215）住在 chunk3：那里有 `audioConfig` 的解析与
+# `load_native_audio`。chunk3 **不** import chunk1，所以这条模块级依赖不成环。
+# `_extract_session_media` 同源：群聊入站的自动收藏要**与私聊同一份**结构化媒体表
+# （`SessionView.media` → `[{source, kind, summary, label}]`），不能另外推一份（见 §45.6/§46）。
+from .chunk3 import _extract_session_media, _load_group_batch_audio
 
 __all__ = ['ServiceChunk1']
 
@@ -105,6 +111,8 @@ _CLEAR_DATABASE_TABLES = (
     'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch',
     'interlude_overlay_snapshot', 'interlude_web_observation', 'interlude_schedule_preplan',
     'interlude_participant', 'interlude_story',
+    # 上游 1.0.1-rc23：世界播种事件表也随清库/清剧本一起清。
+    'interlude_seeded_event',
 )
 
 _MISSING = object()
@@ -265,6 +273,11 @@ def _clear_database_fallback(table: str) -> dict[str, Any]:
             'regimes': [], 'exceptions': [], 'materializedDays': [],
             'validFrom': '1970-01-01', 'validThrough': '1970-01-01',
             'lastReviewedLocalDate': '', 'reviewReason': '[HDSI 数据库已清空]',
+        }
+    if table == 'interlude_seeded_event':
+        return {
+            'status': 'expired', 'summary': '[HDSI 数据库已清空]',
+            'sourcePayload': {}, 'subjects': [],
         }
     return {'status': 'rejected', 'proposedValue': '[HDSI 数据库已清空]', 'evidence': ''}
 
@@ -698,6 +711,7 @@ class ServiceChunk1(ServiceBase):
         破坏性管理操作（调用方必须先校验确认短语）。全量清除后还会用**当前 Console
         配置**重建 Canon，旧档案因此不可能在后续 prompt 里复活。
         """
+        self.invalidate_story_tasks(story_id)
         self.invalidate_buffered_narratives(story_id)
         await self.purge_table('interlude_script_entry', {'storyId': story_id}, {
             'kind': 'redacted', 'actor': 'system', 'content': '[管理员已删除剧本内容]',
@@ -733,6 +747,10 @@ class ServiceChunk1(ServiceBase):
             'regimes': [], 'exceptions': [], 'materializedDays': [],
             'validFrom': '1970-01-01', 'validThrough': '1970-01-01',
             'lastReviewedLocalDate': '', 'reviewReason': '[管理员已删除 Schedule Preplan]',
+        })
+        await self.purge_table('interlude_seeded_event', {'storyId': story_id}, {
+            'status': 'expired', 'summary': '[管理员已删除世界事件]',
+            'sourcePayload': {}, 'subjects': [],
         })
         now = self.now()
         story = await self.get_story(story_id)
@@ -800,6 +818,10 @@ class ServiceChunk1(ServiceBase):
         if self.database_resetting:
             raise RuntimeError('HDSI 数据库清空已经在进行中。')
         self.database_resetting = True
+        # 上游 1.0.1-rc26：先让全局代际失效，再等在途回合（最多 30 秒/每个 key）。
+        # 迟到的模型结果会因代际失配被丢弃，所以超时也照常继续清库。
+        self.invalidate_story_tasks()
+        await self.await_inflight_turns()
         self.invalidate_buffered_narratives()
         self.invalidate_history_vectors()
         try:
@@ -840,11 +862,50 @@ class ServiceChunk1(ServiceBase):
         finally:
             self.database_resetting = False
 
+    async def await_inflight_turns(self, timeout_ms: int = 30_000, poll_ms: int = 500) -> int:
+        """上游 `clearDatabase` 的 30 秒在途屏障。
+
+        等待的是"某个回合的 `inFlightRequestId` 不再是当初那个"（模型回来了、或换成了新
+        请求）；**每个 key 各自一个 deadline**，超时不报错、不中断——代际与
+        `database_resetting` 已经保证了迟到结果被判废。返回仍在途的 key 数（排障用）。
+        """
+        turns = getattr(self, 'buffered_narrative_turns', None)
+        if not isinstance(turns, dict):
+            return 0
+        pending: list[tuple[str, Any]] = [
+            (key, _turn_get(turn, 'inFlightRequestId', 'in_flight_request_id'))
+            for key, turn in list(turns.items())
+            if isinstance(turn, dict)
+            and _turn_get(turn, 'inFlightRequestId', 'in_flight_request_id') is not None
+        ]
+        for key, request_id in pending:
+            self.report_operation(
+                'standard', 'warn', None, 'advance',
+                '清空前等待在途回合完成 参与者=%s 请求=%s', key, request_id,
+            )
+            deadline = self.now_ms() + timeout_ms
+            while self.now_ms() < deadline:
+                current = turns.get(key)
+                if not isinstance(current, dict) or _turn_get(
+                    current, 'inFlightRequestId', 'in_flight_request_id',
+                ) != request_id:
+                    break
+                await asyncio.sleep(poll_ms / 1000)
+        remaining = 0
+        for key, request_id in pending:
+            current = turns.get(key)
+            if isinstance(current, dict) and _turn_get(
+                current, 'inFlightRequestId', 'in_flight_request_id',
+            ) == request_id:
+                remaining += 1
+        return remaining
+
     async def purge_story_range(self, story_id: str, from_value: Any, to_value: Any) -> None:
         """上游 `purgeStoryRange(storyId, from, to)`（`src/service.ts:1543`）。
 
         删除时间戳与区间重叠的剧本行与派生记忆记录（共同退化为软删墓碑）。
         """
+        self.invalidate_story_tasks(story_id)
         start = parse_dt(from_value)
         end = parse_dt(to_value)
         self.invalidate_buffered_narratives(story_id)
@@ -937,6 +998,14 @@ class ServiceChunk1(ServiceBase):
                     'summary': '[管理员已删除网页观察]',
                 })
 
+        # 上游 1.0.1-rc23：区间清剧本时，落在区间内的世界事件一并作废（事件表按 occursAt 计时）。
+        for row in await self.db_get('interlude_seeded_event', {'storyId': story_id}):
+            if in_range(pick(row, 'occursAt', 'occurs_at')):
+                await self.purge_table('interlude_seeded_event', {'id': pick(row, 'id')}, {
+                    'status': 'expired', 'summary': '[管理员已删除世界事件]',
+                    'sourcePayload': {}, 'subjects': [],
+                })
+
         if entry_ids:
             await self.db_set('interlude_schedule_preplan', {'storyId': story_id}, {
                 'lastReviewedLocalDate': '', 'validThrough': '1970-01-01',
@@ -973,7 +1042,14 @@ class ServiceChunk1(ServiceBase):
         rule = self.group_rule_or_default(group_id)
         mentioned_bot = _mentions_bot(session)
         quoted_bot = _quotes_bot(session)
-        if pick(rule, 'responseMode', 'response_mode') == 'mention-only' and not mentioned_bot:
+        # v1.7.6：群里的语音也是**音频证据**（上游 1900）。语音消息没法带 @，所以
+        # `mention-only` 下它也算"叫了她"——这条与私聊那条 `session.content?.trim()`
+        # 的例外同源。没开语音理解时它仍然只留一条占位事实（见 `load_group_batch_audio`）。
+        audio_sources = extract_session_audio_sources(session)
+        if (
+            pick(rule, 'responseMode', 'response_mode') == 'mention-only'
+            and not mentioned_bot and not audio_sources
+        ):
             self.note_group_skip(
                 session,
                 '这条群消息没 @ 机器人，而该群的 response_mode=mention-only（引用机器人不算）',
@@ -998,6 +1074,14 @@ class ServiceChunk1(ServiceBase):
         sender_name = await self.group_sender_name(group_id, sender_id, session)
         character = pick(pick(story, 'setting'), 'character') or {}
         quote = describe_quoted_message(session, pick(character, 'name') or '主角')
+        # 自动收藏入站表情包（群聊覆盖，受控偏离 §45.6）：种类必须在**文本化之前**拿到。
+        # `describe_group_attachments` 会把 `<img kind=…>` 翻成 `[表情包]` / `[动画表情]`
+        # 文本，从那种文本反推种类就是"两种拼写、两处判据"的老病（坑 46）。
+        # 这里用的是与私聊**同一条** `extract_session_media`：同一份**结构化媒体表**
+        # （适配层从观测到的 OneBot 原始段写下的 `SessionView.media`，§46）、同一个
+        # `kind`，判据仍然只有 `helpers.collectible_sticker_kind()` 一处 ——
+        # **不读正文里的任何 `<img>` 文本**（用户手打的标签不算数）。
+        group_media = _extract_session_media(session)
         message_content = describe_group_attachments(_session_read(session, 'content'))
 
         async def task() -> Any:
@@ -1030,7 +1114,13 @@ class ServiceChunk1(ServiceBase):
         message['content'] = message_content
         message['occurredAt'] = now
         message['direction'] = 'user'
-        self.buffer_group_message(story, rule, session, message, mentioned_bot, quoted_bot)
+        self.buffer_group_message(
+            story, rule, session, message, mentioned_bot, quoted_bot, audio_sources,
+        )
+        # 群聊收藏钩子挂在**真正的入站处理点**（所有闸门之后）：白名单外的群、
+        # 关掉的群、`mention-only` 下没 @ 的消息、找不到 / 非 active 的剧本，
+        # 上面都已经 return 了 —— 那些消息既不进叙事，也不该顺手收藏别人的图。
+        self._spawn_group_sticker_collect(group_media)
         self.report_operation(
             'summary', 'info', story, 'user-message',
             '收到群聊消息 群=%s 发送者=%s', group_id, sender_id,
@@ -1122,11 +1212,26 @@ class ServiceChunk1(ServiceBase):
             images = pick(user_input, 'sources') or []
             audio = pick(user_input, 'audioSources', 'audio_sources') or []
             quote = pick(user_input, 'quote')
+            # 通道上下文在下面的条目 metadata 里解析；buffer 调用在更外层也要用它，
+            # 因此先绑定到 None（`receive` 的分支很多，别让名字只在某个分支里存在）。
+            channel_metadata: Any = None
             metadata: dict[str, Any] = {
                 'platform': _session_read(session, 'platform'),
                 'messageId': _session_read(session, 'messageId', 'message_id'),
                 'personId': pick(incoming_participant, 'personId', 'person_id'),
             }
+            # 上游 1.0.1-rc28（M4 §十）：给条目打上通道上下文（注册表命中才打）。
+            # 它是 `lastEntryChannel` 的来源——没有它，私↔群与同人异端两条标注规则
+            # 在真实运行里永远比较不到真正的"前一条"。单平台/未迁移时返回 None。
+            resolve_channel = getattr(self, 'channel_metadata_for', None)
+            if callable(resolve_channel):
+                channel_metadata = await resolve_channel({
+                    'platform': _session_read(session, 'platform'),
+                    'selfId': _session_read(session, 'selfId', 'self_id'),
+                    'userId': _session_read(session, 'userId', 'user_id'),
+                })
+                if channel_metadata:
+                    metadata['channel_context'] = channel_metadata
             if images:
                 metadata['imageCount'] = len(images)
             if audio:
@@ -1148,12 +1253,33 @@ class ServiceChunk1(ServiceBase):
         accepted = await self.serial(story_id, task)
         if not accepted:
             return False
+        # 上游 1.0.1-rc28：逐条消息记住入站端点（M4 规则 1/2 的唯一依据）。
+        # 这里单独解析一次通道上下文——它必须在 buffer 调用点可见（条目 metadata
+        # 那份在另一个分支里解析），注册表未命中时返回 None → 不记端点。
+        resolve_channel = getattr(self, 'channel_metadata_for', None)
+        buffer_channel: Any = None
+        # 入站触达端点状态：连接在线 + 可投递（v3 §四；注册表未命中时是 no-op）。
+        touch_inbound = getattr(self, 'touch_endpoint_state_inbound', None)
+        if callable(touch_inbound):
+            await touch_inbound({
+                'platform': _session_read(session, 'platform'),
+                'selfId': _session_read(session, 'selfId', 'self_id'),
+                'userId': _session_read(session, 'userId', 'user_id'),
+            })
+        if callable(resolve_channel):
+            buffer_channel = await resolve_channel({
+                'platform': _session_read(session, 'platform'),
+                'selfId': _session_read(session, 'selfId', 'self_id'),
+                'userId': _session_read(session, 'userId', 'user_id'),
+            })
         self.buffer_user_narrative(
             accepted['story'], accepted['participant'], session, accepted['now'],
             accepted['superseded'], pick(user_input, 'content'),
             pick(user_input, 'sources') or [],
             pick(user_input, 'audioSources', 'audio_sources') or [],
             pick(user_input, 'quote'),
+            pick(user_input, 'media') or [],
+            pick(buffer_channel or {}, 'endpoint_id', 'endpointId') or '',
         )
         images = pick(user_input, 'sources') or []
         audio = pick(user_input, 'audioSources', 'audio_sources') or []
@@ -1250,12 +1376,16 @@ class ServiceChunk1(ServiceBase):
         message: dict[str, Any],
         mentioned_bot: bool,
         quoted_bot: bool,
+        audio_sources: Any = None,
     ) -> None:
         """上游 `bufferGroupMessage(story, rule, session, message, mentionedBot, quotedBot)`
         （`src/service.ts:1750`）。
 
         按 `故事:群` 聚合一批消息，用 `debounceSeconds` 计时器 + 单调递增的 `revision`
         保证只有最后一次安排会真正刷出；@ 与引用机器人的事实是**累积**的。
+
+        v1.7.6：带上这条消息的语音来源（上游 2099 的 `audioSources` + `audioSession`）
+        ——群音频的**批次预算**靠它逐条算（见 `load_group_batch_audio`）。
         """
         story_id = pick(story, 'id')
         group_id = normalize_group_id(pick(rule, 'groupId', 'group_id'))
@@ -1270,6 +1400,10 @@ class ServiceChunk1(ServiceBase):
             turn['timer']()
         turn['channel_id'] = _session_read(session, 'channelId', 'channel_id')
         turn['latest_session'] = session
+        sources = [str(item) for item in (audio_sources or []) if str(item or '').strip()]
+        if sources:
+            # 上游同一形状：有语音才写这两个键，没有就**不出现**（别留空数组）。
+            message = {**message, 'audioSources': sources, 'audioSession': session}
         turn.setdefault('messages', []).append(message)
         turn['mentioned_bot'] = bool(turn.get('mentioned_bot')) or bool(mentioned_bot)
         turn['quoted_bot'] = bool(turn.get('quoted_bot')) or bool(quoted_bot)
@@ -1330,8 +1464,13 @@ class ServiceChunk1(ServiceBase):
 
         rule = turn.get('rule') or {}
         group_id = turn.get('group_id')
-        willingness = evaluate_group_willingness(
+        # 上游 1.0.1-rc23：走档位解析层（五档 / auto 按生活状态 / 旧数值门按 custom）。
+        life_status = decode_story_state(pick(story, 'state')).get('life_status')
+        willingness = evaluate_willingness_gate(
             self.group_willingness.get(key),
+            pick(rule, 'willingnessPreset', 'willingness_preset'),
+            pick(rule, 'willingnessAuto', 'willingness_auto'),
+            life_status,
             pick(rule, 'willingness'),
             {
                 'now': self.now_ms(),
@@ -1458,18 +1597,31 @@ class ServiceChunk1(ServiceBase):
                 )
             else:
                 turn_query_embedding = None
-            sticker_catalog = await self.sticker_catalog_for_session(
+            # 两级表情选择（§48 甲）：`selection` 一处判"这一回合平铺条目还是只给分组目录"。
+            sticker_selection = await self.sticker_selection_for_session(
                 turn.get('latest_session'), turn_query_embedding,
+            )
+            sticker_catalog = sticker_selection['assets']
+            sticker_groups = sticker_selection['groups']
+            # 上游 2197-2215：群音频走**批次预算**（条数 = `maxPerMessage×4`、
+            # 字节 = `maxFileSizeMB×4`），超出的延后 / 跳过并各留一条 warn。
+            # v1.7.6 之前这里恒传 `[]`，于是"群里发的语音"从来没有作为音频证据进过 payload。
+            group_audio = await _load_group_batch_audio(
+                self, snapshot['story'], batch, turn.get('latest_session'),
             )
             decision_result = await self.try_decide(
                 snapshot['story'], None, 'user-message', snapshot['from'], snapshot['now'],
-                user_message, [], [], group_context, [], [], chat_capabilities, [],
-                sticker_catalog, turn_query_embedding,
+                user_message, [], [], group_context, [], group_audio, chat_capabilities, [],
+                sticker_catalog, turn_query_embedding, None, None, None, sticker_groups,
             )
             decision = pick(decision_result, 'decision') or {}
             succeeded = bool(pick(decision_result, 'succeeded'))
             chat_actions = normalize_group_chat_actions(decision, chat_capabilities, group_context)
-            sticker = self.resolve_sticker(pick(decision, 'localMedia', 'local_media'), sticker_catalog)
+            # 每回合一个**新的**追问预算（同回合最多多问一次，铁律见 §48 兜底表）。
+            sticker_follow_up: dict[str, Any] = {}
+            sticker = await self.resolve_sticker_selection(
+                decision, sticker_selection, sticker_follow_up,
+            )
             native_face = None if sticker else self.resolve_native_face(decision, chat_capabilities)
 
             async def persist_task() -> dict[str, Any]:
@@ -1555,6 +1707,28 @@ class ServiceChunk1(ServiceBase):
                 if (result['chat_actions'].get('reactions') and turn.get('latest_session'))
                 else 0
             )
+            # 共同作品（works）：模型提的修改稿 / 起草请求，回合落库之后才处理
+            # （只调 chunk14 的方法，不在本文件新增成员——Chunk1 与 Chunk3 同源）。
+            work_saver = getattr(self, 'apply_work_proposal', None)
+            proposal = pick(decision, 'workProposal', 'work_proposal')
+            if callable(work_saver) and proposal and turn.get('latest_session'):
+                await work_saver(
+                    snapshot['story'], turn.get('latest_session'), proposal,
+                    source_entry_id=platform_entry_id,
+                )
+            work_starter = getattr(self, 'start_work_generation', None)
+            work_request = pick(decision, 'workRequest', 'work_request')
+            if callable(work_starter) and work_request and turn.get('latest_session'):
+                await work_starter(
+                    snapshot['story'], turn.get('latest_session'), work_request,
+                    source_entry_id=platform_entry_id,
+                )
+            dispatcher = getattr(self, 'dispatch_platform_actions', None)
+            if callable(dispatcher) and turn.get('latest_session'):
+                await dispatcher(
+                    snapshot['story'], decision,
+                    session=turn.get('latest_session'), channel_id=str(turn.get('channel_id') or ''),
+                )
             if result['content']:
                 group_delivery = await self.send_group_message(
                     snapshot['story'], turn.get('channel_id'), result['content'],
@@ -1628,8 +1802,13 @@ class ServiceChunk1(ServiceBase):
                     ),
                 )
             if delivered_segments or completed_reactions or sticker_delivered or native_face_delivered:
-                self.group_willingness[key] = consume_group_willingness(
-                    self.group_willingness.get(key), pick(rule, 'willingness'), self.now_ms(),
+                self.group_willingness[key] = consume_willingness_gate(
+                    self.group_willingness.get(key),
+                    pick(rule, 'willingnessPreset', 'willingness_preset'),
+                    pick(rule, 'willingnessAuto', 'willingness_auto'),
+                    life_status,
+                    pick(rule, 'willingness'),
+                    self.now_ms(),
                 )
             self.schedule_compaction(story_id)
         except Exception as error:

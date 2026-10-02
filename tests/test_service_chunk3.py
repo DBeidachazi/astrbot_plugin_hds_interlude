@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from plugin.core.service import chunk3
-from plugin.core.service.chunk3 import ServiceChunk3
+from plugin.core.service.chunk3 import ServiceChunk3, _load_group_batch_audio
 from plugin.core.service.session import SessionView
 from plugin.core.service.transport import NullTransport
 
@@ -167,7 +167,7 @@ class FakeService(ServiceChunk3):
     def report_operation(self, *args: Any) -> None:
         self.logs.append(('operation',) + args)
 
-    def report_standalone(self, level: str, message: str, *args: Any) -> None:
+    def report_standalone(self, level: str, message: str, *args: Any, **_kwargs: Any) -> None:
         self.logs.append(('standalone', level, message % args if args else message))
 
     def report_standalone_operation(self, *args: Any) -> None:
@@ -500,8 +500,12 @@ class _FlushHost(FakeService):
     def semantic_turn_embedding_enabled(self) -> bool:
         return False
 
-    async def sticker_catalog_for_session(self, session: Any, turn_query_embedding: Any = None) -> list[Any]:
-        return []
+    async def sticker_selection_for_session(
+        self, session: Any, turn_query_embedding: Any = None,
+    ) -> dict[str, Any]:
+        # §48 甲：本文件只关心"位置参数与上游对齐"，目录一律走 `inline` + 空条目
+        # （两级选择本身由 `test_service_chunk2` 覆盖）。
+        return {'mode': 'inline', 'assets': [], 'groups': []}
 
     def private_chat_capabilities(self, session: Any) -> Any:
         return None
@@ -521,6 +525,13 @@ class _FlushHost(FakeService):
     def resolve_sticker(self, draft: Any, catalog: Any) -> Any:
         return None
 
+    async def resolve_sticker_selection(
+        self, decision: Any, selection: Any, follow_up_budget: Any = None,
+    ) -> Any:
+        # §48 甲：inline 模式下 `resolve_sticker_selection` 就是旧的 `resolve_sticker`
+        # （本替身里两条都回 None = 没有选中的表情）。
+        return None
+
     def resolve_native_face(self, decision: Any, capabilities: Any) -> Any:
         return None
 
@@ -531,8 +542,16 @@ class _FlushHost(FakeService):
     def can_handle_participant(self, participant: Any) -> bool:
         return True
 
-    async def send_outgoing_messages(self, story: Any, messages: Any, participant: Any, session: Any) -> list[Any]:
+    async def send_outgoing_messages(
+        self, story: Any, messages: Any, participant: Any, session: Any,
+        should_cancel: Any = None, record_failures: bool = True, request_started_at: Any = None,
+        **kwargs: Any,
+    ) -> list[Any]:
         self.calls['send_outgoing_messages'] = (messages, participant, session)
+        # 上游 1.0.1-rc21：叙事请求发起时刻必须传到投递侧（首条打字时间下限的基准）。
+        self.calls['request_started_at'] = request_started_at
+        # 逐条「正在输入」窗口只在"立即回复"这条路径打开（用户 2026-09-28 点名）。
+        self.calls['typing_window'] = kwargs.get('typing_window')
         return list(messages)
 
     async def confirm_outgoing_deliveries(self, story: Any, delivered: Any) -> None:
@@ -601,6 +620,7 @@ class TestFlushBufferedNarrativePipeline(unittest.IsolatedAsyncioTestCase):
         # 4) 投递 + 后续调度。
         self.assertEqual(host.calls['send_outgoing_messages'][0], [{'content': '在的。'}])
         self.assertEqual(host.calls['confirm_outgoing_deliveries'], [{'content': '在的。'}])
+        self.assertIsNotNone(host.calls.get('request_started_at'), '投递侧必须拿到请求发起时刻')
         self.assertEqual(host.calls['schedule_compaction'], 's')
         self.assertEqual(host.calls['follow_ups'][0], 's')
 
@@ -1084,6 +1104,86 @@ class TestNativeAudio(unittest.IsolatedAsyncioTestCase):
         audio = await ServiceChunk3.load_native_audio(host, {'id': 's'}, ['data:audio/mp3;base64,QUJD'])
         self.assertEqual(audio, [])
 
+    async def test_the_master_switch_blocks_loading_even_with_the_stt_switch_on(self) -> None:
+        """（关音频 / 开转写）：总开关关着时**一条音频都不加载**，转写开关开着也没用。
+
+        两个开关的分工：`enabled` 决定"语音要不要当音频证据加载"，`stt_enabled` 决定
+        "加载之后要不要调转写模型"。总开关在前——这一条不成立的话，用户配好的转写模型
+        会被"看不见的闸"绕过（或者反过来，语音静默进了主模型）。
+        """
+        host = _MediaHost(config={'model': {'audio': {
+            'enabled': False, 'stt_enabled': True, 'maxPerMessage': 3,
+        }}})
+        host.transport = FakeTransport(fetch_audio=self._fetch(b'ID3\x04\x00\x00'))
+        sources = ['data:audio/mp3;base64,QUJD'] * 3
+        self.assertEqual(
+            await ServiceChunk3.load_native_audio(host, {'id': 's'}, sources), [],
+            '总开关关着 = 没有音频证据，转写开关开着也无从转起',
+        )
+        self.assertEqual(
+            await _load_group_batch_audio(host, {'id': 's'}, [{'audio_sources': sources}]),
+            [],
+        )
+
+    async def test_the_master_switch_on_keeps_todays_loading_behaviour(self) -> None:
+        """（开音频 / 关转写）：加载照旧（要不要转写由适配层那一侧决定，core 不参与）。"""
+        host = _MediaHost(config={'model': {'audio': {
+            'enabled': True, 'stt_enabled': False, 'maxPerMessage': 2,
+        }}})
+        host.transport = FakeTransport(fetch_audio=self._fetch(b'ID3\x04\x00\x00'))
+        audio = await ServiceChunk3.load_native_audio(
+            host, {'id': 's'}, ['data:audio/mp3;base64,QUJD', 'data:audio/mp3;base64,QUJD'],
+        )
+        self.assertEqual([item['id'] for item in audio], ['turn-audio-1', 'turn-audio-2'])
+        self.assertTrue(all('base64' in item for item in audio))
+
+    async def test_the_group_batch_budget_caps_count_and_bytes(self) -> None:
+        """上游 2197-2215 的**群音频批次预算**（v1.7.6 补上的 `audioConfig` 消费点）。
+
+        条数上限 = `maxPerMessage × 4`、字节上限 = `maxFileSizeMB × 4MB`；超出的部分
+        延后 / 跳过，各留一条 warn。少了这道闸，一个群里连发语音会把上下文一次塞满。
+        """
+        payload = b'ID3\x04\x00\x00' * 4
+        host = _MediaHost(config={'model': {'audio': {
+            'enabled': True, 'maxPerMessage': 1, 'maxFileSizeMB': 1,
+        }}})
+        host.transport = FakeTransport(fetch_audio=self._fetch(payload))
+        batch = [{'audio_sources': ['data:audio/mp3;base64,QUJD']} for _ in range(6)]
+
+        audio = await _load_group_batch_audio(host, {'id': 's'}, batch)
+
+        # maxPerMessage=1 → 条数上限 4；每条几百字节，远小于 4MB，所以先撞条数。
+        self.assertEqual([item['id'] for item in audio],
+                         ['group-audio-1', 'group-audio-2', 'group-audio-3', 'group-audio-4'])
+        self.assertTrue(
+            any('群音频批次达到资源上限' in str(entry) for entry in host.logs),
+            host.logs,
+        )
+
+    async def test_the_group_batch_budget_stops_on_bytes_and_says_so(self) -> None:
+        """字节上限那条分支：一条音频就超预算时**跳过它**并留 warn（不是静默丢掉）。"""
+        host = _MediaHost(config={'model': {'audio': {
+            'enabled': True, 'maxPerMessage': 3, 'maxFileSizeMB': 1,
+        }}})
+
+        async def fake_load(story, sources, session=None, max_count=None):
+            return [{'format': 'mp3', 'base64': 'A' * (4 * 1_000_000 + 10)}]
+
+        host.load_native_audio = fake_load  # type: ignore[method-assign]
+        audio = await _load_group_batch_audio(host, {'id': 's'}, [{'audio_sources': ['x']}])
+        self.assertEqual(audio, [])
+        self.assertTrue(any('群音频批次达到字节上限' in str(entry) for entry in host.logs), host.logs)
+
+    async def test_the_group_batch_never_touches_audio_when_the_master_switch_is_off(self) -> None:
+        """总开关关着：群批次连平台都不问（不加载、不留 warn）。"""
+        host = _MediaHost(config={'model': {'audio': {'enabled': False, 'maxPerMessage': 3}}})
+        host.transport = FakeTransport(fetch_audio=self._fetch(b'ID3\x04\x00\x00'))
+        audio = await _load_group_batch_audio(
+            host, {'id': 's'}, [{'audio_sources': ['data:audio/mp3;base64,QUJD']}],
+        )
+        self.assertEqual(audio, [])
+        self.assertEqual(host.logs, [])
+
     @staticmethod
     def _fetch(payload: bytes) -> Any:
         async def fetch(url: str) -> bytes:
@@ -1127,47 +1227,88 @@ class LocalImageSourceTests(unittest.TestCase):
         self.assertEqual(self._sources('<img src="/etc/passwd"/>', []), [])
         self.assertEqual(self._sources('<img src="file:///etc/passwd"/>', []), [])
 
-    def test_http_sources_still_work_in_both_paths(self):
+    def test_http_sources_are_recorded_but_inert(self):
+        """正文里的 http 来源仍被记下（`imageCount` / 附件条目照旧），但带 `text:` 惰性前缀。
+
+        受控偏离 §46.8：上游这里给的是**裸 URL**（`[CQ:image,…]` 更是 `onebot-url:`，
+        取回时跳过主机白名单）—— 那正是"手打的正文能让她下载任意地址"的入口。
+        条目还在，只是永不取回（`fetch_native_image()` 见到 `text:` 直接回 None）。
+        """
         url = 'https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=x'
-        self.assertEqual(self._sources('<img src="%s"/>' % url, []), [url])
+        self.assertEqual(self._sources('<img src="%s"/>' % url, []), ['text:%s' % url])
         self.assertEqual(
             self._sources('<img src="%s"/>' % url,
                           [{'type': 'img', 'attrs': {'src': url}, 'children': []}]),
-            [url],
+            ['text:%s' % url],
+        )
+
+    def test_text_file_tokens_are_inert_while_adapter_elements_stay_trusted(self):
+        """正文里的 `file=` token 惰性化；`session.elements`（适配器直给）仍是可信坐标。"""
+        content = '<img src="file:///tmp/a.png"/><img file="/tmp/b.png"/>'
+        elements = [{'type': 'img', 'attrs': {'src': 'file:///tmp/a.png'}, 'children': []}]
+        session = SessionView(
+            platform='onebot', self_id='1', user_id='2', content=content, elements=elements,
+        )
+        self.assertEqual(
+            chunk3._fallback_extract_session_image_sources(session),
+            ['onebot-file:/tmp/a.png', 'text:/tmp/b.png'],
         )
 
 
 class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
 
     def test_describe_vision_event_strips_attachment_markup_and_keeps_sources(self) -> None:
+        """正文里的来源照旧进 `sources`（`imageCount` 与附件条目不变），但带 `text:` 惰性前缀。"""
         host = FakeService()
         event = ServiceChunk3.describe_vision_event(host, {
             'content': '看这个<img src="https://gchat.qpic.cn/a.png"/>好看吗[CQ:record,file=v.silk]',
         })
         self.assertEqual(event['content'], '看这个好看吗')
-        self.assertEqual(event['sources'], ['https://gchat.qpic.cn/a.png'])
+        self.assertEqual(event['sources'], ['text:https://gchat.qpic.cn/a.png'])
 
     def test_describe_vision_event_keeps_image_only_input_wordless(self) -> None:
         """上游注释：抓取失败/被过滤必须表现为「没有视觉输入」，不邀请模型编造。"""
         host = FakeService()
         event = ServiceChunk3.describe_vision_event(host, {'content': '<img src="https://gchat.qpic.cn/a.png"/>'})
         self.assertEqual(event['content'], '')
-        self.assertEqual(event['sources'], ['https://gchat.qpic.cn/a.png'])
+        self.assertEqual(event['sources'], ['text:https://gchat.qpic.cn/a.png'])
 
-    def test_extract_session_image_sources_prefers_cdn_url_then_file_token(self) -> None:
-        host = FakeService()
+    def test_extract_session_image_sources_structured_first_then_inert_text(self) -> None:
+        """§46.8：表在 → **只读结构化**；表不在（`None`/缺失）→ 文本降级但全部惰性。"""
+        # 表在：正文里的三种写法**一条都不进来源表**（种类与来源都只认观测到的那份）。
+        structured = SessionView(
+            platform='onebot', self_id='1', user_id='2',
+            content=('<img src="https://gchat.qpic.cn/real.png"/>'
+                     '<img src="https://gchat.qpic.cn/typed.png"/>'
+                     '[CQ:image,url=https://gchat.qpic.cn/cq.png]'),
+            media=[{'kind': 'image', 'source': 'https://gchat.qpic.cn/real.png',
+                    'source_kind': 'url', 'summary': '', 'raw': {}}],
+        )
+        self.assertEqual(
+            chunk3._extract_session_image_sources(structured),
+            ['https://gchat.qpic.cn/real.png'],
+        )
+        # 空表也算"表在"：观测到零媒体 → 不回退文本。
+        self.assertEqual(
+            chunk3._extract_session_image_sources(
+                SessionView(content='<img src="https://x/b.png"/>', media=[]),
+            ),
+            [],
+        )
+
+        # 没有观测通道（老宿主 / 手搓 session）→ 上游那套文本抽取，坐标一律 `text:`。
         self.assertEqual(
             # 上游 `add(fields.url || fields.cache_url, 'adapter-url')` → 带 onebot-url: 前缀
             chunk3._extract_session_image_sources({'content': '[CQ:image,file=a.jpg,url=https://x/a.jpg]'}),
-            ['onebot-url:https://x/a.jpg'],
+            ['text:https://x/a.jpg'],
         )
         self.assertEqual(
             chunk3._extract_session_image_sources({'content': '[CQ:image,file=abc.jpg]'}),
-            ['onebot-file:abc.jpg'],
+            ['text:abc.jpg'],
         )
         self.assertEqual(
             chunk3._extract_session_image_sources({'content': '<img src="https://x/b.png"/><img src="https://x/b.png"/>'}),
-            ['https://x/b.png'],
+            ['text:https://x/b.png'],
         )
         self.assertEqual(chunk3._extract_session_image_sources({'content': '普通文字'}), [])
 
@@ -1210,6 +1351,43 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter['mime_type'], 'image/png')
 
+    async def test_text_sources_are_never_fetched_even_on_trusted_hosts(self) -> None:
+        """红线（§46.8）：`text:`（正文里读出来的坐标）**永不取回**，连主机白名单都不认。
+
+        这条钉的是"来源"这一半的洞：从前正文里的 `[CQ:image,url=…]` 会被记成
+        `onebot-url:`（= 适配器提供，取回时跳过白名单），手打一句就能让她下载任意地址；
+        裸 URL 也会因为 QQ CDN 白名单被取回。
+        """
+        seen: list[str] = []
+        png = _png_bytes()
+        host = _MediaHost(config={'model': {'vision': {'enabled': True}}})
+
+        async def fetch(url: str) -> bytes:
+            seen.append(url)
+            return png
+
+        host.transport = FakeTransport(fetch_image=fetch)
+        for source in (
+            'text:https://gchat.qpic.cn/a.png',       # 可信主机也不认
+            'text:https://multimedia.nt.qq.com.cn/b.png',
+            'text:https://example.com/c.png',
+            'text:/tmp/secret.png',                   # 也没有本地读文件的口子
+        ):
+            with self.subTest(source=source):
+                self.assertIsNone(await ServiceChunk3.fetch_native_image(host, source))
+        self.assertEqual(seen, [], '正文里的坐标一次都不许取回')
+
+        # 正向对照：适配器观测到的同一批坐标照旧取回（白名单 / 适配器标记不变）。
+        self.assertEqual(
+            (await ServiceChunk3.fetch_native_image(host, 'https://gchat.qpic.cn/a.png'))['mime_type'],
+            'image/png',
+        )
+        self.assertEqual(
+            (await ServiceChunk3.fetch_native_image(host, 'onebot-url:https://example.com/a.png'))['mime_type'],
+            'image/png',
+        )
+        self.assertEqual(seen, ['https://gchat.qpic.cn/a.png', 'https://example.com/a.png'])
+
     async def test_fetch_native_image_decodes_data_uris_and_rejects_non_images(self) -> None:
         host = _MediaHost(config={'model': {'vision': {'enabled': True}}})
         png = _png_bytes()
@@ -1243,7 +1421,10 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
         host = _MediaHost(config={'model': {'vision': {'enabled': True}}})
 
         async def fetch(url: str) -> bytes:
-            return png
+            # 每条 URL 给一份**不同**的字节：v1.4.0 起完全相同的图会在回合内去重
+            # （见下面的 `test_the_same_image_in_one_message_is_only_kept_once`），
+            # 这里测的是"来源上限"，所以让三张图各不相同。
+            return png + url.encode('utf-8')
 
         host.transport = FakeTransport(fetch_image=fetch)
         images = await ServiceChunk3.load_native_images(
@@ -1256,6 +1437,34 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
         disabled = _MediaHost(config={'model': {'vision': {'enabled': False}}})
         self.assertEqual(await ServiceChunk3.load_native_images(disabled, {'id': 's'}, ['x'], None), [])
 
+    async def test_the_same_image_in_one_message_is_only_kept_once(self) -> None:
+        """v1.4.0：同一条消息里重复贴同一张图只留一张（识图按图计费）。"""
+        from PIL import Image  # noqa: F401 - 没有 Pillow 时下面会跳过
+
+        import io as _io
+
+        buffer = _io.BytesIO()
+        Image.new('L', (32, 32), 0).save(buffer, 'PNG')
+        pattern = Image.open(_io.BytesIO(buffer.getvalue()))
+        for x in range(0, 32, 8):
+            for y in range(32):
+                pattern.putpixel((x, y), 255)
+        buffer = _io.BytesIO()
+        pattern.save(buffer, 'PNG')
+        png = buffer.getvalue()
+        host = _MediaHost(config={'model': {'vision': {'enabled': True}}})
+
+        async def fetch(url: str) -> bytes:
+            return png
+
+        host.transport = FakeTransport(fetch_image=fetch)
+        images = await ServiceChunk3.load_native_images(
+            host, {'id': 's'}, ['https://gchat.qpic.cn/1.png', 'https://gchat.qpic.cn/2.png'], None,
+        )
+        self.assertEqual([item['id'] for item in images], ['turn-image-1'],
+                         '第二张是同一张图，应当被跳过')
+        self.assertTrue(images[0].get('perceptualHash'), '留下的那张要带哈希')
+
     async def test_describe_current_images_skips_without_a_vision_provider(self) -> None:
         host = _MediaHost(config={})
 
@@ -1267,6 +1476,63 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await ServiceChunk3.describe_current_images(host, {'id': 's'}, [{'id': 'i'}], '看看'))
         self.assertTrue(any('侧端识图跳过' in str(entry) for entry in host.logs))
 
+    def test_extract_session_media_reads_the_structured_table_only(self) -> None:
+        """媒体种类必须和图片来源对齐，并带上卡片（受控偏离 §29）。
+
+        输入是适配层写下的**结构化媒体表**（`SessionView.media`，§46）：
+        `kind`/`summary` 来自 OneBot 原始段，`raw` 是原始判据，卡片没有来源。
+        """
+        media = chunk3._extract_session_media({
+            'media': [
+                {'kind': 'sticker', 'source': 'https://x/a.png', 'source_kind': 'url',
+                 'summary': '[动画表情]', 'raw': {'sub_type': '1'}},
+                {'kind': 'card', 'source': '', 'source_kind': '', 'summary': '',
+                 'raw': {'app': 'com.tencent.miniapp', 'title': '宝箱'}},
+            ],
+            'content': '<img src="https://x/a.png" kind="sticker" summary="[动画表情]"/>'
+                       '<card app="com.tencent.miniapp" title="宝箱"/>',
+        })
+        self.assertEqual(media[0]['source'], 'https://x/a.png')
+        self.assertEqual(media[0]['kind'], 'sticker')
+        self.assertEqual(media[0]['label'], '[动画表情]')
+        self.assertEqual(media[1]['kind'], 'card')
+        self.assertEqual(media[1]['label'], '[QQ小程序：宝箱]')
+
+    def test_extract_session_media_never_reads_the_message_text(self) -> None:
+        """红线（§46）：正文里手打的 `<img … kind="sticker"/>` **一个都不算数**。
+
+        内容与上一条**逐字相同**，区别只在没有结构化媒体表。判据曾经是从这段文本里
+        正则抠出来的 —— 那样谁都能手打一个 `<img src="http://任意地址" kind="sticker"/>`
+        冒充表情包（会真的去下载那个地址）。取不到结构化数据必须回**空表**，
+        绝不回退解析文本。
+        """
+        content = ('<img src="https://evil.example/x.png" kind="sticker"/>'
+                   '<img src="https://evil.example/x.png" kind="animated"/>'
+                   '<card app="com.tencent.miniapp" title="宝箱"/>')
+        for session in (
+            {'content': content, 'elements': []},
+            {'content': content},
+            SessionView(platform='onebot', self_id='1', user_id='2', content=content),
+            # 老宿主 / 结构缺失：`media` 不是列表也一律按"没有"处理。
+            {'content': content, 'media': None},
+            {'content': content, 'media': 'sticker'},
+        ):
+            with self.subTest(session=session):
+                self.assertEqual(chunk3._extract_session_media(session), [])
+
+    def test_vision_event_keeps_cards_as_text(self) -> None:
+        """卡片是可读内容，留成标签；图片标记照旧拿掉（上游语义）。"""
+        host = _MediaHost(config={})
+        event = ServiceChunk3.describe_vision_event(host, {
+            'content': '看这个<img src="https://x/a.png"/>'
+                       '<card app="com.tencent.miniapp" title="宝箱"/>',
+            'elements': [],
+        })
+        self.assertNotIn('[图片]', event['content'])
+        self.assertNotIn('<card', event['content'])
+        self.assertIn('[QQ小程序：宝箱]', event['content'])
+        self.assertEqual(event['sources'], ['text:https://x/a.png'])
+
     async def test_describe_current_images_returns_observations(self) -> None:
         host = _MediaHost(config={'model': {'vision': {'detail': 'low'}}})
 
@@ -1277,7 +1543,8 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
             def available(self) -> bool:
                 return True
 
-            async def describe_images(self, images: Any, user_text: str = '', detail: str = 'auto') -> Any:
+            async def describe_images(self, images: Any, user_text: str = '', detail: str = 'auto',
+                                      kinds: Any = None) -> Any:
                 self.seen = (list(images), user_text, detail)
                 return ['1. 一只橘猫。']
 
@@ -1294,7 +1561,8 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
             def available(self) -> bool:
                 return True
 
-            async def describe_images(self, images: Any, user_text: str = '', detail: str = 'auto') -> Any:
+            async def describe_images(self, images: Any, user_text: str = '', detail: str = 'auto',
+                                      kinds: Any = None) -> Any:
                 raise RuntimeError('provider down')
 
         host.vision_describer = Describer()

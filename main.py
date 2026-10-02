@@ -28,9 +28,11 @@ from .adapters.astrbot_bridge import (
     PLUGIN_NAME,
     build_bridge,
     endpoint_for_event,
+    is_non_message_event,
     session_view,
 )
 from .adapters.console_api import ConsoleApi
+from .core.health import format_health_lines
 
 __all__ = ['COMMANDS', 'COMMAND_HANDLERS', 'HDSInterludePlugin', 'MANAGEMENT_COMMANDS']
 
@@ -139,6 +141,28 @@ COMMANDS: tuple[CommandSpec, ...] = (
         'interlude.purge.range', 'hdsi_purge_range', 'hdsi_purge_range', 'admin',
         'hdsi_purge_range <开始> <结束>',
     ),
+    # ── 上游 1.0.1-rc28（单剧本多通道 M1a/M1b/M2）────────────────────────────
+    CommandSpec(
+        'interlude.participant.link', 'hdsi_participant_link', 'hdsi_participant_link', 'admin',
+        'hdsi_participant_link <参与者ID> <用户ID>',
+    ),
+    CommandSpec(
+        'interlude.participant.unlink', 'hdsi_participant_unlink', 'hdsi_participant_unlink', 'admin',
+        'hdsi_participant_unlink <端点ID>',
+    ),
+    CommandSpec(
+        'interlude.participant.endpoints', 'hdsi_participant_endpoints', 'hdsi_participant_endpoints', 'admin',
+        'hdsi_participant_endpoints <参与者ID>',
+    ),
+    CommandSpec(
+        'interlude.story.endpoint', 'hdsi_story_endpoint', 'hdsi_story_endpoint', 'admin',
+        'hdsi_story_endpoint [add <平台> <账号> [qq|wechat] | disable <端点ID>]',
+    ),
+    CommandSpec(
+        'interlude.story.alias', 'hdsi_story_alias', 'hdsi_story_alias', 'admin',
+        'hdsi_story_alias [remove <别名ID>]',
+    ),
+    CommandSpec('interlude.reset', 'hdsi_reset', 'hdsi_reset', 'admin', 'hdsi_reset'),
 )
 
 #: AstrBot 命令名 → 处理器方法名。
@@ -161,6 +185,18 @@ CAPABILITY_CHECK_WAIT_SECONDS = 45
 
 #: 上游 `askConfirmation` 的肯定回答正则：`/^(?:y|yes)$/i`。
 CONFIRMATION_YES_RE = re.compile(r'^(?:y|yes)$', re.IGNORECASE)
+
+#: 管理命令的统一回执文案（上游 `index.ts` 逐字）。
+#: ⚠️ 这几个常量在某次重构里被连定义一起删掉、只留了引用，于是**所有**取消/无权限
+#: 分支都抛 `NameError`（用户在 `/hdsi_purge_all` 上踩到：回复 n 时崩，命令没执行成）。
+#: 测试 `test_command_guards.py` 专门钉住它们存在。
+NO_MANAGER = '当前 QQ 没有共享主剧本的管理权限。'
+NO_MANAGER_DETAIL = (
+    '当前 QQ 没有共享主剧本的管理权限。'
+    '请在 Console 的 sharedStory.managerAccounts 中添加此 QQ，或留空允许所有获授权账号。'
+)
+NO_ADMIN = '无权限：当前账号不是 HDSI 管理员。'
+CANCELLED = '操作已取消。'
 
 
 def _to_int(value: Any, default: int) -> int:
@@ -214,8 +250,94 @@ def _pick(value: Any, camel: str, snake: Optional[str] = None) -> Any:
     return value.get(snake) if snake else None
 
 
+#: 上传表情时允许随请求带的三个可选参数（表单字段名，也是查询串上的名字）。
+_STICKER_UPLOAD_FIELDS: tuple[tuple[str, str], ...] = (
+    ('groupId', 'group_id'),
+    ('description', 'description'),
+    ('name', 'name'),
+)
+
+
+async def _sticker_upload_payload() -> tuple[Optional[bytes], dict[str, str]]:
+    """从插件页请求里取**上传的表情字节 + 可选参数**（控制台「上传表情」）。
+
+    两条通道的来由（宿主 bridge 的实际能力，见 astrbot 的 `plugin_page_bridge.js`
+    里 `files:upload` 分支）：
+
+    * 字节只走 `multipart/form-data` 的 **`file`** 字段——宿主 `upload(endpoint, file)`
+      的字段名是写死的（`form.append("file", …)`），`upload` 只是给手敲 curl 的宽容别名；
+    * `groupId` / `description` / `name` **表单字段优先，其次查询串**：bridge 只能发
+      一个文件字段，前端唯一能带参数的路就是把它们挂在端点的查询串上。
+      两种拼写都认（wire 是 camelCase，手敲 curl 的人常写 snake_case）。
+
+    **上传的文件名一个字符都不进业务**：命名一律用内容哈希（见
+    `chunk2.upload_sticker_asset`），这里连 `upload.filename` 都不读。
+    """
+    from astrbot.api.web import request  # noqa: PLC0415 - 宿主 API，测试里用桩
+
+    try:
+        form = await request.form()
+    except Exception:  # noqa: BLE001 - 不是 multipart / 老宿主没有 form()
+        form = None
+    options: dict[str, str] = {}
+    for camel, snake in _STICKER_UPLOAD_FIELDS:
+        value: Any = None
+        if form is not None:
+            try:
+                value = form.get(camel)
+            except Exception:  # noqa: BLE001 - 表单桩缺 get 就当没给
+                value = None
+        if value is None:
+            try:
+                value = request.query.get(camel)
+                if value is None and snake != camel:
+                    value = request.query.get(snake)
+            except Exception:  # noqa: BLE001 - 拿不到查询参数就是没给
+                value = None
+        if value is not None:
+            options[camel] = value if isinstance(value, str) else str(value)
+
+    data: Optional[bytes] = None
+    try:
+        files = await request.files()
+    except Exception:  # noqa: BLE001 - 不是 multipart
+        files = None
+    if files:
+        upload = files.get('file') or files.get('upload')
+        if upload is not None:
+            try:
+                data = await upload.read()
+            except Exception:  # noqa: BLE001
+                data = None
+            if isinstance(data, str):  # 桩/老宿主回文本时按字节处理，别把 str 传下去
+                data = data.encode('utf-8', errors='replace')
+    return data, options
+
+
 def _text(value: Any) -> str:
     return '' if value is None else str(value)
+
+
+#: 表情包按扩展名给的 `Content-Type`（控制台的 `sticker-file` 用）。
+#: 与 `core/service/chunk2.sticker_mime` 同一套映射；这里不跨层 import 那个私有实现，
+#: 因为 `main.py` 的约定是"只经 bridge"。
+_STICKER_CONTENT_TYPES = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+}
+
+
+def _sticker_content_type(path: str) -> str:
+    """按扩展名给图片 MIME（认不出来按 PNG：浏览器仍会按魔数渲染）。"""
+    return _STICKER_CONTENT_TYPES.get(os.path.splitext(_text(path))[1].lower(), 'image/png')
+
+
+#: `sticker-file?inline=` 认的真值写法（前端 bridge 发的是 `inline=1`；
+#: 其余写法只是方便手敲 curl 调试，缺省 / 其他值一律走 blob 老行为）。
+_STICKER_INLINE_TRUE = ('1', 'true', 'yes', 'on')
 
 
 def _format_fixed(value: Any) -> str:
@@ -252,6 +374,14 @@ def _parse_iso(value: str) -> Any:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _local_time_text(value: Any) -> str:
+    """把 ISO 时间戳渲染成本地可读文本（别名列表用；解析不出就原样回显）。"""
+    parsed = _parse_iso(value) if isinstance(value, str) else value
+    if not isinstance(parsed, datetime):
+        return str(value or '')
+    return parsed.astimezone().strftime('%Y-%m-%d %H:%M')
 
 
 def format_story_start_readiness(readiness: Any, title: str = 'Console 档案检查') -> str:
@@ -437,10 +567,68 @@ class HDSInterludePlugin(Star):
              '控制台：已知参与者（白名单一键填入）'),
             (f'/{PLUGIN_NAME}/console/stories', self.page_console_stories, ['GET'],
              '控制台：剧本清单（含归档）'),
+            (f'/{PLUGIN_NAME}/console/token-stats', self.page_console_token_stats, ['GET'],
+             '控制台：Token 用量统计（按天/周/月/自选范围）'),
+            (f'/{PLUGIN_NAME}/console/actions', self.page_console_actions, ['GET'],
+             '控制台：平台动作目录与权限档位'),
+            (f'/{PLUGIN_NAME}/console/action-permission', self.page_console_action_permission, ['POST'],
+             '控制台：设置一个平台动作的权限档位'),
+            (f'/{PLUGIN_NAME}/console/action-permissions-reset', self.page_console_action_permissions_reset, ['POST'],
+             '控制台：清空平台动作权限表（回默认档）'),
+            (f'/{PLUGIN_NAME}/console/patch-decide', self.page_console_patch_decide, ['POST'],
+             '设定候选审批'),
+            (f'/{PLUGIN_NAME}/console/patch-rollback', self.page_console_patch_rollback, ['POST'],
+             '设定候选回滚'),
             (f'/{PLUGIN_NAME}/console/story-merge', self.page_console_story_merge, ['POST'],
              '控制台：把旧剧本并入共享主剧本'),
             (f'/{PLUGIN_NAME}/console/story-promote', self.page_console_story_promote, ['POST'],
              '控制台：把选中的剧本立为共享主剧本'),
+            # 共同作品（上游 rc28 `works.ts` 的界面；入口由本移植版补）。
+            # 「作品」面板只读 + 用户动作：**只有用户能接受 / 驳回**她的提案。
+            (f'/{PLUGIN_NAME}/console/works', self.page_console_works, ['GET'],
+             '控制台：共同作品清单'),
+            (f'/{PLUGIN_NAME}/console/work', self.page_console_work, ['GET'],
+             '控制台：一件共同作品的全貌'),
+            (f'/{PLUGIN_NAME}/console/work-create', self.page_console_work_create, ['POST'],
+             '控制台：新建一件共同作品'),
+            (f'/{PLUGIN_NAME}/console/work-accept', self.page_console_work_accept, ['POST'],
+             '控制台：接受一条作品提案'),
+            (f'/{PLUGIN_NAME}/console/work-reject', self.page_console_work_reject, ['POST'],
+             '控制台：驳回一条作品提案'),
+            (f'/{PLUGIN_NAME}/console/work-edit', self.page_console_work_edit, ['POST'],
+             '控制台：用户手改共同作品正文'),
+            (f'/{PLUGIN_NAME}/console/work-generate', self.page_console_work_generate, ['POST'],
+             '控制台：让她起草一版（异步写手任务）'),
+            (f'/{PLUGIN_NAME}/console/work-export', self.page_console_work_export, ['GET'],
+             '控制台：导出共同作品（按消息长度分段）'),
+            (f'/{PLUGIN_NAME}/console/work-cancel', self.page_console_work_cancel, ['POST'],
+             '控制台：取消一个写手任务'),
+            # 表情库（v1.8.0）：列表 / 原图 / 改描述 / 删除 / 重扫。
+            # 删除语义是**默认只标记**，`purge=true` 才连文件一起删（见 PORTING_NOTES §45）。
+            (f'/{PLUGIN_NAME}/console/stickers', self.page_console_stickers, ['GET'],
+             '控制台：本地表情库清单'),
+            (f'/{PLUGIN_NAME}/console/sticker-file', self.page_console_sticker_file, ['GET'],
+             '控制台：读取一张表情包（缺省回原图字节，`inline=1` 回 base64 JSON）'),
+            (f'/{PLUGIN_NAME}/console/sticker-update', self.page_console_sticker_update, ['POST'],
+             '控制台：改表情包的描述 / 名字 / 停用'),
+            (f'/{PLUGIN_NAME}/console/sticker-restore-description',
+             self.page_console_sticker_restore_description, ['POST'],
+             '控制台：把表情包交回自动描述'),
+            (f'/{PLUGIN_NAME}/console/sticker-delete', self.page_console_sticker_delete, ['POST'],
+             '控制台：删除表情包（默认只标记，purge 才删文件）'),
+            (f'/{PLUGIN_NAME}/console/sticker-rescan', self.page_console_sticker_rescan, ['POST'],
+             '控制台：重扫表情库目录'),
+            # 表情库分组与上传（v1.8.3，§47）：新建分组 / 删除分组 / 批量移动 / 上传表情。
+            (f'/{PLUGIN_NAME}/console/sticker-groups', self.page_console_sticker_groups, ['GET'],
+             '控制台：表情库分组清单'),
+            (f'/{PLUGIN_NAME}/console/sticker-group-save', self.page_console_sticker_group_save,
+             ['POST'], '控制台：新建 / 修改表情库分组'),
+            (f'/{PLUGIN_NAME}/console/sticker-group-delete', self.page_console_sticker_group_delete,
+             ['POST'], '控制台：删除表情库分组（组内素材先挪走）'),
+            (f'/{PLUGIN_NAME}/console/sticker-move', self.page_console_sticker_move, ['POST'],
+             '控制台：批量移动表情到分组'),
+            (f'/{PLUGIN_NAME}/console/sticker-upload', self.page_console_sticker_upload, ['POST'],
+             '控制台：上传表情（multipart，字段名 file）'),
             # 配置备份（原 config-backup 页并入控制台）
             (f'/{PLUGIN_NAME}/config-export', self.page_config_export, ['GET'],
              '导出 HDS Interlude 配置'),
@@ -530,15 +718,217 @@ class HDSInterludePlugin(Star):
     async def page_console_stories(self):
         return await self._console_json(lambda api, q: api.stories())
 
+    async def page_console_token_stats(self):
+        """Token 用量统计：`range=day|week|month|custom`（自选时带 `from` / `to`）。"""
+        return await self._console_json(lambda api, q: api.token_stats(
+            q('range'), q('from'), q('to'),
+        ))
+
+    async def page_console_actions(self):
+        """平台动作目录 + 当前权限档位（面板「动作」）。"""
+        return await self._console_json(lambda api, q: api.actions_catalog())
+
+    async def page_console_action_permission(self):
+        """设置一个动作的权限档位（未知动作 / 未知档位会被 400 拒绝）。"""
+        return await self._console_write(lambda api, body: api.set_action_permission(
+            body.get('action'), body.get('tier'),
+        ))
+
+    async def page_console_action_permissions_reset(self):
+        """清空动作权限表：所有动作回目录默认档。"""
+        return await self._console_write(lambda api, body: api.reset_action_permissions())
+
     async def page_console_story_merge(self):
         return await self._console_write(lambda api, body: api.merge_story(
             body.get('source_story_id'), body.get('target_story_id'),
+        ))
+
+    async def page_console_patch_decide(self):
+        return await self._console_write(lambda api, body: api.decide_patch(
+            body.get('story_id'), body.get('patch_id'), body.get('action'), body.get('note', ''),
+        ))
+
+    async def page_console_patch_rollback(self):
+        return await self._console_write(lambda api, body: api.rollback_patch(
+            body.get('story_id'), body.get('patch_id'), body.get('note', ''),
         ))
 
     async def page_console_story_promote(self):
         return await self._console_write(lambda api, body: api.promote_story(
             body.get('source_story_id'),
         ))
+
+    # ---- 控制台的「作品」面板（共同作品） ---- #
+
+    async def page_console_works(self):
+        """共同作品清单：这部剧本里每个参与者一件。"""
+        return await self._console_json(lambda api, q: api.works_overview(q('story_id')))
+
+    async def page_console_work(self):
+        """一件作品的全貌（正文原样回，面板自己决定怎么显示）。"""
+        return await self._console_json(lambda api, q: api.work_detail(q('work_id')))
+
+    async def page_console_work_create(self):
+        """新建第一件作品（`story_id` 留空 = 面板当前那部剧本）。
+
+        已有共同作品时服务层会拒（**绝不覆盖**），那条文案原样回给用户。
+        """
+        return await self._console_write(lambda api, body: api.create_work(
+            body.get('story_id'), body.get('participant_id'),
+            body.get('title'), body.get('content'),
+        ))
+
+    async def page_console_work_accept(self):
+        """接受一条提案——**只有用户能做这件事**（她只能提议）。"""
+        return await self._console_write(lambda api, body: api.accept_work_proposal(
+            body.get('work_id'), body.get('proposal_id'),
+        ))
+
+    async def page_console_work_reject(self):
+        """驳回一条提案（正文不动，只留结论）。"""
+        return await self._console_write(lambda api, body: api.reject_work_proposal(
+            body.get('work_id'), body.get('proposal_id'),
+        ))
+
+    async def page_console_work_edit(self):
+        """用户手改正文：一条新版本（`reason` 是给这条版本留的理由）。"""
+        return await self._console_write(lambda api, body: api.edit_work(
+            body.get('work_id'), body.get('content'), body.get('reason', ''),
+        ))
+
+    async def page_console_work_generate(self):
+        """让她起草一版：异步写手任务，结果作为待决提案回来。"""
+        return await self._console_write(lambda api, body: api.start_work_generation(
+            body.get('work_id'), body.get('brief'),
+        ))
+
+    async def page_console_work_cancel(self):
+        """取消一个写手任务（`interrupted` 的遗留任务也能取消）。"""
+        return await self._console_write(lambda api, body: api.cancel_work_generation(
+            body.get('work_id'), body.get('job_id'),
+        ))
+
+    async def page_console_work_export(self):
+        """导出整件作品：`{parts, count}`，每段都在单条消息的安全长度内。"""
+        return await self._console_json(lambda api, q: api.export_work(q('work_id')))
+
+    # ---- 控制台的「表情库」面板（v1.8.0） ---- #
+
+    async def page_console_stickers(self):
+        """本地表情库清单（`status` / `kind` / `source` / `q` 都可选）。"""
+        return await self._console_json(lambda api, q: api.stickers(
+            q('status'), q('kind'), q('source'), q('q'),
+            _to_int(q('limit'), 60), _to_int(q('offset'), 0),
+        ))
+
+    async def page_console_sticker_file(self):
+        """回一张表情包：缺省是**原始图片字节**（宿主按 `file_response` 走 blob）。
+
+        `inline=1` 时改成回 base64 JSON 信封（`{assetId, mimeType, size, data}`）——
+        沙箱 iframe 里 `<img src>` 拿不到登录态、bridge 又只有 JSON 通道，形状见
+        `docs/PORTING_NOTES.md` §45.8（前端 `src/sticker-images.ts` 已按它接好）。
+        **不带 `inline` 时逐字保持老的 blob 行为**（老客户端兼容），两条分支共用同一批
+        校验与异常分支，所以 400 / 404 的措辞逐字一致。
+
+        `file_response` 之外还要给下载文件名：素材的 `filePath` basename 就是它在
+        表情库里的名字，直接拿来当 `filename` 最直观（前端也可以不下载、只显示）。
+        """
+        from astrbot.api.web import error_response, file_response, json_response
+
+        from .adapters.console_api import ConsoleError
+
+        asset_id = ''
+        inline = False
+        try:
+            from astrbot.api.web import request
+
+            asset_id = str(request.query.get('assetId', '') or '')
+            raw_inline = request.query.get('inline', '')
+            inline = str(raw_inline or '').strip().lower() in _STICKER_INLINE_TRUE
+        except Exception:  # noqa: BLE001 - 取不到查询参数就是没给
+            asset_id = ''
+            inline = False
+        try:
+            if inline:
+                return json_response(await self._console.sticker_file_inline(asset_id))
+            path = await self._console.sticker_file(asset_id)
+        except ConsoleError as error:
+            return error_response(str(error), status_code=400)
+        except FileNotFoundError:
+            return error_response('表情包文件不存在（可能已被删除）', status_code=404)
+        except Exception as error:  # noqa: BLE001
+            logger.warning('hds-interlude：读取表情包失败：%s' % error)
+            return error_response('读取表情包失败：%s' % error, status_code=500)
+        return file_response(
+            path, filename=os.path.basename(path), content_type=_sticker_content_type(path),
+        )
+
+    async def page_console_sticker_update(self):
+        """改描述 / 名字 / 停用（白名单在 `ConsoleApi.update_sticker` 里）。"""
+        return await self._console_write(lambda api, body: api.update_sticker(body))
+
+    async def page_console_sticker_restore_description(self):
+        """把描述交回自动描述（摘掉手工标记）。"""
+        return await self._console_write(
+            lambda api, body: api.restore_sticker_description(body),
+        )
+
+    async def page_console_sticker_delete(self):
+        """删除一条素材：默认只标记，`purge=true` 才连文件一起删。"""
+        return await self._console_write(lambda api, body: api.delete_sticker(body))
+
+    async def page_console_sticker_rescan(self):
+        """重扫表情库目录（跑完整 `scan_sticker_library()`）。"""
+        return await self._console_write(lambda api, body: api.rescan_stickers(body))
+
+    # ---- 控制台的「表情库」面板：分组与上传（v1.8.3，§47） ---- #
+
+    async def page_console_sticker_groups(self):
+        """表情库分组清单（**目录即分组**：内置默认组永远在，磁盘上有目录的也在）。"""
+        return await self._console_json(lambda api, _q: api.sticker_groups())
+
+    async def page_console_sticker_group_save(self):
+        """新建 / 改名 / 写描述（白名单在 `ConsoleApi.save_sticker_group` 里）。"""
+        return await self._console_write(lambda api, body: api.save_sticker_group(body))
+
+    async def page_console_sticker_group_delete(self):
+        """删分组：组内素材**先搬进目标目录**（默认进内置默认组），绝不悄悄删素材。"""
+        return await self._console_write(lambda api, body: api.delete_sticker_group(body))
+
+    async def page_console_sticker_move(self):
+        """批量改归属（**先校验后写**：有一条 assetId 不合法就一条都不写）。"""
+        return await self._console_write(lambda api, body: api.move_stickers(body))
+
+    async def page_console_sticker_upload(self):
+        """上传一张表情（`multipart/form-data`，字段名固定 **`file`**）。
+
+        与其它控制台写操作的区别只有一处：请求体不是 JSON，所以这里不用
+        `_console_write` 的 JSON 解析，而是自己取字节 + 三个可选参数
+        （`groupId` / `description` / `name`，表单字段或查询串，见
+        `_sticker_upload_payload()` 的两条通道说明）。
+
+        校验 / 去重 / 落盘 / 建档 / 描述全在 `ConsoleApi.upload_sticker()` →
+        服务层的 `upload_sticker_asset()`；`ConsoleError` 映射成 400 + 原文案。
+        """
+        from astrbot.api.web import error_response, json_response
+
+        from .adapters.console_api import ConsoleError
+
+        data, options = await _sticker_upload_payload()
+        if not data:
+            return error_response('没有收到文件内容（multipart 的 file 字段）', status_code=400)
+        try:
+            payload = await self._console.upload_sticker(
+                data, options.get('groupId', ''), options.get('description'),
+                options.get('name', ''),
+            )
+        except ConsoleError as error:
+            return error_response(str(error), status_code=400)
+        except Exception as error:  # noqa: BLE001
+            logger.warning('hds-interlude：上传表情失败：%s' % error)
+            return error_response('上传失败：%s' % error, status_code=500)
+        logger.warning('hds-interlude：控制台上传了表情：%s' % payload.get('assetId', '?'))
+        return json_response(payload)
 
     async def _console_write(self, action):
         """跑一个控制台写操作。
@@ -778,12 +1168,25 @@ class HDSInterludePlugin(Star):
         return bool(CONFIRMATION_YES_RE.match(_text(answer).strip()))
 
     def _resolve_confirmation(self, event: AstrMessageEvent) -> bool:
-        """若该会话正在等 y/n，则消费这条回复并返回 `True`。"""
+        """若该会话正在等 y/n，则消费这条回复并返回 `True`。
+
+        **只有真正的文字消息才算回答**：NapCat 的「对方正在输入…」是 `notice`，宿主照样
+        派到消息处理器上；以前它会带着空文本进来，把等待中的 future 用 `''` 结掉 ——
+        确认被当成"取消"，用户随后真打的 `y` 反而成了普通聊天消息（用户 2026-09-28 的
+        `/hdsi_purge_all` 现场：提问后 2 秒就报"操作已取消"，然后她开始回答一个 "y"）。
+        非消息事件与空文本一律放行给别的分支，确认继续等（60 秒超时按取消处理）。
+        """
         key = _text(getattr(event, 'unified_msg_origin', ''))
         future = self._confirmations.get(key)
         if future is None or future.done():
             return False
-        future.set_result(_text(event.get_message_str()).strip())
+        non_message, _label = is_non_message_event(event)
+        if non_message:
+            return False
+        answer = _text(event.get_message_str()).strip()
+        if not answer:
+            return False
+        future.set_result(answer)
         event.stop_event()
         return True
 
@@ -841,13 +1244,13 @@ class HDSInterludePlugin(Star):
         if not capture:
             return
         try:
-            replies = await self.bridge.handle_event(event)
+            await self.bridge.handle_event(event)
         except Exception as error:  # noqa: BLE001 - 私聊归属不能因为一次异常就漏给别的 Agent
             logger.error('hds-interlude：私聊事件处理失败，已吞掉事件以免其它 Agent 接手：%s' % error)
             event.stop_event()
             return
-        for reply in replies:
-            yield event.plain_result(reply)
+        for reply in self.bridge.turn_replies():
+            yield self._reply_result(event, reply)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
@@ -867,9 +1270,22 @@ class HDSInterludePlugin(Star):
         if not allowed:
             self.bridge.service.note_group_skip(session, reason)
             return
-        replies = await self.bridge.handle_event(event)
-        for reply in replies:
-            yield event.plain_result(reply)
+        await self.bridge.handle_event(event)
+        for reply in self.bridge.turn_replies():
+            yield self._reply_result(event, reply)
+
+    @staticmethod
+    def _reply_result(event: AstrMessageEvent, reply: dict[str, Any]):
+        """本回合一条可见回复交回宿主的结果：语音段发 `Record`，其余发纯文本。
+
+        `reply['voice']` 是适配层**已经合成好的音频文件路径**（正文 `<tts/>` 标记
+        指定的分段）；空串表示这条照旧发文字——合不出来时适配层会退回文字并打 warn，
+        所以这里看到的永远是"要么有文件、要么是文字"，没有第三种。
+        """
+        path = reply.get('voice') if isinstance(reply, dict) else ''
+        if path:
+            return event.chain_result(AstrbotBridge.voice_components(path))
+        return event.plain_result(reply.get('content') if isinstance(reply, dict) else reply)
 
     # ------------------------------------------------------------------ #
     # 命令：档案与状态
@@ -1014,6 +1430,12 @@ class HDSInterludePlugin(Star):
                 _pick(window, 'activityLoad', 'activity_load') or '尚未建立',
             ),
         ]
+        # 上游 1.0.1-rc28 的健康指标：命令行长文本不好读，给一份 6 行人话摘要
+        # （数值与 Console 面板同源，见 `core/health.py::format_health_lines`）。
+        snapshot = service.health_snapshot(_pick(story, 'id')) if hasattr(service, 'health_snapshot') else {}
+        if snapshot:
+            lines.append('健康指标（自本次重载）：')
+            lines.extend('· %s' % line for line in format_health_lines(snapshot))
         yield event.plain_result('\n'.join(lines))
 
     async def _change_status(self, session: Any, status: str) -> str:
@@ -1653,6 +2075,204 @@ class HDSInterludePlugin(Star):
         yield event.plain_result(
             '已彻底重置所有平台：旧剧本、场景摘要、剧情弧线、长期事实、记忆、意图、状态演化和参与者关系状态均已清除；'
             '当前故事保留为空白的全局主剧本，Canon 已按当前 Console 配置重建。'
+        )
+
+    @filter.command('hdsi_participant_link')
+    async def hdsi_participant_link(self, event: AstrMessageEvent):
+        """管理员：把同一个人的另一个号链入既有参与者（第二端点消息进入同一关系分支）。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result(NO_MANAGER)
+            return
+        args = self._raw_args(event)
+        participant_id = self._text_arg(args, 0).strip()
+        account = self._text_arg(args, 1).strip()
+        if not participant_id or not account:
+            yield event.plain_result('用法：hdsi_participant_link <参与者ID> <用户ID>')
+            return
+        service = self.bridge.service
+        participant = await service.get_participant(participant_id) if hasattr(service, 'get_participant') else None
+        if not participant:
+            yield event.plain_result('参与者不存在：%s' % participant_id)
+            return
+        platform = _pick(session, 'platform') or 'onebot'
+        result = await service.link_participant_endpoint(participant, platform, account)
+        if _pick(result, 'ok'):
+            display = _pick(participant, 'displayName', 'display_name') or participant_id
+            yield event.plain_result('用户端点已链接（%s → %s）。' % (account, display))
+            return
+        yield event.plain_result('链接失败：%s' % _pick(result, 'error'))
+
+    @filter.command('hdsi_participant_unlink')
+    async def hdsi_participant_unlink(self, event: AstrMessageEvent):
+        """管理员：解除一个用户端点链接（可撤销；身份与历史保留）。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result(NO_MANAGER)
+            return
+        endpoint_id = self._text_arg(self._raw_args(event), 0).strip()
+        if not endpoint_id:
+            yield event.plain_result('用法：hdsi_participant_unlink <端点ID>')
+            return
+        result = await self.bridge.service.unlink_participant_endpoint(endpoint_id)
+        if _pick(result, 'ok'):
+            yield event.plain_result('端点已解除链接（%s）。' % endpoint_id)
+            return
+        yield event.plain_result('解除失败：%s' % _pick(result, 'error'))
+
+    @filter.command('hdsi_participant_endpoints')
+    async def hdsi_participant_endpoints(self, event: AstrMessageEvent):
+        """管理员：列出参与者名下全部用户端点。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result(NO_MANAGER)
+            return
+        participant_id = self._text_arg(self._raw_args(event), 0).strip()
+        if not participant_id:
+            yield event.plain_result('用法：hdsi_participant_endpoints <参与者ID>')
+            return
+        await self.bridge.service.ensure_endpoint_registry()
+        endpoints = self.bridge.service.list_participant_endpoints(participant_id)
+        if not endpoints:
+            yield event.plain_result('参与者 %s 没有用户端点。' % participant_id)
+            return
+        lines = [
+            '%s %s %s 端点=%s' % (
+                '●' if _pick(item, 'enabled') else '○', _pick(item, 'platform'),
+                _pick(item, 'userId', 'user_id'), _pick(item, 'endpointId', 'endpoint_id'),
+            )
+            for item in endpoints
+        ]
+        yield event.plain_result('用户端点（%d 个）：\n%s' % (len(endpoints), '\n'.join(lines)))
+
+    @filter.command('hdsi_story_endpoint')
+    async def hdsi_story_endpoint(self, event: AstrMessageEvent):
+        """管理员：管理剧本的角色端点（账号迁移的唯一显式途径）。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result(NO_MANAGER)
+            return
+        story = await self._require_story(session)
+        if isinstance(story, str):
+            yield event.plain_result(story)
+            return
+        service = self.bridge.service
+        parts = [part for part in self._text_arg(self._raw_args(event), 0).split() if part]
+        if parts and parts[0] == 'add':
+            if len(parts) < 3:
+                yield event.plain_result('用法：hdsi_story_endpoint add <平台> <账号> [qq|wechat]')
+                return
+            channel_kind = 'wechat' if len(parts) > 3 and parts[3] == 'wechat' else 'qq'
+            result = await service.add_story_endpoint(story, parts[1], parts[2], channel_kind)
+            if _pick(result, 'ok'):
+                yield event.plain_result('角色端点已注册（%s %s，%s，端点 %s）。' % (
+                    parts[1], parts[2], channel_kind, _pick(result, 'endpointId', 'endpoint_id')))
+                return
+            yield event.plain_result('注册失败：%s' % _pick(result, 'error'))
+            return
+        if parts and parts[0] == 'disable':
+            if len(parts) < 2:
+                yield event.plain_result('用法：hdsi_story_endpoint disable <端点ID>')
+                return
+            result = await service.disable_story_endpoint(parts[1])
+            if _pick(result, 'ok'):
+                yield event.plain_result('端点已停用（%s）。' % parts[1])
+                return
+            yield event.plain_result('停用失败：%s' % _pick(result, 'error'))
+            return
+        if parts:
+            yield event.plain_result('用法：hdsi_story_endpoint [add <平台> <账号> [qq|wechat] | disable <端点ID>]')
+            return
+        await service.ensure_endpoint_registry()
+        endpoints = service.list_story_endpoints(_pick(story, 'id'))
+        if not endpoints:
+            yield event.plain_result('当前故事没有登记任何角色端点。')
+            return
+        lines = [
+            '%s %s %s（%s%s）端点=%s' % (
+                '●' if _pick(item, 'enabled') else '○', _pick(item, 'platform'), _pick(item, 'selfId', 'self_id'),
+                _pick(item, 'channelKind', 'channel_kind'),
+                '·在线' if _pick(item, 'online') else '·离线',
+                _pick(item, 'endpointId', 'endpoint_id'),
+            )
+            for item in endpoints
+        ]
+        yield event.plain_result('角色端点（%d 个）：\n%s' % (len(endpoints), '\n'.join(lines)))
+
+    @filter.command('hdsi_story_alias')
+    async def hdsi_story_alias(self, event: AstrMessageEvent):
+        """管理员：查看/回滚剧本别名重定向（单剧本多通道 M1b）。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result(NO_MANAGER)
+            return
+        service = self.bridge.service
+        await service.ensure_endpoint_registry()
+        text = self._text_arg(self._raw_args(event), 0).strip()
+        if text.startswith('remove'):
+            alias_id = text[len('remove'):].strip()
+            if not alias_id:
+                yield event.plain_result('用法：hdsi_story_alias remove <别名ID>')
+                return
+            result = await service.remove_story_alias(
+                alias_id, 'by %s' % (_pick(session, 'userId', 'user_id') or 'admin'),
+            )
+            if _pick(result, 'ok'):
+                yield event.plain_result('已回滚别名 %s（审计已写入剧本条目）。' % alias_id)
+                return
+            yield event.plain_result('回滚失败：%s' % _pick(result, 'error'))
+            return
+        if text:
+            yield event.plain_result('用法：hdsi_story_alias [remove <别名ID>]')
+            return
+        aliases = service.list_story_aliases()
+        if not aliases:
+            yield event.plain_result('当前没有剧本别名。')
+            return
+        lines = [
+            '%s → %s（%s，%s）' % (
+                _pick(row, 'aliasStoryId', 'alias_story_id'),
+                _pick(row, 'canonicalStoryId', 'canonical_story_id'),
+                _pick(row, 'reason'), _local_time_text(_pick(row, 'createdAt', 'created_at')),
+            )
+            for row in aliases
+        ]
+        yield event.plain_result('剧本别名（%d 条）：\n%s' % (len(aliases), '\n'.join(lines)))
+
+    @filter.command('hdsi_reset')
+    async def hdsi_reset(self, event: AstrMessageEvent):
+        """管理员：完全重置——清空数据库并把角色设定重置为 Console 档案当前值。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result('无权限。')
+            return
+        story = await self._require_story(session)
+        if isinstance(story, str):
+            yield event.plain_result(story)
+            return
+        confirmed = await self._ask_confirmation(
+            event, '这将删除所有剧本、记忆、事实，并将角色设定重置为 Console 档案当前值。确定吗？(y/n)',
+        )
+        if not confirmed:
+            yield event.plain_result(CANCELLED)
+            return
+        await self.bridge.service.clear_database()
+        await self.bridge.service.purge_all_story_data(_pick(story, 'id'))
+        yield event.plain_result(
+            '已完全重置。数据库已清空，角色设定已回到 Console 故事档案（storyDefaults）模板。\n'
+            '如需更换角色身份，请在 Console 修改故事档案后重新开始。'
         )
 
     @filter.command('hdsi_purge_platform')

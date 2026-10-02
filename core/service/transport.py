@@ -18,6 +18,9 @@
 | 表情包投递（Chunk1/Chunk2 `sendSticker`） | `session.bot.sendMessage(channelId, h('img'))` | `send_sticker` |
 | 网页观察（Chunk5，上游 Puppeteer） | `ctx.puppeteer.page()` | `search_web` / `visit_web` |
 | typ-0 后台投递出口（Chunk0 `desktop_delivery_handler`） | bridge handler | `deliver_background` |
+| 平台动作目录（本移植版新增，`core/platform_actions.py`） | 参考插件的 `bot.internal._request(action, params)` | `platform_action` |
+| QQ 空间原生动作直通（发/删说说） | 同上 | `call_onebot` |
+| 「正在输入」状态（NapCat `set_input_status`） | 同上 | `set_input_status` |
 
 **降级原则**（移植约定）：确实无法在 AstrBot 复现的能力
 （Puppeteer 截图、sharp 抽帧、Satori 原生表情）必须返回失败而不是抛异常，
@@ -30,16 +33,31 @@ from typing import Any, Optional, Protocol, runtime_checkable
 
 from .base import log_fallback
 
-__all__ = ['BackgroundDelivery', 'NullTransport', 'Transport']
+__all__ = ['BackgroundDelivery', 'NullTransport', 'Transport', 'voice_kwargs']
 
 #: `send_private` / `send_group` 的返回结构（上游 `SendMessageResult` 的等价物）。
 #: `ok=False` 时调用方按投递失败处理，`message_ids` 用于拆分投递的账本记录。
 SendResult = dict[str, Any]
 
 
+def voice_kwargs(flag: Any) -> dict[str, Any]:
+    """语音意图 → 出站调用的可选关键字（v1.7.7 的正文 `<tts/>` 标记）。
+
+    只有真的要发语音时才带上 `voice=True`：`send_private` / `send_group` /
+    `send_session` 的语音参数是**新增的可选能力**，恒传会在非语音路径上撞到
+    还没跟上这一步的实现（老适配器、极简测试桩）的 `TypeError`。
+    非语音投递的调用形状因此与历史版本逐字一致。
+    """
+    return {'voice': True} if flag is True else {}
+
+
 @runtime_checkable
 class BackgroundDelivery(Protocol):
-    """上游 `desktopDeliveryHandler` 的入参（`src/service.ts:712-715`）。"""
+    """上游 `desktopDeliveryHandler` 的入参（`src/service.ts:712-715`）。
+
+    `voice` 是本移植版 v1.7.7 加的可选字段：正文 `<tts/>` 标记要求这条以语音投递。
+    没有语音意图时**不写这个键**（老实现照旧只读它认识的那几个字段）。
+    """
 
     participant_id: str
     self_id: str
@@ -48,6 +66,7 @@ class BackgroundDelivery(Protocol):
     kind: str
     content: str
     quote_message_id: Optional[str]
+    voice: bool
 
 
 @runtime_checkable
@@ -61,11 +80,15 @@ class Transport(Protocol):
         participant: dict[str, Any],
         content: str,
         reply_to: Optional[str] = None,
+        voice: bool = False,
     ) -> SendResult:
         """给一条关系分支发私聊消息。上游 `sendPrivateMessage(participant...)`。
 
         `participant` 是 `InterludeParticipant` 的 dict（snake_case 内部字段，
         数据库行则是 camelCase；实现里用 `pick()` 双读）。
+
+        `voice=True`（v1.7.7）：这一段是正文 `<tts/>` 标记指定的语音。适配层负责
+        合成；**合成不了就退回发文字并打 warn**，绝不因为发不出语音而丢内容。
         """
         ...
 
@@ -74,14 +97,18 @@ class Transport(Protocol):
         channel_id: str,
         content: str,
         reply_to: Optional[str] = None,
+        voice: bool = False,
     ) -> SendResult:
-        """向群频道发送。上游 `sendGroupMessage(story, channelId, content, replyToMessageId)`。"""
+        """向群频道发送。上游 `sendGroupMessage(story, channelId, content, replyToMessageId)`。
+
+        `voice=True` 同 `send_private`（v1.7.7 的正文 `<tts/>`）。"""
         ...
 
-    async def send_session(self, session: Any, content: str) -> SendResult:
+    async def send_session(self, session: Any, content: str, voice: bool = False) -> SendResult:
         """对当前入站会话原路回复。上游 `session.send(outgoingContent)`（`:5156`）。
 
         等价于"给触发本回合的私聊/群聊回一条"，`session` 是 `SessionView`。
+        `voice=True` 同 `send_private`（v1.7.7 的正文 `<tts/>`）。
         """
         ...
 
@@ -120,6 +147,23 @@ class Transport(Protocol):
         """下载图片原始字节。上游 `this.ctx.http.get(url, {responseType: 'arraybuffer'})`（`:2698`/`:2806`）。"""
         ...
 
+    async def fetch_incoming_image(self, source: str) -> Optional[bytes]:
+        """按**入站媒体坐标**取图片字节（**可选能力**；普通实现可以回 `None`）。
+
+        `source` 就是适配层写进结构化媒体表的那个字符串（`SessionView.media[].source`，
+        见 `docs/PORTING_NOTES.md` §46/§49）。与 `fetch_image()` 的分工：
+
+        * `fetch_image(url)` 只管"把这个 URL 下回来"，**任何实现**都该有；
+        * `fetch_incoming_image(source)` 回答"这次入站事件里那张图，宿主还能怎么把字节
+          给我" —— 宿主手上的本地文件、宿主自己的下载器、OneBot 侧的 `get_image`
+          都属于这一类，这些**只有适配层知道**，而它们可能省掉一次网络请求、
+          也可能在 `rkey` 短效链接失效时仍然拿得到字节。
+
+        契约：拿不到一律回 `None`，**绝不抛**；不认识这个坐标 / 没这项能力就回 `None`
+        （调用方会退回 `fetch_image()`，所以**不实现它不会破坏任何既有行为**）。
+        """
+        return None
+
     async def fetch_audio(self, url: str) -> Optional[bytes]:
         """下载音频原始字节。上游原生音频通道（Chunk2）。"""
         ...
@@ -144,6 +188,70 @@ class Transport(Protocol):
         """后台（无实时 Session）投递。上游 `desktopDeliveryHandler`（`:712-715`）。"""
         ...
 
+    # ---- 平台动作执行层（`core/platform_actions.py` 的动作目录） ----
+
+    async def platform_action(self, action: str, params: dict[str, Any]) -> SendResult:
+        """执行一条**目录动作**（`platform_actions.ACTIONS` 里的 id）。
+
+        返回 `{'ok': bool, 'error': str, 'data': Any}`：
+
+        * 未知 action / 参数缺失或越界 / 平台不支持 / 传输异常 → `ok=False`，
+          `error` 是给日志与调用方看的中文短语；平台不支持的稳定前缀是
+          `unsupported-platform-action: <id>`，调用方可以据此分类；
+        * 参数校验与「会话缺省坐标」由实现方补齐（目录是唯一事实源，见
+          `core/platform_actions.validate_action`）；
+        * 传输层异常（超时 / 断连）时 `error` **以「结果未知，请勿自动重试」结尾**，
+          此时动作可能已经在平台侧生效，调用方按 `ambiguous` 处理、不得自动重试。
+        """
+        ...
+
+    async def request_text(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        data: Optional[dict[str, str]] = None,
+        timeout_ms: int = 20_000,
+    ) -> Optional[str]:
+        """发一次**原始 HTTP** 并回文本（QQ 空间 CGI 用：要自带 Cookie / Referer）。
+
+        `method` 只认 `'GET'` / `'POST'`；POST 用 `application/x-www-form-urlencoded`
+        编码 `data`（腾讯那几个 CGI 就是这个形状）。失败返回 `None` 并记日志 —— 
+        **绝不抛**：QQ 空间是可选能力，不能拖垮叙事主链。
+
+        v1.7.6 补一句口径：调用方 `core/qzone.py::call_qzone_cgi` **两种失败都接得住**
+        ——回 `None` 与抛异常（某些 HTTP 客户端把超时/断连报成异常）都按"请求可能已经
+        打到腾讯"处理（`ambiguous`，禁止自动重试）。实现方仍以回 `None` 为准。
+        """
+        raise NotImplementedError
+
+    async def call_onebot(self, action: str, params: dict[str, Any]) -> SendResult:
+        """原生 OneBot 动作直通（QQ 空间的 `send_qzone_msg` 等走这里）。
+
+        回执校验：帧里 `status == 'ok'` 或 `retcode == 0` → `ok=True` 且
+        `data=帧里的 data`；否则 `ok=False`，`error` 带上 status/retcode/message。
+        传输异常（超时 / 断连）时 `error` 以「结果未知，请勿自动重试」结尾。
+        """
+        ...
+
+    async def is_super_admin(self, user_id: str) -> bool:
+        """宿主管理员判定（用于动作权限表里的 `admin` 档）。
+
+        取不到（没实现、读不到管理员名单）一律返回 **False**——这个返回值是多条
+        `dangerous` 动作的唯一闸门，"读不到"必须等价于"没有权限"，不能反过来。
+        """
+        return False
+
+    async def set_input_status(self, target: dict[str, Any], typing: bool) -> SendResult:
+        """设置「正在输入」状态（NapCat `set_input_status`）。
+
+        `target` 是会话坐标 `{'platform','self_id','user_id','group_id','channel_id',
+        'is_group'}`；`typing=True` → `event_type=1`（开始输入），`False` → `2`。
+        群聊可能不支持：失败就是 `ok=False`，绝不抛。
+        """
+        ...
+
 
 class NullTransport:
     """全部方法安全降级的 `Transport`。
@@ -159,6 +267,7 @@ class NullTransport:
         participant: dict[str, Any],
         content: str,
         reply_to: Optional[str] = None,
+        voice: bool = False,
     ) -> SendResult:
         log_fallback('debug', 'Transport 未安装：私聊投递已跳过')
         return {'ok': False, 'error': 'transport-unavailable'}
@@ -168,11 +277,12 @@ class NullTransport:
         channel_id: str,
         content: str,
         reply_to: Optional[str] = None,
+        voice: bool = False,
     ) -> SendResult:
         log_fallback('debug', 'Transport 未安装：群投递已跳过')
         return {'ok': False, 'error': 'transport-unavailable'}
 
-    async def send_session(self, session: Any, content: str) -> SendResult:
+    async def send_session(self, session: Any, content: str, voice: bool = False) -> SendResult:
         log_fallback('debug', 'Transport 未安装：会话回复已跳过')
         return {'ok': False, 'error': 'transport-unavailable'}
 
@@ -205,6 +315,10 @@ class NullTransport:
     async def fetch_image(self, url: str) -> Optional[bytes]:
         return None
 
+    async def fetch_incoming_image(self, source: str) -> Optional[bytes]:
+        # 空传输层没有"宿主通道"这回事：回 `None`，调用方自然退回 `fetch_image()`。
+        return None
+
     async def fetch_audio(self, url: str) -> Optional[bytes]:
         return None
 
@@ -226,3 +340,33 @@ class NullTransport:
     async def deliver_background(self, delivery: dict[str, Any]) -> SendResult:
         log_fallback('debug', 'Transport 未安装：后台投递已跳过')
         return {'ok': False, 'error': 'transport-unavailable'}
+
+    # ---- 平台动作执行层 ----
+
+    async def platform_action(self, action: str, params: dict[str, Any]) -> SendResult:
+        log_fallback('debug', 'Transport 未安装：平台动作已跳过 动作=%s', action)
+        return {'ok': False, 'error': 'transport-unavailable', 'data': None}
+
+    async def request_text(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        data: Optional[dict[str, str]] = None,
+        timeout_ms: int = 20_000,
+    ) -> Optional[str]:
+        log_fallback('debug', '无传输层实现，原始 HTTP 请求被忽略 %s %s', method, url)
+        return None
+
+    async def call_onebot(self, action: str, params: dict[str, Any]) -> SendResult:
+        log_fallback('debug', 'Transport 未安装：OneBot 动作已跳过 动作=%s', action)
+        return {'ok': False, 'error': 'transport-unavailable', 'data': None}
+
+    async def set_input_status(self, target: dict[str, Any], typing: bool) -> SendResult:
+        log_fallback('debug', 'Transport 未安装：输入状态已跳过')
+        return {'ok': False, 'error': 'transport-unavailable', 'data': None}
+
+    async def is_super_admin(self, user_id: str) -> bool:
+        # 没有宿主就谈不上"宿主管理员"：一律 False（权限判定宁可从严）。
+        return False

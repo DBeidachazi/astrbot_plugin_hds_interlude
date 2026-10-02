@@ -56,6 +56,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import json
 import math
 import re
@@ -69,7 +70,12 @@ from ..agency import (
     normalize_agency_window_draft,
     normalize_proactive_contact,
     proactive_recheck_at,
+    # 上游 1.0.1-rc25：主动联系温度三模式与每日上限。
+    resolve_proactive_daily_cap,
+    resolve_proactive_interval_minutes,
+    resolve_proactive_threshold,
 )
+from ..bubbles import strip_voice_marker
 from ..delivery import (
     attach_message_event,
     delivery_entry_metadata,
@@ -92,7 +98,13 @@ from ..script.recall_navigation import recall_focus
 from ..script.scene_frame import advance_scene_frame, project_scene_frame, resolve_dialogue_burst
 from ..script.timeline_routing import needs_timeline_director
 from ..script.validator import validate_script_commit
-from ..story_state import decode_story_state, encode_story_state, normalize_continuity_snapshot
+from ..story_state import (
+    append_proactive_contact,
+    count_proactive_contacts_in_window,
+    decode_story_state,
+    encode_story_state,
+    normalize_continuity_snapshot,
+)
 from ..time import dt_ms, format_log_time, iso, parse_dt, utc_now
 from ..turn_persistence import script_entry_draft_for_commit
 from ..urge import commit_urge, normalize_urge_state, urge_burst_active
@@ -111,9 +123,11 @@ except ImportError:  # pragma: no cover
 
 from .helpers import (
     automatic_delivery_from_payload,
+    backfilled_quote_content,
     clip,
     describe_timeline_plan_rejection,
     detect_live_script_time_overflow,
+    detect_message_repetition,
     extract_user_reported_times,
     group_due_intents,
     has_required_narrative_script,
@@ -141,6 +155,27 @@ from .helpers import (
 # 上游 `normalizeVisibleMessageContent`（`service.ts` 模块级函数）在 helpers.py 里是
 # 私有名；它决定跨账号主动联系的可见文本契约（去掉括号标签等），必须与群回复同源。
 from .helpers import _normalize_visible_message_content as normalize_visible_message_content
+
+def _quote_text(value: Any, *keys: str) -> str:
+    """按 camelCase 优先从引文里读字符串（缺值给空串）。"""
+    if not isinstance(value, dict):
+        return ''
+    for key in keys:
+        found = value.get(key)
+        if found not in (None, ''):
+            return str(found)
+    return ''
+
+
+def _quote_entry_id(value: Any) -> Optional[int]:
+    """`msg-<条目id>` → 条目 id；不是这个形状就返回 None。"""
+    for key in ('messageId', 'message_id', 'messageRef', 'message_ref', 'id'):
+        raw = _quote_text(value, key).strip()
+        match = re.match(r'^msg-(\d+)$', raw)
+        if match:
+            return int(match.group(1))
+    return None
+
 
 __all__ = ['ServiceChunk4']
 
@@ -175,6 +210,8 @@ _DUAL_ELEMENT_KEYS = (
 
 _DUAL_SINGLE_KEYS = (
     'followUpCommitment', 'localMedia', 'nativeFace', 'groupReply',
+    # 共同作品：模型提出的修改稿 / 异步写手请求（上游 works.ts 的两个入口字段）。
+    'workProposal', 'workRequest',
     'automaticDeliverySummary', 'agencyWindow', 'proactiveContact', 'statePatch',
     'authoredActions', 'lifeHandoff', 'intentUpdates',
 )
@@ -279,6 +316,11 @@ def _cfg(section: Any, camel: str, default: Any = None) -> Any:
 
 def _record(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _without_voice_marker(value: Any) -> Any:
+    """删掉正文语音标记（v1.7.7）：只处理字符串，其它形状原样返回。"""
+    return strip_voice_marker(value)[0] if isinstance(value, str) else value
 
 
 def _automation(story: Any) -> dict[str, Any]:
@@ -611,6 +653,58 @@ def _create_fact_query(
     return '\n'.join(part for part in parts if part)
 
 
+def _structured_group_reply_ok(value: Any) -> bool:
+    """上游 `hasStructuredGroupReplyField`：顶层 groupReply 是否已构成合法群回复。"""
+    if not isinstance(value, dict):
+        return False
+    mode = value.get('mode')
+    if mode == 'none':
+        return True
+    if mode != 'immediate':
+        return False
+    content = value.get('content')
+    return isinstance(content, str) and bool(content.strip())
+
+
+def hoist_participantless_interaction(decision: Any, phase: str) -> tuple[Any, str]:
+    """上游 1.0.1-rc22 `hoistParticipantlessInteraction`（移植版同名）。
+
+    无参与者的回合（群聊 user-message、advance 等）如果模型把回复写进了
+    `interaction.reply`，commit-builder 会为这个没有 participant 的回复生成
+    `outgoing-message` 事件，结构校验直接拒掉整个提交 —— 症状是「群聊整回合静默」
+    （用户 2026-09-26 的日志）。这里统一容错：
+
+    - 私聊形态的 immediate 回复落在 `user-message` 相位且顶层还没有合法 `groupReply`
+      → **提升**为 `groupReply`（`replyTo` 一并带过），清空 `interaction`；
+    - 其余情形（delayed、advance 等本无回复通道的相位、已有 groupReply）
+      → 只清空 `interaction`，不提升。
+
+    返回 `(decision, 处理标签)`；标签为空串表示没动过。
+    """
+    if not isinstance(decision, dict):
+        return decision, ''
+    interaction = decision.get('interaction')
+    reply = interaction.get('reply') if isinstance(interaction, dict) else None
+    if not isinstance(reply, dict):
+        return decision, ''
+    mode = reply.get('mode')
+    content = reply.get('content')
+    if mode == 'none' or not isinstance(content, str) or not content.strip():
+        return decision, ''
+    if mode == 'immediate' and phase == 'user-message' and not _structured_group_reply_ok(decision.get('groupReply')):
+        hoisted = dict(decision)
+        forwarded: dict[str, Any] = {'mode': 'immediate', 'content': content}
+        reply_to = reply.get('replyTo', reply.get('reply_to'))
+        if reply_to:
+            forwarded['replyTo'] = reply_to
+        hoisted['groupReply'] = forwarded
+        hoisted.pop('interaction', None)
+        return hoisted, '提升为群发'
+    stripped = dict(decision)
+    stripped.pop('interaction', None)
+    return stripped, '剥离（无回复通道）'
+
+
 def _normalize_decision(
     raw: Any,
     from_dt: datetime,
@@ -813,6 +907,9 @@ class ServiceChunk4(ServiceBase):
                 'automatic_delivery': automatic_delivery,
                 'script_event': restore_message_event(intent.get('payload'), content),
             }
+            if payload.get('voice') is True:
+                # 正文 `<tts/>` 指定的语音分段（意图排期时写进 payload）。
+                message['voice'] = True
             delivered = await self.send_outgoing_messages(
                 story, [message], None, None,
                 lambda target: target.get('id') in self.interrupted_typing_participants,
@@ -841,6 +938,11 @@ class ServiceChunk4(ServiceBase):
             if automatic_delivery:
                 await self.record_automatic_delivery(story['id'], participant['id'], automatic_delivery, now)
             await self.record_character_message(participant, now)
+            # 本移植版：这条分段气泡已经投出去了，熄灭"正在输入"（下一条有自己的窗口，
+            # 由 `confirm_outgoing_deliveries` 按 `notBefore` 到点才点亮）。
+            ender = getattr(self, 'end_typing', None)
+            if callable(ender):
+                await ender(participant)
             await self.db_set('interlude_intent', {'id': intent['id']}, {'status': 'completed', 'updatedAt': now})
         if split_handled:
             await self.schedule_next_split_wake(story['id'])
@@ -1073,19 +1175,37 @@ class ServiceChunk4(ServiceBase):
         visual_observations: Optional[list[str]] = None,
         timeline_plan: Any = None,
         on_early_reply: Any = None,
+        attachments: Optional[list[dict[str, Any]]] = None,
+        sticker_groups: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """上游 `decide(story, participant, phase, from, now, ...)`（`:3437`）。
+
+        `attachments` 是**本移植版追加的末位可选参数**（受控偏离，见
+        `docs/PORTING_NOTES.md` §29）：本轮附带的媒体种类（照片 / 表情包 / 动画表情 /
+        QQ 商城表情 / 小程序卡片）。上游没有这个概念——它的适配器把种类信息丢在
+        解析层，模型只能一律看到 `[图片]`。追加在末尾，位置参数调用不受影响。
+
+        `sticker_groups` 同样追加在末尾（受控偏离 §48 甲）：**分组目录**
+        （`[{groupId, name, description, count}]`，不列条目）——两级选择的第一段。
+        与 `sticker_catalog` 互斥：给了分组目录就不平铺条目（那正是省 token 的地方）。
 
         主模型上下文的**唯一入口**。返回的 `NarrativeRequest` 是**发给模型的 wire
         format**：顶层与嵌套键全部保持上游 camelCase（见模块 docstring 第 3 条）。
         """
+        started = time.perf_counter()
         superseded_intents = superseded_intents or []
         images = images or []
         audio = audio or []
         extra_web_context = extra_web_context or []
         quoted_messages = quoted_messages or []
         sticker_catalog = sticker_catalog or []
+        sticker_groups = sticker_groups or []
         visual_observations = visual_observations or []
+        # 上游 1.0.1-rc23/rc26：到点世界事件在**本回合开始前**排水注入，于是它们本回合
+        # 就出现在 recentScript 里（先进账、后写作）。`low` 只在非 user-message 相位
+        # 排水，免得一条无关紧要的背景事件劫持对话回合。
+        if getattr(self, 'world_seeder_available', None) and self.world_seeder_available():
+            await self.drain_due_seeded_events(story, now, phase != 'user-message')
         runtime = self.runtime_config
         shared = self.shared_story_config
         memory = self.memory_config
@@ -1165,6 +1285,12 @@ class ServiceChunk4(ServiceBase):
             and not prompt_entries
         ):
             raise ValueError('Narrative context integrity failure: visible raw history did not reach recentScript.')
+        # 上游 1.0.1-rc18：条数锚定只对私聊对话回合生效（群聊与推进回合不注入守卫）。
+        repetition = (
+            detect_message_repetition(prompt_entries)
+            if (phase in ('user-message', 'conversation-follow-up') and not group_context)
+            else None
+        )
         decoded_state = decode_story_state(story.get('state'))
         scene_frame = project_scene_frame({
             'story_id': story['id'],
@@ -1281,6 +1407,26 @@ class ServiceChunk4(ServiceBase):
                 },
                 3 if (user_message and user_message.strip()) else 1,
             )
+        # 本移植版：共同作品（works）的当前投影与工作模式；没启用/没这部作品时为 None。
+        shared_work = None
+        works_mode = None
+        works_state = getattr(self, 'shared_work_state', None)
+        if callable(works_state):
+            try:
+                shared_work = await works_state(story, participant)
+                # 工作模式从 `works` 配置组读（chunk14 的 `works_config()`），缺省 main。
+                config_reader = getattr(self, 'works_config', None)
+                config = config_reader() if callable(config_reader) else {}
+                works_mode = pick(config, 'generationMode', 'generation_mode') or 'main'
+            except Exception as error:  # noqa: BLE001 - 作品投影失败不该挡住叙事
+                self.report('warn', story, phase, '共同作品投影失败 错误=%s', error)
+                shared_work = None
+        # 本移植版：把"这一回合她实际能对平台做什么"算好随请求带下去（提示词只列启用项）。
+        # 权限表、配置开关、会话身份都在 chunk12 判完；这里只负责取一份结果。
+        action_scopes = ('private', 'group') if group_context else ('private',)
+        platform_actions = self.available_platform_actions(
+            self.resolve_action_session_role(participant), action_scopes,
+        )
         # 发给模型的请求：键名逐字保持上游 camelCase。
         request: dict[str, Any] = {
             'urgeEnabled': _cfg(self.urge_config, 'enabled', False) and not any(
@@ -1297,11 +1443,23 @@ class ServiceChunk4(ServiceBase):
             'images': images,
             'audio': audio,
             'visualObservations': visual_observations,
+            'attachments': attachments or [],
             'timelinePlan': timeline_plan,
             'developmentTendencies': development_tendencies,
+            # M4 §十：通道路由事实（注册表命中才给；单平台时为 None → 不标注）。
+            'channelData': await self.channel_data_for(
+                story, participant, group_context, prompt_entries,
+            ) if phase != 'advance' else None,
             'writingOptions': {
                 'messageSeparator': (str(_cfg(runtime, 'messageSeparator', '')).strip() or '<sep/>'),
                 'splitReplyMessages': _cfg(runtime, 'splitReplyMessages', True) is not False,
+                # v1.7.7：正文语音标记 `<tts/>`。关掉时这段提示词改成"不要写语音标记"
+                # （模型压根不知道这个 token 存在，别教它用一个不会生效的东西）。
+                'ttsEnabled': bool(self.voice_reply_enabled),
+                # 上游 1.0.1-rc18：只在**私聊对话回合**注入条数守卫（推进回合与群聊不注入）。
+                **({
+                    'messageRepetition': repetition,
+                } if repetition else {}),
                 'browserMode': (
                     'disabled'
                     if (not _cfg(self.browser_config, 'enabled', False)
@@ -1330,6 +1488,12 @@ class ServiceChunk4(ServiceBase):
             'facts': facts,
             'groupContext': group_context,
             'chatCapabilities': chat_capabilities,
+            # 共同作品：把当前共享文本的投影与工作模式带下去（启用时才给；内容不受信）。
+            **({} if shared_work is None else {'sharedWork': shared_work}),
+            **({} if works_mode is None else {'worksMode': works_mode}),
+            # 双拼写：提示词渲染侧两种写法都认（跨 chunk 传参的既有约定，见坑 41）。
+            'platformActions': platform_actions,
+            'platform_actions': platform_actions,
             'contactThreads': await self.contact_threads(story['id'], facts, participant_id) if memory_enabled else [],
             'sceneFrame': scene_frame,
             'dialogueBurst': dialogue_burst,
@@ -1354,10 +1518,14 @@ class ServiceChunk4(ServiceBase):
             ),
             'onEarlyReply': on_early_reply,
         }
+        quoted_messages = await self._backfill_quoted_messages(story, quoted_messages, prompt_entries)
         if quoted_messages:
             request['quotedMessages'] = quoted_messages
         if sticker_catalog and phase == 'user-message':
             request['stickerCatalog'] = sticker_catalog
+        # 两级选择的第一段（§48 甲）：只给分组目录、不列条目。
+        if sticker_groups and phase == 'user-message':
+            request['stickerGroupCatalog'] = sticker_groups
         # 本地扩展：生活活力（防停滞 / 生活钩子 / 长线剧情）。停滞判定要看几个小时，
         # 不能用按 60 分钟时间窗裁过的 recent_entries，单独取最近 40 条。
         vitality_context = vitality.request_context(
@@ -1372,9 +1540,51 @@ class ServiceChunk4(ServiceBase):
                     safe_json_preview(vitality_context.get('lifeStagnation')) if vitality_context.get('lifeStagnation') else '无',
                     '、'.join(item['title'] for item in vitality_context.get('activeArcs') or []) or '无',
                 )
+        # 上轮上下文构成（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.4）：只记装配侧的量，
+        # 真正的 token 账单在模型中心的用量账里。诊断记账失败不影响本回合。
+        await self.record_context_metrics(
+            story, request, (time.perf_counter() - started) * 1000.0, phase,
+            participant_id or '', now,
+        )
         return _resync_dual(resolve_authored_actions(
             await self.narrator.decide(request), False, separator,
         ))
+
+    async def _backfill_quoted_messages(
+        self, story: Any, quoted_messages: Any, entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """补出被回复消息的正文（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）。
+
+        平台只给一个 id 时，模型看到的是"引用了某条看不见的消息"——比不引用更糟。
+        先在本回合的条目里找，找不到再按 `msg-<条目id>` 去库里取那一条（我们自己发出去的
+        消息用的就是这种 id）。补上的条目带 `backfilled: True`，日志里能分清
+        "平台给的引文"和"我们补出来的引文"。
+        """
+        rows = [item for item in (quoted_messages or []) if isinstance(item, dict)]
+        if not rows:
+            return []
+        resolved = list(entries or [])
+        result: list[dict[str, Any]] = []
+        for quote in rows:
+            if _quote_text(quote, 'content').strip():
+                result.append(quote)
+                continue
+            content = backfilled_quote_content(quote, resolved)
+            if not content:
+                # 合成 id 指向的条目可能不在本回合窗口里：补一次按 id 的精确查询。
+                wanted = _quote_entry_id(quote)
+                if wanted is not None:
+                    found = await self.db_get('interlude_script_entry', {
+                        'storyId': pick(story, 'id'), 'id': wanted,
+                    })
+                    if found:
+                        resolved = [*resolved, *found]
+                        content = backfilled_quote_content(quote, resolved)
+            if not content:
+                result.append(quote)
+                continue
+            result.append({**quote, 'content': content, 'backfilled': True})
+        return result
 
     # ------------------------------------------------------------------ #
     # shouldRefreshContinuity（上游 :3604）
@@ -1601,18 +1811,24 @@ class ServiceChunk4(ServiceBase):
         turn_query_embedding: Optional[list[float]] = None,
         visual_observations: Optional[list[str]] = None,
         on_early_reply: Any = None,
+        attachments: Optional[list[dict[str, Any]]] = None,
+        sticker_groups: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """上游 `tryDecide(...)`（`:3720`）。
 
         参数顺序与上游**逐字对齐**（位置参数），因为 `chunk3.flush_buffered_narrative`
         等兄弟成员按位置调用它。返回 dict 同时提供 `timelinePlan` / `timeline_plan`
         与 `effectiveNow` / `effective_now`（跨 chunk 双读）。
+
+        `sticker_groups`（末位追加，受控偏离 §48 甲）是两级选择第一段的分组目录，
+        原样透传给 `decide()`（三次重写调用都要带上，否则重写那一遍会退回平铺目录）。
         """
         superseded_intents = superseded_intents or []
         images = images or []
         audio = audio or []
         quoted_messages = quoted_messages or []
         sticker_catalog = sticker_catalog or []
+        sticker_groups = sticker_groups or []
         visual_observations = visual_observations or []
         immediate_observations: list[dict[str, Any]] = []
         effective_now = now
@@ -1672,7 +1888,8 @@ class ServiceChunk4(ServiceBase):
                 story, participant, phase, from_, effective_now, user_message, due_intents,
                 superseded_intents, group_context, images, audio, [], False, chat_capabilities,
                 quoted_messages, sticker_catalog, turn_query_embedding, visual_observations,
-                timeline_plan, early_reply if can_early_reply else None,
+                timeline_plan, early_reply if can_early_reply else None, attachments,
+                sticker_groups,
             )
             immediate = None
             if (
@@ -1698,6 +1915,7 @@ class ServiceChunk4(ServiceBase):
                     superseded_intents, group_context, images, audio, immediate_observations, False,
                     chat_capabilities, quoted_messages, sticker_catalog, turn_query_embedding,
                     visual_observations, timeline_plan, early_reply if can_early_reply else None,
+                    attachments, sticker_groups,
                 )
             # 用户自报的钟点（「八点赶到」）对守卫背书：模型复述它们不是时间越界。
             # 提取是 O(消息长度) 的本地正则，只在实况用户回合发生一次。
@@ -1734,6 +1952,10 @@ class ServiceChunk4(ServiceBase):
                 # 诊断：记录被抛弃草稿里模型实际返回的 interaction（缺失/为空/形状错误），
                 # 让下一次「结构化可见回复缺失」可以直接从日志定位是模型行为还是解析问题。
                 if initial_visible_recovery:
+                    # 上游 rc28 健康指标：结构化可见回复缺失（触发重写的那一类）。
+                    health = getattr(self, 'health', None)
+                    if health is not None:
+                        health.record_structure_missing(pick(story, 'id'))
                     # ⚠️ 这条必须是**可见**的：core 的 `diagnostic` 频道在默认
                     # `logging.verbosity` 下一个字都不打（见 AGENTS.md 坑 25），而
                     # 「一个已经写好的回合被白重写一次」正是运维最需要看见的事。
@@ -1761,6 +1983,7 @@ class ServiceChunk4(ServiceBase):
                     superseded_intents, group_context, images, audio, immediate_observations, True,
                     chat_capabilities, quoted_messages, sticker_catalog, turn_query_embedding,
                     visual_observations, timeline_plan, early_reply if can_early_reply else None,
+                    attachments, sticker_groups,
                 )
                 recovered_time_overflow = detect_live_script_time_overflow(
                     _raw_decision(decision, 'script'), phase, from_, effective_now, timezone, endorsed_clocks,
@@ -1781,18 +2004,36 @@ class ServiceChunk4(ServiceBase):
                             'standard', 'info', story, phase,
                             '恢复稿省略了结构化回复字段，已按剧本补齐 类型=%s', repaired,
                         )
+                if not requires_visible_reply_recovery(phase, group_context, decision):
+                    # 重写把结构化回复救回来了（上游 rc28 的「挽回」计数）。
+                    health = getattr(self, 'health', None)
+                    if health is not None and initial_visible_recovery:
+                        health.record_recovery_saved(pick(story, 'id'))
                 if (
                     main_available and not early_reply_committed
                     and requires_visible_reply_recovery(phase, group_context, decision)
                 ):
-                    self.report_operation(
-                        'diagnostic', 'warn', story, phase,
-                        '恢复尝试仍缺失结构化回复 interaction=%s',
-                        safe_json_preview(_record(decision).get('interaction')),
-                    )
-                    raise ValueError(
-                        'Narrative provider omitted the required visible-reply structure after one recovery attempt.',
-                    )
+                    # 上游 1.0.1-rc24/rc28：两稿都缺结构化回复时**降级为无可见回复提交**，
+                    # 不再抛错。旧写法会进 60 秒重试队列，弱模型下变成失败循环，而剧本
+                    # 本身是好的 —— 推进不该因为一个传输字段缺失而停摆。
+                    preview = safe_json_preview(_record(decision).get('interaction'))
+                    if has_required_narrative_script(decision):
+                        self.report_operation(
+                            'standard', 'warn', story, phase,
+                            '结构化回复两稿均缺失，降级为无可见回复提交（剧本推进不受影响）interaction=%s',
+                            preview,
+                        )
+                        decision = dict(_record(decision))
+                        decision.pop('interaction', None)
+                        decision.pop('groupReply', None)
+                    else:
+                        self.report_operation(
+                            'standard', 'warn', story, phase,
+                            '恢复尝试仍缺失结构化回复且没有可用剧本 interaction=%s', preview,
+                        )
+                        raise ValueError(
+                            'Narrative provider omitted the required visible-reply structure after one recovery attempt.',
+                        )
             # 固定的叙事契约要求每个真实模型回合都有散文。一个语法合法但省略/留空
             # script 的对象过去会被当成成功，推进游标却在生活记录里留下空洞。
             # 把它当成 provider 失败，实况用户回合走既有的持久化重试路径，
@@ -1908,6 +2149,18 @@ class ServiceChunk4(ServiceBase):
                 '即时回复的对话与本回合不一致，已改投等待来信的那条：本回合=%s 改投=%s',
                 participant_id or '(无)', reply_route['redirect_to'],
             )
+        if not participant_id:
+            # 上游 1.0.1-rc22：无参与者回合的 interaction 形态回复统一容错。
+            raw, hoist_label = hoist_participantless_interaction(raw, phase)
+            if hoist_label:
+                self.report_operation(
+                    'standard', 'info', story, phase,
+                    '无参与者回合已重排 interaction 回复 原mode=%s 处理=%s',
+                    _record(_raw_decision(raw, 'interaction')).get('reply', {}).get('mode') if isinstance(
+                        _record(_raw_decision(raw, 'interaction')).get('reply'), dict,
+                    ) else '(缺失)',
+                    hoist_label,
+                )
         refresh_continuity = self.should_refresh_continuity(story, phase)
         decision = _normalize_decision(
             raw, from_, now, permit_messages, self.effective_urge_runtime, shared,
@@ -2142,29 +2395,61 @@ class ServiceChunk4(ServiceBase):
                         None,
                     )
                     urge_config = self.urge_config
-                    capacity_config = self.agency_config
+                    burst_interval = None
                     if _cfg(urge_config, 'enabled', False) and urge_burst_active(
                         normalize_urge_state(
                             _record(_record(state.get('extensions')).get('urge')), dt_ms(now),
                         ),
                         dt_ms(now), urge_config, agency_candidate['participant_id'],
                     ):
-                        capacity_config = {
-                            **self.agency_config, 'minimumProactiveIntervalMinutes': urge_config.get('contact_min'),
-                        }
+                        # 上游 1.0.1-rc25：Urge 爆发期把安全间隔压到 contactMin，**优先于**
+                        # 自然/平衡模式的 30 分钟。容量硬门（设备/隐私/负荷）三模式都不变。
+                        burst_interval = urge_config.get('contact_min')
+                    capacity_config = {
+                        **self.agency_config,
+                        'minimumProactiveIntervalMinutes': resolve_proactive_interval_minutes(
+                            self.agency_config, burst_interval,
+                        ),
+                    }
                     capacity = evaluate_agency_capacity(
                         agency_window, agency_candidate, now, capacity_config,
                         _record(_record(target).get('state')).get('lastCharacterMessageAt'),
                     )
                     willingness = agency_candidate.get('willingness') or 0
-                    willingness_passes = willingness >= float(
-                        _cfg(self.effective_urge_runtime, 'proactiveWillingnessThreshold', 0.65)
+                    willingness_passes = willingness >= resolve_proactive_threshold(
+                        self.agency_config,
+                        _cfg(self.effective_urge_runtime, 'proactiveWillingnessThreshold', 0.65),
                     )
+                    # 上游 1.0.1-rc25：每参与者每 24 小时的主动联系上限（0 = 不限）。
+                    daily_cap = resolve_proactive_daily_cap(self.agency_config)
+                    daily_count = count_proactive_contacts_in_window(
+                        _record(state).get('proactive_contact_log'),
+                        agency_candidate['participant_id'], now,
+                    )
+                    cap_passes = daily_cap <= 0 or daily_count < daily_cap
                     agency_allows_send = (
                         agency_candidate.get('outcome') == 'send-now'
-                        and bool(capacity.get('allowed')) and willingness_passes
+                        and bool(capacity.get('allowed')) and willingness_passes and cap_passes
                     )
-                    if not agency_allows_send and agency_candidate.get('outcome') != 'let-go' and willingness_passes:
+                    health = getattr(self, 'health', None)
+                    if health is not None:
+                        # 上游 rc28：主动联系候选一次（`sent` = 真的决定发出）。
+                        health.record_proactive(pick(story, 'id'), agency_allows_send)
+                    if agency_allows_send:
+                        # 上游：只有允许发送时才写审计窗（入列不等于发送成功）；
+                        # 它是每日上限的计数来源，且**不进模型上下文**。
+                        next_state['proactive_contact_log'] = append_proactive_contact(
+                            _record(next_state).get('proactive_contact_log'),
+                            agency_candidate['participant_id'], iso(now),
+                            # 上游 M3：审计行带上实际使用的端点（多通道归因的依据）。
+                            self.resolve_most_active_endpoint_id(agency_candidate['participant_id']) or '',
+                        )
+                    if (
+                        not agency_allows_send
+                        and agency_candidate.get('outcome') != 'let-go'
+                        and willingness_passes
+                        and cap_passes
+                    ):
                         agency_recheck = {
                             'candidate': agency_candidate,
                             'window': agency_window,
@@ -2173,10 +2458,13 @@ class ServiceChunk4(ServiceBase):
                         }
                     self.report_operation(
                         'standard', 'info', story, phase,
-                        'Agency 主动联系判断 参与者=%s 结果=%s 原因=%s 意愿=%s',
+                        'Agency 主动联系判断 参与者=%s 结果=%s 原因=%s 意愿=%s 模式=%s 日上限=%s/%s',
                         agency_candidate['participant_id'],
                         '立即联系' if agency_allows_send else ('稍后重查' if agency_recheck else '自然放下'),
-                        capacity.get('reason'), '%.2f' % willingness,
+                        capacity.get('reason') if capacity.get('allowed') or cap_passes else 'proactive-daily-cap',
+                        '%.2f' % willingness,
+                        self.agency_config.get('contact_mode') or 'strict',
+                        daily_count, '不限' if daily_cap <= 0 else daily_cap,
                     )
                 if agency_window:
                     self.report_operation(
@@ -2256,12 +2544,15 @@ class ServiceChunk4(ServiceBase):
             and reply.get('content') and reply.get('sendAt')
         ):
             send_at = parse_dt(reply['sendAt'])
+            # v1.7.7：延迟回复的 payload 是**给模型看的草稿**（到期回合会重新决策），
+            # 标记是投递意图、不是她要说的字——按同一口径删掉，别让 `<tts/>` 混进
+            # 提示词里的 "The protagonist wanted to send …"。
             await self.append_intent(story['id'], {
                 'type': 'delayed-reply',
                 'summary': 'The character decided to send a delayed reply.',
                 'not_before': reply['sendAt'],
                 'payload': {
-                    'content': reply['content'],
+                    'content': _without_voice_marker(reply['content']),
                     'userInitiated': phase == 'user-message',
                     'interaction': True,
                     **({
@@ -2344,7 +2635,7 @@ class ServiceChunk4(ServiceBase):
                     'summary': 'The character planned a message to another relationship branch.',
                     'not_before': send_at_value,
                     'payload': {
-                        'content': action.get('content'),
+                        'content': _without_voice_marker(action.get('content')),
                         'userInitiated': False,
                         'crossConversation': True,
                         'willingness': action.get('willingness'),
@@ -2367,7 +2658,7 @@ class ServiceChunk4(ServiceBase):
         prepared: list[dict[str, Any]] = []
         for message in messages:
             prepared_message = prepare_outgoing_delivery(
-                message, self.split_outgoing_message(message['content']),
+                message, self.split_outgoing_segments(message['content']),
             )
             if prepared_message:
                 prepared.append(prepared_message)

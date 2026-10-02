@@ -66,7 +66,23 @@ EXPECTED_TABLES = [
     'interlude_web_observation',
     'interlude_overlay_snapshot',
     'interlude_sticker',
+    # 本移植版新增（v1.8.3，§47）：表情库**分组注册表**。
+    # ⚠️ 表名是复数：`interlude_sticker.group` 的索引就叫 `interlude_sticker_group`，
+    # 而 SQLite 里索引与表共用命名空间，单数表名会撞索引名。
+    'interlude_sticker_groups',
     'interlude_schedule_preplan',
+    # 上游 1.0.1-rc23：世界播种器的事件表。
+    'interlude_seeded_event',
+    # 上游 1.0.1-rc28（M1a/M1b）：端点注册表与剧本别名。
+    'interlude_endpoint',
+    'interlude_story_alias',
+    # 本移植版新增：控制台「Token 统计」页的账本。
+    'interlude_token_usage',
+    # 上游 rc28 的 QQ 空间动作账本（P3 解禁后补上）与本移植版的定时命令表。
+    'interlude_qzone_post',
+    'interlude_scheduled_command',
+    # 上游 rc28 的共同作品表（P3 解禁后补上）。
+    'interlude_work',
 ]
 
 #: `(表, 主键, 是否自增)` —— 直接抄自 database.ts 的 `primary` / `autoInc`。
@@ -83,8 +99,16 @@ EXPECTED_PRIMARY = {
     'interlude_web_observation': ('id', True),
     'interlude_overlay_snapshot': ('id', True),
     'interlude_sticker': ('id', True),
+    'interlude_sticker_groups': ('groupId', False),
     # 日程预排是每剧本一行，主键是 `storyId`（非自增）。
     'interlude_schedule_preplan': ('storyId', False),
+    'interlude_seeded_event': ('id', True),
+    'interlude_endpoint': ('id', False),
+    'interlude_story_alias': ('aliasStoryId', False),
+    'interlude_token_usage': ('id', True),
+    'interlude_qzone_post': ('id', True),
+    'interlude_scheduled_command': ('id', True),
+    'interlude_work': ('id', False),
 }
 
 #: `indexes` / `unique` 选项 → 期望存在的索引列（顺序照抄 database.ts）。
@@ -102,6 +126,8 @@ EXPECTED_INDEXES = {
     'interlude_overlay_snapshot': ['storyId', 'status', 'target', 'periodEnd'],
     # `unique: ['assetId']` 与 `indexes` 合在一起。
     'interlude_sticker': ['assetId', 'status', 'group', 'updatedAt'],
+    # 分组描述表：主键就是目录名，所以没有 `name` 列、也没有名字唯一索引。
+    'interlude_sticker_groups': ['updatedAt'],
     'interlude_schedule_preplan': ['validThrough', 'lastReviewedLocalDate'],
 }
 
@@ -137,11 +163,15 @@ EXPECTED_COLUMNS = {
     'interlude_fact': [
         'knowledge', 'id', 'storyId', 'participantId', 'scope', 'content', 'importance',
         'confidence', 'unresolved', 'embedding', 'status', 'sourceEntryIds', 'lastSeenAt',
+        # 本移植版新增（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §4）：召回回写，遗忘评分用。
+        'accessCount', 'lastAccessAt',
         'createdAt', 'updatedAt',
     ],
     'interlude_state_patch': [
         'id', 'storyId', 'participantId', 'target', 'path', 'proposedValue', 'evidence',
         'confidence', 'impact', 'status', 'sourceEntryIds', 'createdAt', 'appliedAt',
+        # 本移植版新增（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.3）：审批与回滚留痕。
+        'decidedAt', 'decisionNote',
     ],
     'interlude_web_observation': [
         'id', 'storyId', 'participantId', 'intentId', 'mode', 'query', 'url', 'title',
@@ -153,13 +183,53 @@ EXPECTED_COLUMNS = {
     ],
     'interlude_sticker': [
         'id', 'assetId', 'filePath', 'group', 'mimeType', 'animated', 'size', 'hash',
-        'description', 'aliases', 'status', 'embedding', 'createdAt', 'updatedAt',
+        'description', 'aliases', 'status', 'embedding',
+        # 本移植版新增（v1.8.0）：手工短名 / 来源 / 用过几次 / 「描述是人写的」标记
+        # （旧库走增量补列，读取侧把 NULL 当空串 / 0 / False）。
+        'name', 'source', 'uses', 'descriptionManual',
+        # v1.8.0 第二层判据（§45.7）：这一条是**识图模型猜出来的**表情包。
+        'guessed',
+        # v1.8.4（§48）：归属是谁定的——`groupGuessed` = 模型读描述时定的，
+        # `groupManual` = 人定的（控制台移动 / 上传指定 / 目录扫描带进来的）。
+        'groupGuessed', 'groupManual',
+        # v1.8.4（§50）：**这一行的启用状态是谁定的**（'' / model / manual）。
+        'disabledBy',
+        'createdAt', 'updatedAt',
+    ],
+    'interlude_sticker_groups': [
+        # 分组描述表：`groupId` **就是磁盘目录名**（= `interlude_sticker.group`），
+        # 表只补"描述与时间"——所以没有 `name` 列（组名 = 目录名，唯一特例是内置组
+        # 的显示名「未整理」，那是常量不是数据）。
+        # `autoCreated` = 这一行由**模型自动归组**建的（只有它占自动建组额度）。
+        'groupId', 'description', 'autoCreated', 'createdAt', 'updatedAt',
     ],
     'interlude_schedule_preplan': [
         'storyId', 'revision', 'timezone', 'validFrom', 'validThrough',
         'lastReviewedLocalDate', 'lastEvidenceEntryId', 'reviewReason', 'regimes',
         'exceptions', 'materializedDays', 'createdAt', 'updatedAt',
     ],
+    'interlude_seeded_event': [
+        'id', 'storyId', 'summary', 'importance', 'occursAt', 'expiresAt', 'status',
+        'subjects', 'sourcePayload', 'injectedEntryId', 'createdAt', 'updatedAt',
+    ],
+    'interlude_endpoint': [
+        'id', 'ownerKind', 'ownerId', 'channelKind', 'platform', 'accountKey', 'selfId',
+        'userId', 'channelId', 'groupId', 'conversationKind', 'enabled', 'createdAt', 'updatedAt',
+    ],
+    'interlude_story_alias': ['aliasStoryId', 'canonicalStoryId', 'reason', 'createdAt'],
+    'interlude_token_usage': [
+        'id', 'day', 'storyId', 'task', 'model', 'provider',
+        'inputTokens', 'outputTokens', 'cachedTokens', 'calls', 'createdAt', 'updatedAt',
+    ],
+    'interlude_qzone_post': [
+        'id', 'storyId', 'kind', 'tid', 'targetUin', 'content', 'ugcRight', 'endpointId',
+        'status', 'error', 'createdAt', 'postedAt',
+    ],
+    'interlude_scheduled_command': [
+        'id', 'storyId', 'command', 'params', 'cron', 'enabled', 'nextRunAt', 'lastRunAt',
+        'lastStatus', 'lastError', 'runCount', 'createdAt', 'updatedAt',
+    ],
+    'interlude_work': ['id', 'storyId', 'participantId', 'generation', 'state'],
 }
 
 #: sqlite3 类型映射断言（`unsigned`/`double`/`boolean`/`json`/`timestamp`）。
@@ -173,6 +243,8 @@ EXPECTED_TYPES = {
                        'lastSeenAt': 'TEXT'},
     'interlude_scene': {'entryCount': 'INTEGER', 'lastEntryId': 'INTEGER', 'hook': 'TEXT'},
     'interlude_sticker': {'animated': 'INTEGER', 'size': 'INTEGER', 'aliases': 'TEXT'},
+    'interlude_sticker_groups': {'groupId': 'TEXT', 'description': 'TEXT',
+                                 'autoCreated': 'INTEGER'},
     'interlude_schedule_preplan': {'revision': 'INTEGER', 'validFrom': 'TEXT',
                                    'regimes': 'TEXT', 'exceptions': 'TEXT',
                                    'materializedDays': 'TEXT'},
@@ -262,12 +334,13 @@ class _DatabaseTestCase(unittest.TestCase):
 class RegisterTablesTests(_DatabaseTestCase):
     """对应上游 `registerTables(ctx)`：13 张表一次性建成。"""
 
-    def test_all_thirteen_tables_created(self):
+    def test_all_twenty_tables_created(self):
         created = self.db.register_tables()
         self.assertEqual(sorted(created), sorted(EXPECTED_TABLES))
         self.assertEqual(sorted(self._table_names()), sorted(EXPECTED_TABLES))
-        # `TABLES` 注册表本身也是 13 项。
-        self.assertEqual(len(TABLES), 13)
+        # `TABLES` 注册表本身是 21 项（13 张原有表 + rc23 事件表 + rc28 端点/别名表
+        # + Token 账本 + QQ 空间账本 + 定时命令表 + 本移植版的共同作品表与表情库分组表）。
+        self.assertEqual(len(TABLES), 21)
         self.assertEqual(db_mod.table_names(), EXPECTED_TABLES)
 
     def test_columns_match_upstream_declaration(self):
@@ -318,6 +391,31 @@ class RegisterTablesTests(_DatabaseTestCase):
         self.assertTrue(unique_indexes, 'assetId 的唯一索引没建出来')
         self.assertIn(['assetId'], [self._index_map('interlude_sticker')[name] for name in unique_indexes])
 
+    def test_sticker_group_rows_are_keyed_by_the_directory_name(self):
+        """v1.8.5（§47）：分组描述表的键**就是目录名**，一个目录名只能有一行。
+
+        "磁盘目录结构是分组的唯一事实来源"落在库里就是这一条：`groupId` 既是主键、
+        也是 `interlude_sticker.group` 的取值（= 落盘的一级目录名）。
+        """
+        self.db.register_tables()
+        self.db.insert('interlude_sticker_groups', {
+            'groupId': '猫猫', 'description': '撒娇用',
+            'createdAt': T0, 'updatedAt': T0,
+        })
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.insert('interlude_sticker_groups', {
+                'groupId': '猫猫', 'description': '再来一行',
+                'createdAt': T0, 'updatedAt': T0,
+            })
+        # 另一个目录名随便（它对应另一组）。
+        self.db.insert('interlude_sticker_groups', {
+            'groupId': '狗狗', 'description': '',
+            'createdAt': T0, 'updatedAt': T0,
+        })
+        self.assertEqual(self.db.count('interlude_sticker_groups'), 2)
+        stored = self.db.get('interlude_sticker_groups', {'groupId': '猫猫'})
+        self.assertEqual(stored['description'], '撒娇用', '列名 camelCase，描述原样存')
+
     def test_unsigned_double_boolean_json_timestamp_type_mapping(self):
         self.db.register_tables()
         for table, columns in EXPECTED_TYPES.items():
@@ -363,10 +461,11 @@ class RegisterTablesTests(_DatabaseTestCase):
         self.assertEqual(self.db.get('interlude_story', {'id': 'story-1'})['platform'], 'qq')
 
     def test_register_tables_adds_only_missing_tables(self):
-        """模拟旧安装：只有最早的一批表，后加的四张表应被补上。"""
+        """模拟旧安装：只有最早的一批表，后加的五张表应被补上（含 v1.8.3 的分组表）。"""
         self.db.register_tables()
         for table in ('interlude_web_observation', 'interlude_overlay_snapshot',
-                      'interlude_sticker', 'interlude_schedule_preplan'):
+                      'interlude_sticker', 'interlude_sticker_groups',
+                      'interlude_schedule_preplan'):
             self.db.conn.execute('DROP TABLE IF EXISTS "%s"' % table)
         self.db.conn.commit()
 
@@ -374,7 +473,8 @@ class RegisterTablesTests(_DatabaseTestCase):
         self.assertEqual(
             sorted(created),
             ['interlude_overlay_snapshot', 'interlude_schedule_preplan',
-             'interlude_sticker', 'interlude_web_observation'],
+             'interlude_sticker', 'interlude_sticker_groups',
+             'interlude_web_observation'],
         )
         self.assertEqual(sorted(self._table_names()), sorted(EXPECTED_TABLES))
 
@@ -450,6 +550,76 @@ class IncrementalColumnTests(_DatabaseTestCase):
             self.db.get('interlude_script_entry', {'id': rows[0]['id']})['embedding'],
             [0.25, -1.5],
         )
+
+    def test_missing_sticker_guessed_column_is_added(self):
+        """v1.8.0 第二层判据（§45.7）：旧 `interlude_sticker` 补 `guessed` 列。
+
+        造一个**没有** `guessed` 列的旧表（有 `hash` / `description`，够走过读取路径），
+        升级后旧行还在、`guessed` 是 NULL（读取侧当 False）。
+        """
+        self.db.conn.execute(
+            'CREATE TABLE interlude_sticker (\n'
+            '  "id" INTEGER,\n'
+            '  "assetId" TEXT,\n'
+            '  "hash" TEXT,\n'
+            '  "description" TEXT,\n'
+            '  PRIMARY KEY ("id" AUTOINCREMENT)\n'
+            ')',
+        )
+        self.db.conn.execute(
+            "INSERT INTO interlude_sticker (assetId, hash, description) "
+            "VALUES ('sticker-old', 'deadbeef', '旧的表情包')",
+        )
+        self.db.conn.commit()
+        self.assertNotIn('guessed', self._table_info('interlude_sticker'))
+
+        self.db.register_tables()
+
+        self.assertIn('guessed', self._table_info('interlude_sticker'))
+        rows = self.db.all('interlude_sticker')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['description'], '旧的表情包')
+        self.assertIsNone(rows[0]['guessed'], '补出来的旧行是 NULL（读取侧当 False）')
+        self.db.update('interlude_sticker', {'id': rows[0]['id']}, {'guessed': True})
+        # SQLite 的 boolean 落到列里就是 0/1（坑 8：`is True` 会漏掉它）；
+        # 读外部这一列的口径在 `console_api._truthy_boolean`。
+        self.assertEqual(self.db.get('interlude_sticker', {'id': rows[0]['id']})['guessed'], 1)
+
+    def test_missing_sticker_group_columns_are_added(self):
+        """v1.8.4（§48）：旧 `interlude_sticker` 补 `groupGuessed` / `groupManual` 两列。
+
+        旧行补出来是 NULL（读取侧当 False）——"这条素材的归属是谁定的"在旧库里
+        无从得知，按"没人定过"处理才不会让模型把用户摆好的东西搬走。
+        """
+        self.db.conn.execute(
+            'CREATE TABLE interlude_sticker (\n'
+            '  "id" INTEGER,\n'
+            '  "assetId" TEXT,\n'
+            '  "hash" TEXT,\n'
+            '  "group" TEXT,\n'
+            '  PRIMARY KEY ("id" AUTOINCREMENT)\n'
+            ')',
+        )
+        self.db.conn.execute(
+            "INSERT INTO interlude_sticker (assetId, hash, \"group\") "
+            "VALUES ('sticker-old', 'deadbeef', 'collected')",
+        )
+        self.db.conn.commit()
+        self.assertNotIn('groupGuessed', self._table_info('interlude_sticker'))
+
+        self.db.register_tables()
+
+        self.assertIn('groupGuessed', self._table_info('interlude_sticker'))
+        self.assertIn('groupManual', self._table_info('interlude_sticker'))
+        row = self.db.all('interlude_sticker')[0]
+        self.assertEqual(row['group'], 'collected')
+        self.assertIsNone(row['groupGuessed'], '补出来的旧行是 NULL（读取侧当 False）')
+        self.assertIsNone(row['groupManual'])
+        self.db.update('interlude_sticker', {'id': row['id']},
+                       {'groupGuessed': True, 'groupManual': False})
+        stored = self.db.get('interlude_sticker', {'id': row['id']})
+        self.assertEqual(stored['groupGuessed'], 1, 'boolean 落到列里就是 0/1')
+        self.assertEqual(stored['groupManual'], 0)
 
     def test_full_legacy_database_upgrades_in_place(self):
         """完整的旧库（缺 sticker / preplan / 两个新列）升级后 13 张表齐全。"""
@@ -606,6 +776,35 @@ class RowAccessTests(_DatabaseTestCase):
             self.db.update('interlude_story', {'id': 'x'}, {'statsu': 'typo'})
         with self.assertRaises(KeyError):
             self.db.count('interlude_story', {'id; DROP TABLE interlude_story': 1})
+
+    def test_count_by_groups_rows_by_column(self):
+        """v1.8.3（§47）：`count_by` 一次 `GROUP BY` 拿到每组的行数。
+
+        控制台「表情库」的分组列表要的就是这个：在 Python 侧把整张素材表拉出来
+        数个数是控制台最容易犯的错（每行还带 `embedding` 的 JSON）。
+        """
+        rows = (
+            ('a', 'collected'), ('b', 'collected'), ('c', 'cat'),
+            ('d', 'collected'), ('e', None),
+        )
+        for asset_id, group in rows:
+            self.db.insert('interlude_sticker', {'assetId': asset_id, 'group': group, 'hash': asset_id})
+        self.assertEqual(
+            self.db.count_by('interlude_sticker', 'group'),
+            {'collected': 3, 'cat': 1, '': 1},  # NULL 折成空串（"未分组"那一桶）
+        )
+        # `where` 与 `count()` 同一套语义（同一套 `_where_clause`）。
+        self.assertEqual(
+            self.db.count_by('interlude_sticker', 'group', {'assetId': 'a'}), {'collected': 1},
+        )
+        self.assertEqual(self.db.count_by('interlude_sticker', 'group', {'assetId': 'nope'}), {})
+        # 空表回空字典（不是 {'' : 0}）。
+        self.assertEqual(self.db.count_by('interlude_scene', 'status'), {})
+        # 拼错列名一律 KeyError：在 SQLite 里它只是回 0 行，静默比报错难查得多。
+        with self.assertRaises(KeyError):
+            self.db.count_by('interlude_sticker', 'groups')
+        with self.assertRaises(KeyError):
+            self.db.count_by('interlude_nope', 'group')
 
     def test_null_where_matches_is_null(self):
         self.db.insert('interlude_scene', {'storyId': 's1', 'status': 'active'})

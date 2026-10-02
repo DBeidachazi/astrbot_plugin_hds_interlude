@@ -271,6 +271,11 @@ def render_log_message(message: str, args: Optional[Sequence[Any]] = None) -> st
 # ---------------------------------------------------------------------------
 
 _RE_RETRY = re.compile(r"重试|再次尝试")
+#: **否定式**的"重试"（"请勿自动重试" / "不会自动重试" / "不再自动重试" …）。
+#: 我们自己给写动作写的失败口径就长这样——早先被 `/重试/` 命中，于是每条"结果未知"
+#: 的 warn 都顶着 `[自动重试]` 标签，**标签与正文说的是反话**（真机日志点名）。
+#: 判定时先把这些片段摘掉，剩下的才算"要重试"（`_mentions_retry`）。
+_RE_RETRY_NEGATED = re.compile(r"(?:勿|不|别|避免|禁止|停止)[^。；;，,]{0,8}?重试")
 _RE_HARD_FAIL = re.compile(r"模型调用失败|主叙事失败|消息投递失败")
 _RE_WARN_WORDS = re.compile(r"警告|拦截|不可用|失败")
 _RE_TRIGGER = re.compile(r"Alter.*(?:触发|超过阈值)|累积触发")
@@ -309,11 +314,21 @@ _PHASE_LABELS: Dict[str, str] = {
 }
 
 
+def _mentions_retry(message: str) -> bool:
+    """正文是不是在说"要重试"。
+
+    **否定式不算**：`结果未知，请勿自动重试` 是"别重试"，`已安排自动重试` 才是要重试。
+    判定就是把否定片段摘掉后再看剩下的文本——两种情况混在一句里（"已自动重试 1 次，
+    结果未知，请勿再重试"）也能各认各的。
+    """
+    return bool(_RE_RETRY.search(_RE_RETRY_NEGATED.sub("", message or "")))
+
+
 def detect_log_action(message: str, level: InterludeLogLevel) -> InterludeLogAction:
     """从日志文本 + 级别推断语义动作（顺序即优先级，与上游一致）。"""
     if level == "error":
         return "error"
-    if _RE_RETRY.search(message):
+    if _mentions_retry(message):
         return "retry"
     if _RE_HARD_FAIL.search(message):
         return "error"
@@ -379,7 +394,13 @@ def _log_category(
     phase: Optional["NarrativePhase"] = None,
     standalone: bool = False,
     message: str = "",
+    category: Optional[str] = None,
 ) -> str:
+    # 调用方知道**真实会话类型**时以它为准：这个标签是纯文案推断出来的，谁在正文里
+    # 写了一句"群聊不支持"就会被错标成 `[群聊]`（私聊里也照标）。能给出确切口径的
+    # 调用方（如输入状态按会话坐标判定）就把 `category` 显式传下来。
+    if category:
+        return str(category)
     if action == "trigger" or action == "emotion" or _RE_CATEGORY_ALTER.search(message):
         return "[情绪追踪]"
     if action == "agency" or _RE_CATEGORY_AGENCY.search(message):
@@ -488,7 +509,8 @@ def format_layered_log(data: Dict[str, Any]) -> str:
 
     `data` 键与上游 `LayeredLogInput` 一一对应：
     `level` / `phase` / `protagonist` / `message` / `args` / `colors` /
-    `color_theme` / `kaomoji` / `standalone`。
+    `color_theme` / `kaomoji` / `standalone`。本移植版多一个可选键 `category`：
+    调用方知道真实会话类型时用它直接给标签（未给时照旧按文案推断）。
     """
     text = render_log_message(data.get("message", ""), data.get("args"))
     action = detect_log_action(text, data.get("level"))
@@ -497,7 +519,9 @@ def format_layered_log(data: Dict[str, Any]) -> str:
     standalone = data.get("standalone") is True
     root = _is_root_log(summary, action, data.get("level"), standalone)
     branch = "" if root else ("└─" if _is_final_branch(summary, action) else "├─")
-    category = _log_category(action, data.get("phase"), standalone, text)
+    category = _log_category(
+        action, data.get("phase"), standalone, text, data.get("category"),
+    )
     face = _SYMBOLS[action] if data.get("kaomoji") is False else _KAOMOJI[action]
     theme = data.get("color_theme")
     palette = _COLOR_PALETTES["dark" if theme is None else theme]

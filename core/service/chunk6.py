@@ -96,6 +96,7 @@ import random
 from typing import Any, Callable, Optional
 
 from ..agency import active_agency_window, proactive_candidate_fingerprint
+from ..bubbles import VOICE_MARKER, runtime_bubble_segments
 from ..delivery import delivery_entry_metadata, restore_message_event, script_event_payload
 from ..script.delivery_ledger import update_script_delivery_actions
 from ..story_state import decode_story_state, encode_story_state
@@ -108,6 +109,7 @@ from ..urge import (
     urge_user_event,
 )
 from .base import ServiceBase, is_one_bot_platform, pick
+from .transport import voice_kwargs
 from .helpers import (
     active_rest_window,
     automatic_delivery_from_payload,
@@ -436,6 +438,10 @@ class ServiceChunk6(ServiceBase):
                         'automatic_delivery': automatic_delivery,
                         'script_event': restore_message_event(payload, content),
                     }
+                    if payload.get('voice') is True:
+                        # 这一段是正文 `<tts/>` 指定的语音（排期时写进 payload，见
+                        # `confirm_outgoing_deliveries`）。
+                        message['voice'] = True
                     delivered = await self.send_outgoing_messages(
                         story,
                         [message],
@@ -475,6 +481,10 @@ class ServiceChunk6(ServiceBase):
                             story_id, pick(participant, 'id'), automatic_delivery, now,
                         )
                     await self.record_character_message(participant, now)
+                    # 本移植版：这一条分段气泡已经投出去了，熄灭"正在输入"（下一条会再点亮）。
+                    ender = getattr(self, 'end_typing', None)
+                    if callable(ender):
+                        await ender(participant)
                     await self.db_set(
                         'interlude_intent', {'id': pick(next_intent, 'id')},
                         {'status': 'completed', 'updatedAt': now},
@@ -489,15 +499,19 @@ class ServiceChunk6(ServiceBase):
                         _record(pick(following, 'payload')).get('content'), max_characters,
                     )
                     if following_content:
+                        following_delay = self.typing_delay_milliseconds(following_content)
                         await self.db_set(
                             'interlude_intent', {'id': pick(following, 'id')},
                             {
-                                'notBefore': parse_dt(
-                                    dt_ms(now) + self.typing_delay_milliseconds(following_content),
-                                ),
+                                'notBefore': parse_dt(dt_ms(now) + following_delay),
                                 'updatedAt': now,
                             },
                         )
+                        # 这条被推后了：它的亮灯窗口从**现在**（上一条刚发出去）重新开始，
+                        # 到新的 `notBefore` 熄灭——逐条亮灭的边界不能让"积压"打破。
+                        starter = getattr(self, 'begin_typing', None)
+                        if callable(starter) and participant is not None:
+                            await starter(participant, following_delay)
             await self.schedule_next_split_wake(story_id)
 
         await self.serial(story_id, task)
@@ -894,11 +908,25 @@ class ServiceChunk6(ServiceBase):
         session: Any = None,
         should_cancel: Optional[Callable[[Any], bool]] = None,
         record_failures: bool = True,
+        request_started_at: Optional[datetime] = None,
+        *,
+        typing_window: bool = False,
     ) -> list[dict[str, Any]]:
         """上游 `sendOutgoingMessages(...)`（`:5107`）逐条移植。
 
         立即回复可以复用入站 `session`；跨账号与定时消息则通过**目标参与者自己的**
         通道投递。这条边界保证共享剧本不会把每条回复都发回恰好触发本回合的那个账号。
+
+        `request_started_at`（上游 1.0.1-rc21）：叙事请求**发起**的时刻。模型返回得比
+        「她打字该花的时间」快时，首条消息补足等待再发；已经超过就立刻发。只对当前
+        对话参与者的**首条**生效，整批至多一次；拆条后续分段、定时意图、跨参与者/跨群
+        与推进回合都有各自的时间语义，不接管。
+
+        `typing_window`（本移植版，用户 2026-09-28 点名）：**逐条气泡**在**发出之前**
+        点亮「正在输入」→ 按这条气泡自己的打字时长等待 → 发出 → 立刻熄灭，下一条重新
+        点亮。默认关闭——只有"立即回复"那条路径打开它：分段气泡的亮灯窗口由
+        `confirm_outgoing_deliveries` 按 `notBefore` 排期（见 `begin_typing(delay_ms=…)`），
+        在这里再等一遍会把投递间隔翻倍。**不管开不开，投递的内容与顺序一个字都不变。**
         """
         delivered: list[dict[str, Any]] = []
         if not messages:
@@ -916,6 +944,8 @@ class ServiceChunk6(ServiceBase):
         for participant in participants:
             if participant:
                 by_id[pick(participant, 'id')] = participant
+        typing_floor_applied = False
+        typing_waited_ms = 0
         for message in messages:
             message_participant_id = pick(message, 'participantId', 'participant_id')
             target = by_id.get(message_participant_id)
@@ -940,17 +970,53 @@ class ServiceChunk6(ServiceBase):
                         story, target_id, message, 'participant-not-allowed',
                     )
                 continue
+            hold = 0
+            if (request_started_at is not None and current is not None
+                    and message_participant_id == pick(current, 'id') and not typing_floor_applied):
+                # 上游 1.0.1-rc21：首条发言的打字时间下限。基准是叙事请求发起时刻，
+                # 目标延迟沿用与分段相同的 `typing_delay_milliseconds`。
+                typing_floor_applied = True
+                hold = self.first_message_typing_hold_ms(
+                    pick(message, 'content') or '', request_started_at,
+                )
+                if hold > 0:
+                    self.report_operation(
+                        'diagnostic', 'debug', story, 'user-message',
+                        '首条消息按打字时间补足等待 参与者=%s 等待=%dms', target_id, hold,
+                    )
             if should_cancel is not None and should_cancel(target):
                 self.report_operation(
                     'standard', 'info', story, 'user-message',
                     '新消息打断主角输入，停止发送后续分段 参与者=%s', target_id,
                 )
                 continue
+            content = message.get('content') if isinstance(message.get('content'), str) else ''
+            if typing_window:
+                # 逐条气泡：点亮 → 按**这条**气泡的打字时长等待 → （发出）→ 熄灭。
+                # 一次循环只管一条，所以第 N 条发出去之后灯就灭了；第 N+1 条重新点亮、
+                # 按它自己的字数重新等（用户点名的语义，不许合并成一次长亮）。
+                # 群聊在 `typing_indicator` 里就被挡掉：不点亮、不告警、不调用。
+                # `darken=False`：熄灯落在**投递之后**（下面的 `finally`），而不是之前。
+                waited = 0
+                indicator = getattr(self, 'typing_indicator', None)
+                if callable(indicator):
+                    waited = await indicator(target, content, darken=False)
+                if waited > 0:
+                    typing_waited_ms = max(typing_waited_ms, waited)
+                elif hold > 0:
+                    # 输入状态用不了（关掉 / 平台不支持 / 太短不值得亮）时，打字下限
+                    # 照旧生效：「首条不早于她的打字时长」是既有的投递语义，不能因为
+                    # 一个锦上添花的能力被丢掉。
+                    await asyncio.sleep(hold / 1000)
+                    typing_waited_ms = max(typing_waited_ms, hold)
+            elif hold > 0:
+                # 没开逐条亮灭的调用方：下限等待照旧（上游行为，一个字没改）。
+                await asyncio.sleep(hold / 1000)
+                typing_waited_ms = max(typing_waited_ms, hold)
             try:
                 self.report_operation(
                     'standard', 'info', story, 'intent-due', '消息投递开始 参与者=%s', target_id,
                 )
-                content = message.get('content') if isinstance(message.get('content'), str) else ''
                 literal_quote_message_id = await self.resolve_literal_quote_message_id(
                     pick(story, 'id'), target_id, content,
                 )
@@ -968,6 +1034,9 @@ class ServiceChunk6(ServiceBase):
                 if literal_quote_message_id:
                     message['quote_message_id'] = literal_quote_message_id
                 outgoing_content = _QUOTE_PLACEHOLDER if literal_quote_message_id else content
+                # 正文 `<tts/>` 指定的语音意图：只在这一段本身有字要说时才成立
+                # （纯引用占位符只是"引用了某条消息"的文本标记，念出来没有意义）。
+                outgoing_voice = pick(message, 'voice') is True and not literal_quote_message_id
                 logging_config = _section(self.config, 'logging')
                 if _cfg(logging_config, 'logMessageContent', False):
                     preview_length = _cfg(logging_config, 'previewLength')
@@ -983,11 +1052,17 @@ class ServiceChunk6(ServiceBase):
                         # 上游把正文换成 `h('quote', {id}) + '\u200b'`；`send_session`
                         # 协议没有 reply_to，照原样发就只剩零宽占位，故这条降级路径
                         # 改走按参与者投递，把引用目标显式交给适配器（见模块文档串第 3 条）。
+                        # 上游 M1a：出站地址以端点注册表为准（无注册表时原样）。
+                        # `getattr` 兜底：极简测试桩不必实现端点层。
+                        sync = getattr(self, 'delivery_address_for', None)
                         result = await self.transport.send_private(
-                            target, _QUOTE_PLACEHOLDER, literal_quote_message_id,
+                            sync(story, target) if callable(sync) else target,
+                            _QUOTE_PLACEHOLDER, literal_quote_message_id,
                         )
                     else:
-                        result = await self.transport.send_session(session, outgoing_content)
+                        result = await self.transport.send_session(
+                            session, outgoing_content, **voice_kwargs(outgoing_voice),
+                        )
                     error = _transport_failure(result)
                     if error is not None:
                         raise RuntimeError(error)
@@ -1008,6 +1083,9 @@ class ServiceChunk6(ServiceBase):
                     }
                     if message.get('quote_message_id'):
                         delivery['quoteMessageId'] = message['quote_message_id']
+                    if outgoing_voice:
+                        # 正文 `<tts/>` 意图随投递动作一起交给适配层（有才写这个键）。
+                        delivery['voice'] = True
                     outcome = await desktop_handler(delivery)
                     if not (isinstance(outcome, dict) and outcome.get('ok')):
                         failure = _record(outcome).get('error') or 'typ-0 宿主投递失败。'
@@ -1029,9 +1107,22 @@ class ServiceChunk6(ServiceBase):
                     # 找到了 Koishi 式 bot 对象，但本移植版的出站协议只有 Transport：
                     # 记一次明确失败，绝不静默丢消息（见模块文档串第 2 条）。
                     raise RuntimeError('transport-unavailable')
+                sync = getattr(self, 'delivery_address_for', None)
+                delivery_target = sync(story, target) if callable(sync) else target
                 result = await self.transport.send_private(
-                    target, outgoing_content, literal_quote_message_id,
+                    delivery_target, outgoing_content, literal_quote_message_id,
+                    **voice_kwargs(outgoing_voice),
                 )
+                # 出站结果回写端点状态（deliverable 维）：失败进 5 分钟冷却。
+                note_outbound = getattr(self, 'note_endpoint_outbound', None)
+                if callable(note_outbound):
+                    failure = _transport_failure(result)
+                    note_outbound(
+                        'participant-user', pick(target, 'id'), failure is None,
+                        failure or 'delivered',
+                        {'platform': pick(delivery_target, 'platform'),
+                         'selfId': pick(delivery_target, 'selfId', 'self_id')},
+                    )
                 error = _transport_failure(result)
                 if error is not None:
                     raise RuntimeError(error)
@@ -1045,6 +1136,13 @@ class ServiceChunk6(ServiceBase):
                     await self.record_outgoing_delivery_failure(
                         story, target_id, message, 'transport-error: %s' % error,
                     )
+            finally:
+                if typing_window:
+                    # 这条气泡发出去了（或明确失败）——**立刻**熄灭，绝不留到下一批 /
+                    # 下一条。失败也要熄：不能让对方永远看着"正在输入"。
+                    ender = getattr(self, 'end_typing', None)
+                    if callable(ender):
+                        await ender(target)
         return delivered
 
     # ------------------------------------------------------------------ #
@@ -1093,8 +1191,19 @@ class ServiceChunk6(ServiceBase):
                     )
                 delay = 0
                 later_segments = pick(message, 'laterSegments', 'later_segments') or []
+                later_voice = pick(message, 'laterSegmentsVoice', 'later_segments_voice') or []
                 for index, segment in enumerate(later_segments):
-                    delay += self.typing_delay_milliseconds(segment)
+                    segment_delay = self.typing_delay_milliseconds(segment)
+                    # 本移植版（用户 2026-09-28 点名）：每条分段气泡有**自己的**亮灯窗口
+                    # `[上一条发出去, 这一条发出去]`。所以第 1 条的窗口现在就开始（立刻点亮），
+                    # 第 N 条要等到第 N-1 条投递之后才点亮——而不是排期这一刻把所有分段一次
+                    # 点亮、跨越多条气泡。熄灭仍由投递那一刻的 `end_typing` 负责。
+                    # `notBefore` 的排期语义一个字没动（它管的是投递间隔，不是灯）。
+                    window_start = delay
+                    delay += segment_delay
+                    starter = getattr(self, 'begin_typing', None)
+                    if callable(starter):
+                        await starter(participant, segment_delay, delay_ms=window_start)
                     send_at = parse_dt(dt_ms(now) + delay)
                     payload: dict[str, Any] = {
                         'content': segment,
@@ -1102,6 +1211,10 @@ class ServiceChunk6(ServiceBase):
                         'userInitiated': pick(message, 'userInitiated', 'user_initiated') is True,
                         **script_event_payload(message, index + 1),
                     }
+                    # v1.7.7：这一段由正文 `<tts/>` 指定要发语音。分段意图是延迟投递的，
+                    # 语音意图必须随 payload 一起排期，否则等它到期时已经无从知道。
+                    if index < len(later_voice) and later_voice[index] is True:
+                        payload['voice'] = True
                     if automatic_delivery:
                         payload['automaticDelivery'] = automatic_delivery
                     await self.append_intent(pick(story, 'id'), {
@@ -1429,17 +1542,29 @@ class ServiceChunk6(ServiceBase):
     # ------------------------------------------------------------------ #
 
     def split_outgoing_message(self, content: str) -> list[str]:
-        """上游 `splitOutgoingMessage(content)`（`:5372`）逐字移植。"""
-        runtime = _section(self.config, 'runtime')
-        if _cfg(runtime, 'splitReplyMessages', True) is False:
-            return [content]
-        separator = _cfg(runtime, 'messageSeparator')
-        separator = separator.strip() if isinstance(separator, str) else ''
-        if not separator:
-            separator = '<sep/>'
-        if not separator or separator not in content:
-            return [content]
-        return [part.strip() for part in content.split(separator) if part.strip()]
+        """上游 `splitOutgoingMessage(content)`（`:5372`）逐字移植（只要文本视图）。"""
+        return [segment['content'] for segment in self.split_outgoing_segments(content)]
+
+    def split_outgoing_segments(self, content: str) -> list[dict[str, Any]]:
+        """`splitOutgoingMessage` + 正文语音标记（v1.7.7）。
+
+        返回 `[{'content': str, 'voice': bool}, ...]`：切分口径与上游逐字一致，
+        另外把每个分段里的字面 `<tts/>` 删掉、把"这一段要发语音"记进 `voice`。
+
+        `model.audio.tts_enabled` 关掉时 `voice` 恒为 `False`——**标记照样删、
+        内容一字不少**，整条退回文字投递（不是丢消息）。这种情况留一条可见的 warn：
+        她的剧本散文里很可能写着"（发了条语音）"，模型与用户都要看得出标记**没生效**。
+        """
+        enabled = bool(self.voice_reply_enabled)
+        segments = runtime_bubble_segments(
+            _section(self.config, 'runtime'), content, enabled,
+        )
+        if not enabled and VOICE_MARKER in content:
+            self.report_standalone(
+                'warn',
+                '正文语音标记已忽略（文字转语音开关是关的），这一条按文字发出，内容不丢',
+            )
+        return segments
 
     # ------------------------------------------------------------------ #
     # typingDelayMilliseconds（上游 :5379）
@@ -1476,6 +1601,18 @@ class ServiceChunk6(ServiceBase):
         factor = 1 + (random.random() * 2 - 1) * jitter if jitter else 1
         return int(max(250, min(maximum_seconds * _SECOND_MS,
                                 _js_round(nominal * factor * _SECOND_MS))))
+
+    def first_message_typing_hold_ms(self, content: str, request_started_at: datetime) -> int:
+        """上游 1.0.1-rc21 `firstMessageTypingHoldMs(content, requestStartedAt)`。
+
+        `hold = max(0, 打字目标时长 - 从请求发起到现在的耗时)`：模型快于目标就补足差额，
+        已经超过就立即发。`elapsed` 以 0 为下限——起点时间戳异常（时钟回拨）不会反向
+        放大等待，也不会给出负数。
+        """
+        floor_ms = self.typing_delay_milliseconds(content)
+        started = dt_ms(request_started_at) if request_started_at is not None else 0.0
+        elapsed = max(0.0, dt_ms(_now_of(self)) - started)
+        return int(max(0.0, floor_ms - elapsed))
 
     # ------------------------------------------------------------------ #
     # findBotForParticipant（上游 :5389）

@@ -106,8 +106,12 @@ args, text = prompt_for(base_request(groupContext={'groupId': 'g', 'messages': [
 check(args is not None, 'system_prompt 未被调用')
 check(args[7] is True and args[8] is True and args[14] is True and args[17] is True, args[7:18])
 check('For this group turn, return groupReply' in text, '群聊应拿到 groupReply 传输说明')
-check('For this private turn, return interaction' not in text, '群聊不应拿到私聊传输说明')
+check('For this private turn' not in text, '群聊不应拿到私聊传输说明')
 check('integer field named alter' in text, '情绪（Alter）规则')
+# 合并 KelaLeaf 后：默认特化档（off ≡ full）仍带本地扩展规则
+for rule in ('interval.realCalendar', 'interval.lifeStagnation', 'interval.lifeHooks', 'interval.activeArcs',
+             'interval.overnightMessages', 'online acquaintance in person never becomes a plan'):
+    check(rule in text, '默认档提示词缺少本地扩展规则 %s' % rule)
 check('agencyWindow may be' not in text, '按上游设计，回复回合不带行动窗口规则')
 check('Schedule Preplan contains only the coming roughly twelve hours' in text, '日程用法规则')
 args, text = prompt_for(base_request(phase='advance'))
@@ -115,7 +119,7 @@ check('agencyWindow may be' in text and 'integer field named alter' in text, '�
 args, text = prompt_for(base_request(outputRecovery=True, groupContext={'groupId': 'g', 'messages': []}))
 check('OUTPUT RECOVERY' in text, '重写纠错规则')
 args, text = prompt_for(base_request())
-check(args[17] is False and 'For this private turn, return interaction' in text, '私聊回合仍是私聊说明')
+check(args[17] is False and 'For this private turn' in text and 'For this group turn' not in text, '私聊回合仍是私聊说明')
 args, text = prompt_for(base_request(phase='advance', alterEnabled=False, agencyEnabled=False))
 check('integer field named alter' not in text and 'agencyWindow may be' not in text, '关掉时不注入')
 args, text = prompt_for(base_request(alter_enabled=True, group_context={'groupId': 'g', 'messages': []}))

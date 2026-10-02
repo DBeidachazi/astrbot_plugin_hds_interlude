@@ -1117,6 +1117,78 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body['messages'][1]['content'][0]['text'].endswith('animated: true.'))
         self.assertEqual(body['messages'][1]['content'][1]['image_url'], {'url': 'data:image/png;base64,AAA', 'detail': 'low'})
 
+    async def test_describe_sticker_passes_the_sticker_verdict_fields_through(self):
+        """§50：描述回执里的 `is_sticker` / `confidence` **原样**出去（判据不在这里）。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': json.dumps({
+            'description': '一张风景照', 'aliases': [],
+            'is_sticker': False, 'confidence': 0.93,
+        }, ensure_ascii=False)}}]}])
+        config = make_config(providers=[make_provider(use_for_main=False, use_for_stickers=True)])
+        describer = create_sticker_describer(http, config)
+        result = await describer.describe_sticker('data:image/png;base64,AAA', 'image/png', 'p.png', False)
+        self.assertIs(result['is_sticker'], False)
+        self.assertEqual(result['confidence'], 0.93)
+        # 提示词必须**问**这两个字段（问不出来就永远是"拿不准 = 不动"）。
+        system = http.posts[0]['body']['messages'][0]['content']
+        self.assertIn('"is_sticker"', system)
+        self.assertIn('"confidence"', system)
+        # 拿不准时鼓励答 true（停用是重手，判据那边还有置信度闸）。
+        self.assertIn('when unsure answer is_sticker:true', system)
+
+    async def test_describe_sticker_carries_the_group_directory_and_returns_the_choice(self):
+        """§48 乙：带上分组目录 → 提示词里多一段 + 回执里的 `group` 原样交出去。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': json.dumps({
+            'description': '一只挥手的猫',
+            'aliases': ['打招呼'],
+            'group': {'existing': 'g-1'},
+        }, ensure_ascii=False)}}]}])
+        config = make_config(providers=[make_provider(use_for_main=False, use_for_stickers=True)])
+        describer = create_sticker_describer(http, config)
+        groups = [{'groupId': 'g-1', 'name': '猫猫', 'description': '猫、躺平', 'count': 2}]
+        result = await describer.describe_sticker(
+            'data:image/png;base64,AAA', 'image/png', 'cat.png', False, groups=groups,
+        )
+        self.assertEqual(result['group'], {'existing': 'g-1'})
+        system = http.posts[0]['body']['messages'][0]['content']
+        self.assertIn('g-1', system)
+        self.assertIn('"group"', system)
+        # 不给目录：老问法逐字不变、回执里也不会有 `group`。
+        http2 = FakeHttpClient(responses=[{'choices': [{'message': {'content': json.dumps({
+            'description': '一只猫', 'aliases': [], 'group': {'existing': 'g-1'},
+        }, ensure_ascii=False)}}]}])
+        plain = create_sticker_describer(http2, config)
+        result2 = await plain.describe_sticker('data:image/png;base64,AAA', 'image/png', 'cat.png', False)
+        self.assertNotIn('group', result2)
+        self.assertNotIn('"group"', http2.posts[0]['body']['messages'][0]['content'])
+
+    async def test_select_sticker_asks_the_main_route_for_one_asset_and_the_message(self):
+        """§48 甲：第二步走**主叙事**连接，把该组条目与已写好的正文一起给它。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': json.dumps({
+            'stickerAssetId': 'a-2', 'willingness': 0.9, 'content': '哈哈哈',
+        }, ensure_ascii=False)}}], 'usage': {'prompt_tokens': 20, 'completion_tokens': 8}}])
+        usages: list = []
+        config = make_config(providers=[make_provider(use_for_main=True)])
+        client = self.make_narrator(http, config, on_usage=usages.append)
+        items = [{'assetId': 'a-1', 'description': '猫'}, {'assetId': 'a-2', 'description': '狗'}]
+        receipt = await client.select_sticker(items, '哈哈哈', 0.7, 'g-1')
+        self.assertEqual(receipt['stickerAssetId'], 'a-2')
+        body = http.posts[0]['body']
+        self.assertIn('stickerAssetId', body['messages'][0]['content'])
+        sent = json.loads(body['messages'][1]['content'])
+        self.assertEqual(sent['groupId'], 'g-1')
+        self.assertEqual(sent['stickerCandidates'], items)
+        self.assertEqual(sent['message'], '哈哈哈')
+        self.assertEqual(body['max_tokens'], 256)
+        self.assertEqual(usages[0]['task'], '表情选择')
+
+    async def test_select_sticker_degrades_to_none_on_broken_json(self):
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': '不是 JSON'}}]}])
+        config = make_config(providers=[make_provider(use_for_main=True)])
+        client = self.make_narrator(http, config)
+        self.assertIsNone(await client.select_sticker([{'assetId': 'a', 'description': 'x'}], 'x', 0.7, 'g'))
+        silent = SilentNarrator()
+        self.assertIsNone(await silent.select_sticker([{'assetId': 'a'}], 'x', 0.7, 'g'))
+
     async def test_describe_sticker_degrades_quietly(self):
         http = FakeHttpClient(responses=[{'choices': [{'message': {'content': ''}}]}])
         config = make_config(providers=[make_provider(use_for_main=False, use_for_stickers=True)])
@@ -1128,6 +1200,71 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(silent, SilentStickerDescriber)
         self.assertFalse(silent.available())
         self.assertIsNone(await silent.describe_sticker('x', 'y', 'z', False))
+
+    async def test_guess_sticker_asks_the_stickers_route_for_strict_json(self):
+        """第二层判据（§45.7）：走**同一条** `stickers` 路由，问法要严格 JSON。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': json.dumps({
+            'is_sticker': True, 'kind': 'meme', 'confidence': 0.8, 'description': '一只猫',
+        }, ensure_ascii=False)}}]}])
+        config = make_config(providers=[make_provider(
+            use_for_main=False, use_for_stickers=True, model='vision-m',
+        )])
+        describer = create_sticker_describer(http, config)
+        self.assertTrue(describer.guess_sticker_available())
+        result = await describer.guess_sticker('data:image/png;base64,AAA', 'image/png', 'plain.png')
+        self.assertEqual(result['is_sticker'], True)
+        self.assertEqual(result['description'], '一只猫')
+
+        post = http.posts[0]
+        self.assertEqual(post['task'], 'stickers', '任务级路由必须报真实任务名')
+        body = post['body']
+        self.assertEqual(body['model'], 'vision-m')
+        self.assertEqual(body['max_tokens'], 256, '判定只要一句话，别按描述的口径给 768')
+        self.assertEqual(body['response_format'], {'type': 'json_object'})
+        system = body['messages'][0]['content']
+        for key in ('"is_sticker"', '"kind"', '"confidence"', '"description"'):
+            self.assertIn(key, system, '提示词要逐字要求这几个键')
+        self.assertIn('screenshot', system, '要明确"截图 / 实拍照片 = 不是表情包"')
+        self.assertIn('is_sticker=false', system, '拿不准要答 false')
+        self.assertIn('plain.png', body['messages'][1]['content'][0]['text'])
+        self.assertEqual(
+            body['messages'][1]['content'][1]['image_url'],
+            {'url': 'data:image/png;base64,AAA', 'detail': 'low'},
+        )
+
+    async def test_guess_sticker_falls_back_to_the_vision_route_but_never_to_the_main_model(self):
+        """没有 `stickers` 连接时回落 `vision`（并报 `vision` 的任务名）；主模型绝不顶替。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': '{"is_sticker": false}'}}]}])
+        config = make_config(providers=[make_provider(
+            use_for_main=False, use_for_vision=True, model='sidecar-m',
+        )])
+        describer = create_sticker_describer(http, config)
+        # `available()` 仍是贴纸口径（没勾 stickers 就是 False）——两层口径刻意分开。
+        self.assertFalse(describer.available())
+        self.assertTrue(describer.guess_sticker_available())
+        result = await describer.guess_sticker('data:image/png;base64,AAA', 'image/png', 'x.png')
+        self.assertEqual(result, {'is_sticker': False})
+        self.assertEqual(http.posts[0]['task'], 'vision', '回落时要报 vision，否则指名的 Provider 会静默失效')
+        self.assertEqual(http.posts[0]['body']['model'], 'sidecar-m')
+
+        # 只配了主模型 → 判定没有路由，绝不偷偷花主叙事的钱。
+        only_main = create_sticker_describer(http, make_config())
+        self.assertFalse(only_main.guess_sticker_available())
+        self.assertIsNone(await only_main.guess_sticker('data:image/png;base64,AAA', 'image/png', 'x.png'))
+
+    async def test_guess_sticker_degrades_quietly_on_empty_or_broken_json(self):
+        """空回复 / JSON 坏 → `None`（core 侧按"不收"处理），不抛。"""
+        http = FakeHttpClient(responses=[
+            {'choices': [{'message': {'content': ''}}]},
+            {'choices': [{'message': {'content': '这不是 JSON'}}]},
+        ])
+        config = make_config(providers=[make_provider(use_for_main=False, use_for_stickers=True)])
+        describer = create_sticker_describer(http, config)
+        self.assertIsNone(await describer.guess_sticker('data:image/png;base64,AAA', 'image/png', 'a.png'))
+        self.assertIsNone(await describer.guess_sticker('data:image/png;base64,AAA', 'image/png', 'a.png'))
+        silent = create_sticker_describer(http, make_config())
+        self.assertFalse(silent.guess_sticker_available())
+        self.assertIsNone(await silent.guess_sticker('data:image/png;base64,AAA', 'image/png', 'a.png'))
 
     async def test_describe_images_uses_the_sidecar_contract_and_retries_once(self):
         http = FakeHttpClient(responses=[
@@ -1153,6 +1290,39 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(silent, SilentVisionDescriber)
         self.assertFalse(silent.available())
         self.assertIsNone(await silent.describe_images(images))
+
+
+class SideTaskRouteTests(unittest.IsolatedAsyncioTestCase):
+    """`SIDE_TASK_ROUTES`：侧任务带下去的**传输层任务键**。
+
+    这个键直接决定宿主用哪个 AstrBot Provider（`AstrbotHttpClient._chat` 按它读
+    `task_model_id`），所以它属于接线，不是日志字段。v1.7.9：共同作品的独立写手有
+    自己的一条（`作品创作 → works`）——没有它，写手请求会带着默认的 `compaction`
+    去问宿主要压缩模型，用户在「写手模型」里选的那个一次都不会被用到。
+    """
+
+    async def _post_side_task(self, task):
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': '草稿'}}]}])
+        client = OpenAICompatibleNarrator(http, make_config(), silent_logs=True)
+
+        def build_body(capped):  # noqa: ARG001 - 这里只关心任务键
+            return {'model': 'm1', 'messages': [{'role': 'user', 'content': '写点什么'}]}
+
+        text = await client._side_task_json(  # noqa: SLF001 - 就是被测的那个旁路入口
+            make_provider(), 'm1', task, None, build_body, lambda raw: raw,
+        )
+        return text, http.posts[0]
+
+    async def test_the_works_writer_carries_the_works_task_key(self):
+        text, post = await self._post_side_task('作品创作')
+        self.assertEqual(text, '草稿')
+        self.assertEqual(post['task'], 'works')
+
+    async def test_tasks_without_their_own_route_still_fall_back_to_compaction(self):
+        """上游 timeline / 日程预排 / Overlay 整理都跟随压缩（不要顺手给它们各开一条）。"""
+        for task in ('压缩', '时间导演', '日程预排', 'Overlay 整理'):
+            _text, post = await self._post_side_task(task)
+            self.assertEqual(post['task'], 'compaction', task)
 
 
 class EmbedderClientTests(unittest.IsolatedAsyncioTestCase):
@@ -1268,9 +1438,14 @@ class FactoryTests(unittest.IsolatedAsyncioTestCase):
         vision = create_vision_describer(
             http, make_config(providers=[make_provider(use_for_main=False, use_for_vision=True)]),
         )
-        # 上游 `available()` 问的是表情连接；侧端识图看 `visionAvailable()`。
-        self.assertTrue(vision.vision_available())
-        self.assertFalse(vision.available())
+        # 上游 1.0.1-rc26：工厂返回薄包装，`available()` 走 **vision 路由**口径。
+        # 旧实现直接把 narrator 交出去，而它的 `available()` 问的是**贴纸连接**——
+        # 只勾「用于侧端识图」的用户被误判成「没有配置视觉模型」，识图静默跳过。
+        self.assertTrue(vision.available())
+        stickers_only = create_vision_describer(
+            http, make_config(providers=[make_provider(use_for_main=False, use_for_stickers=True)]),
+        )
+        self.assertFalse(stickers_only.available(), '识图只认 useForVision，不认贴纸连接')
 
     async def test_context_style_sources_are_accepted_by_the_factories(self):
         http = FakeHttpClient()

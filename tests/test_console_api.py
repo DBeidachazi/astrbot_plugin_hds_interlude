@@ -7,21 +7,43 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import os
+import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 # 复用桥接测试里的 AstrBot 桩与夹具（导入即装桩）
-from plugin.tests.test_astrbot_bridge import FakeContext, _make_bridge, bridge_module
+from plugin.tests.test_astrbot_bridge import (
+    TEST_DATA_DIR,
+    FakeContext,
+    _FakeUpload,
+    _ProviderStub,
+    _install_web_request,
+    _make_bridge,
+    _make_plugin,
+    bridge_module,
+)
 from plugin.adapters import console_api as console_module
 from plugin.adapters.console_api import ConsoleApi, ConsoleError, CONSOLE_TASKS, mask_endpoint
+from plugin.core import platform_actions
 from plugin.core.database import Database
+from plugin.core.service import helpers as helpers_module
+from plugin.core.service.base import InterludeContext
+from plugin.core.service.chunk2 import ServiceChunk2
+from plugin.core.service.transport import NullTransport
 
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+#: 一张最小合法 PNG（魔数正确即可，内容不参与判据）。
+_PNG_BYTES = b'\x89PNG\r\n\x1a\n' + b'x' * 32
 
 
 class MaskEndpointTests(unittest.TestCase):
@@ -69,6 +91,344 @@ class ConsoleApiTests(unittest.TestCase):
         self.database.register_tables()
         self.bridge.db = self.database
         self.api = ConsoleApi(self.bridge)
+
+    # ---- token 统计 ----
+
+    def test_token_stats_summarises_the_ledger_and_handles_an_empty_table(self):
+        """空表也要回一个完整空壳（面板显示 0，不是 500）——§29 的控制台取数约定。"""
+        payload = _run(self.api.token_stats('day'))
+        self.assertEqual(payload['range'], 'day')
+        self.assertEqual(payload['totals']['inputTokens'], 0)
+        self.assertEqual(len(payload['series']), 1, '按天视图至少给今天这一格')
+
+        self.bridge.db.insert('interlude_token_usage', {
+            'day': '2026-09-30', 'storyId': 's1', 'task': '主叙事', 'model': 'deepseek-chat',
+            'provider': '连接A', 'inputTokens': 1200, 'outputTokens': 300, 'cachedTokens': 600,
+            'calls': 3, 'createdAt': '2026-09-30T00:00:00Z', 'updatedAt': '2026-09-30T00:00:00Z',
+        })
+        self.bridge.db.insert('interlude_token_usage', {
+            'day': '2026-09-29', 'storyId': 's1', 'task': '压缩', 'model': 'flash',
+            'provider': '连接B', 'inputTokens': 400, 'outputTokens': 100, 'cachedTokens': 0,
+            'calls': 1, 'createdAt': '2026-09-29T00:00:00Z', 'updatedAt': '2026-09-29T00:00:00Z',
+        })
+        week = _run(self.api.token_stats('week', '', ''))
+        self.assertEqual(week['range'], 'week')
+        self.assertEqual(week['totals']['inputTokens'], 1600)
+        self.assertAlmostEqual(week['totals']['hitRate'], 600 / 1600)
+        self.assertEqual({item['model'] for item in week['byModel']}, {'deepseek-chat', 'flash'})
+        self.assertEqual({item['task'] for item in week['byTask']}, {'主叙事', '压缩'})
+        self.assertEqual(len(week['series']), 7)
+
+        # 自选范围能精确圈住一天（8 月那类老数据不进本周视图这件事由纯函数测试覆盖）。
+        custom = _run(self.api.token_stats('custom', '2026-09-30', '2026-09-30'))
+        self.assertEqual(custom['totals']['inputTokens'], 1200)
+        self.assertEqual(custom['from'], '2026-09-30')
+
+    # ---- 平台动作目录与权限（面板「动作」） ----
+
+    def _temp_permissions(self) -> str:
+        """把权限表指到本用例自己的临时目录：验证真的落成 JSON，且不污染别的用例。"""
+        path = os.path.join(self._tmp.name, 'action_permissions.json')
+        self.bridge._action_permissions_path = Path(path)
+        self.bridge._action_permissions = {}
+        return path
+
+    def test_actions_catalog_mirrors_the_core_directory(self):
+        """面板的目录必须与 `core/platform_actions.ACTIONS` 逐条一致（不许在控制台重算）。"""
+        payload = _run(self.api.actions_catalog())
+        rows = payload['actions']
+        self.assertEqual([row['id'] for row in rows], list(platform_actions.ACTIONS))
+        self.assertEqual(payload['stats']['total'], len(platform_actions.ACTIONS))
+        json.dumps(payload, ensure_ascii=False)  # 面板直接吃它，必须可序列化
+        for row in rows:
+            action = platform_actions.ACTIONS[row['id']]
+            with self.subTest(action=row['id']):
+                self.assertEqual(row['label'], action.label)
+                self.assertEqual(row['summary'], action.summary)
+                self.assertEqual(row['risk'], action.risk)
+                self.assertEqual(row['category'], action.category)
+                self.assertEqual(row['category_label'],
+                                 platform_actions.ACTION_CATEGORIES[action.category])
+                self.assertEqual(row['default_permission'], action.default_permission)
+                self.assertEqual(row['group'], platform_actions.action_config_group(action))
+                self.assertEqual([param['name'] for param in row['params']],
+                                 [param.name for param in action.params])
+                for param in row['params']:
+                    self.assertEqual(sorted(param), sorted(
+                        ['name', 'label', 'type', 'required', 'minimum', 'maximum', 'choices', 'note'],
+                    ))
+        # 四档 + 中文说明；分组表覆盖全部可见动作组（面板要说明"开关在哪一组"）
+        self.assertEqual([tier['id'] for tier in payload['tiers']],
+                         list(platform_actions.PERMISSION_TIERS))
+        self.assertTrue(all(tier['label'] and tier['description'] for tier in payload['tiers']))
+        for row in rows:
+            self.assertIn(row['group'], payload['groups'])
+        # v1.7.4：动作开关并进一个父组 `robot_actions`，落点是三个**子组**（点分路径）。
+        # 文案必须是子组中文名，而不是"先到的类别"（`robot_actions.chat` 里坐着互动/消息/
+        # 历史/状态/资料/语音/联系人七类，叫「互动」是错的）。
+        self.assertEqual(payload['groups'],
+                         dict(platform_actions.ACTION_CONFIG_GROUP_LABELS))
+        self.assertEqual(sorted(payload['groups']),
+                         ['robot_actions.chat', 'robot_actions.group', 'robot_actions.qzone'])
+        self.assertEqual(payload['groups']['robot_actions.chat'], '会话动作')
+        self.assertEqual(set(payload['groups'].values()),
+                         {'会话动作', '群管理动作', 'QQ 空间动作'})
+        legacy_names = {'actions_chat', 'actions_group', 'actions_qzone', 'actions_risks'}
+        self.assertEqual(legacy_names & {row['group'] for row in rows}, set(),
+                         '旧组名不许再作为落点出现在动作页 payload 里')
+        # 各 risk 计数与档位分布都要对得上
+        counts = {}
+        for row in rows:
+            counts[row['risk']] = counts.get(row['risk'], 0) + 1
+        for level in platform_actions.RISK_LEVELS:
+            self.assertEqual(payload['stats']['risk'][level], counts.get(level, 0), level)
+        self.assertEqual(
+            sum(payload['stats']['permissions'].values()), len(rows),
+            '档位分布必须覆盖每一个动作',
+        )
+
+    def test_dangerous_actions_default_to_disabled_and_the_warning_is_verbatim(self):
+        payload = _run(self.api.actions_catalog())
+        risky = [row for row in payload['actions'] if row['risk'] == 'dangerous']
+        self.assertTrue(risky)
+        self.assertEqual(payload['risky'], [row['id'] for row in risky])
+        for row in risky:
+            with self.subTest(action=row['id']):
+                self.assertEqual(row['default_permission'], 'disabled')
+                self.assertEqual(row['permission'], 'disabled')
+                self.assertFalse(row['enabled'])
+        self.assertEqual(payload['stats']['risky'], len(risky))
+        self.assertEqual(payload['stats']['risky_enabled'], 0, '默认没有任何危险动作在跑')
+        # 警示语必须是 core 里那一句原文，不许在控制台另写一句
+        self.assertEqual(platform_actions.RISK_WARNING,
+                         '此标签下功能具有一定风险，易误操作，请谨慎开启。')
+        self.assertEqual(payload['risk_warning'], platform_actions.RISK_WARNING)
+
+    def test_catalog_survives_an_unconfigured_empty_plugin(self):
+        """没有配置 / 没有数据库 / 没有任何剧本时也要回完整目录（§29 的控制台取数约定）。"""
+        bare = _make_bridge({})
+        bare.db = None
+        payload = _run(ConsoleApi(bare).actions_catalog())
+        self.assertEqual(len(payload['actions']), len(platform_actions.ACTIONS))
+        self.assertEqual(payload['stats']['enabled'], len(platform_actions.ACTIONS)
+                         - payload['stats']['risky'])
+        self.assertTrue(all(row['config_enabled'] is None for row in payload['actions']),
+                        '分组不存在 = 未配置 = 不限制')
+        self.assertTrue(payload['permissions_path'].endswith('action_permissions.json'))
+
+    def test_config_switch_is_the_master_switch(self):
+        """配置开关关掉时档位无论选什么都不生效（与关系），但档位本身照原样显示。"""
+        self.bridge.config['actions_interaction'] = {'send_poke': False}
+        payload = _run(self.api.actions_catalog())
+        row = next(item for item in payload['actions'] if item['id'] == 'send_poke')
+        self.assertIs(row['config_enabled'], False)
+        self.assertEqual(row['permission'], 'global', '档位是权限表的值，不因开关而改写')
+        self.assertFalse(row['enabled'], '开关是总闸，关掉就不生效')
+        self.assertEqual(payload['stats']['enabled'],
+                         len(payload['actions']) - payload['stats']['risky'] - 1)
+
+    def test_enabling_a_dangerous_action_drives_the_warning_counter(self):
+        """危险动作的开关现在落在它自己类别所属的子组里（群管理类 → `robot_actions.group`）。"""
+        self.bridge.config['robot_actions'] = {'group': {'set_group_kick': True}}
+        _run(self.api.set_action_permission('set_group_kick', 'admin'))
+        payload = _run(self.api.actions_catalog())
+        row = next(item for item in payload['actions'] if item['id'] == 'set_group_kick')
+        self.assertEqual(row['permission'], 'admin')
+        self.assertEqual(row['group'], 'robot_actions.group')
+        self.assertTrue(row['enabled'])
+        self.assertEqual(payload['stats']['risky_enabled'], 1)
+
+    # ---- v1.7.2 分组收敛 / v1.7.3 取消风险组：旧格式配置仍要读得到 ----
+
+    def test_action_switches_read_old_format_groups(self):
+        """旧格式：开关写在 `actions_interaction` 等旧组里，没有 `robot_actions`。
+
+        这是本任务的**核心验收（用户点名）**——分组名收敛了，用户升级前设过的开关必须
+        照旧读得到（通过 `robot_actions.chat / group / qzone` 的嵌套路径），并且面板上
+        报告的落点是**新子组**（写方向也只写新路径）。
+        """
+        # ① 归一化路径：`normalize_config` 的 N:1 归并（服务层/桥接装配置时走它）
+        bridge = _make_bridge({
+            'actions_interaction': {'enabled': True, 'send_poke': False, 'send_like': True},
+            'actions_voice': {'send_voice': False, 'default_voice': 'zh-CN-YunxiNeural'},
+        })
+        bridge.db = self.bridge.db
+        payload = _run(ConsoleApi(bridge).actions_catalog())
+        switches = {row['id']: row['config_enabled'] for row in payload['actions']}
+        self.assertIs(switches['send_poke'], False, '关掉的开关升级后还是关着')
+        self.assertIs(switches['send_like'], True)
+        self.assertIs(switches['send_voice'], False)
+        self.assertIsNone(switches['set_group_kick'], '没配过的组照旧 = 未配置 = 不限制')
+        for row in payload['actions']:
+            with self.subTest(action=row['id']):
+                self.assertTrue(row['group'].startswith('robot_actions.'),
+                                '落点必须是父组下的三个子组之一')
+
+        # ② 直接改内存里的旧组（`bridge.section()` 自己会归并，不依赖归一化）
+        self.bridge.config.pop('robot_actions', None)
+        self.bridge.config['actions_interaction'] = {'send_poke': False}
+        row = next(item for item in _run(self.api.actions_catalog())['actions']
+                   if item['id'] == 'send_poke')
+        self.assertIs(row['config_enabled'], False)
+        self.assertEqual(row['group'], 'robot_actions.chat')
+
+    def test_retired_risk_group_is_a_dead_compat_slot(self):
+        """`actions_risks` 从 v1.7.4 起**不再参与归并**：它里面的开关不影响任何动作。
+
+        用户判断那些配置目前没人用（危险开关在 v1.7.3 就搬进各自类别组了）。兼容位照旧留在
+        schema 里（回退到旧版本仍读得到它），但读取侧不认——面板照旧回"未配置 = 不限制"，
+        而不是把一个谁都没在用的旧值当成用户的选择。
+        """
+        bridge = _make_bridge({'actions_risks': {
+            'enabled': True, 'set_group_kick': True, 'delete_qzone_post': True,
+            'delete_friend': True,
+        }})
+        bridge.db = self.bridge.db
+        payload = _run(ConsoleApi(bridge).actions_catalog())
+        rows = {row['id']: row for row in payload['actions']}
+        for action_id, group in (('set_group_kick', 'robot_actions.group'),
+                                 ('delete_qzone_post', 'robot_actions.qzone'),
+                                 ('delete_friend', 'robot_actions.chat')):
+            with self.subTest(action=action_id):
+                self.assertIsNone(rows[action_id]['config_enabled'],
+                                  '退休的风险组不再是归并源')
+                self.assertEqual(rows[action_id]['group'], group)
+        self.assertIsNone(rows['send_poke']['config_enabled'])
+
+    def test_writing_a_nested_switch_path_lands_in_the_nested_group(self):
+        """控制台写 `robot_actions.group.set_group_kick` 必须落到**嵌套子组**里。
+
+        v1.7.4 的关键写方向：路径是点分的（`_resolve_schema_field` 只沿 `type: object`
+        的 items 往下走），落盘不能变成 `"robot_actions.group"` 这种平铺假键——宿主下次
+        加载会把它当未知键删掉（坑 22），用户的改动等于没写。
+        """
+        self.bridge.raw_config = lambda: {
+            'actions_group': {'enabled': True, 'set_group_kick': True},
+            'robot_actions': {'chat': {'send_poke': False}},
+        }
+        written: dict[str, Any] = {}
+
+        async def fake_save(target):
+            written.clear()
+            written.update(target)
+            return 'test'
+
+        self.bridge.save_raw_config = fake_save
+        _run(self.api.set_config_value('robot_actions.group.set_group_kick', False))
+        self.assertIs(written['robot_actions']['group']['set_group_kick'], False)
+        self.assertNotIn('robot_actions.group', written, '不许写成点号平铺的假键')
+        self.assertIs(written['robot_actions']['chat']['send_poke'], False,
+                      '兄弟子组不许被覆盖掉')
+
+    def test_config_page_shows_the_merged_value_of_the_nested_groups(self):
+        """配置页显示的必须是运行期**真正生效**的值（含旧分组归并），见坑 34。
+
+        嵌套目标（`robot_actions.chat` / `runtime.input_status`）尤其要：内嵌表单拿到的是
+        整个子组对象，显示成默认值的话，用户在控制台里改一项就把旧分组里没读出来的选择
+        整块覆盖掉。
+        """
+        # 磁盘上（这里用 `_live_config` 代表）只有旧分组，没有 `robot_actions`
+        self.bridge._live_config['actions_interaction'] = {'send_poke': False}
+        self.bridge._live_config['input_status'] = {'enabled': False}
+        payload = _run(self.api.config_schema())
+        groups = {group['key']: group for group in payload['groups']}
+        chat = next(item for item in groups['robot_actions']['fields'] if item['key'] == 'chat')
+        self.assertEqual(chat['type'], 'object')
+        self.assertIs(chat['value']['send_poke'], False)
+        self.assertTrue(chat['present'], '旧分组里的值也算"设过"')
+        status = next(item for item in groups['runtime']['fields']
+                      if item['key'] == 'input_status')
+        self.assertEqual(status['type'], 'object')
+        self.assertIs(status['value']['enabled'], False)
+        self.assertTrue(groups['actions_interaction']['invisible'],
+                        '旧组下发的数据仍带 invisible 标记（宿主配置页据此隐藏）')
+        self.assertTrue(groups['input_status']['invisible'])
+
+    def test_permission_write_round_trips_to_the_temp_data_dir(self):
+        path = self._temp_permissions()
+        result = _run(self.api.set_action_permission('send_poke', 'admin'))
+        self.assertEqual(result['action'], 'send_poke')
+        self.assertEqual(result['tier'], 'admin')
+        self.assertEqual(result['permissions'], {'send_poke': 'admin'})
+        # 面板显示的是"插件数据目录 / action_permissions.json"（生产路径与桥接的写入
+        # 目标同源；用例里把桥接的写入位置改到了临时目录，所以只对文件名做断言）。
+        self.assertTrue(result['permissions_path'].endswith('action_permissions.json'))
+        # 落成 JSON 文件（独立表，不进 `_conf_schema.json`）
+        self.assertTrue(os.path.isfile(path))
+        with open(path, encoding='utf-8') as handle:
+            self.assertEqual(json.load(handle), {'send_poke': 'admin'})
+        # 读回：目录里的档位跟着变
+        payload = _run(self.api.actions_catalog())
+        row = next(item for item in payload['actions'] if item['id'] == 'send_poke')
+        self.assertEqual(row['permission'], 'admin')
+        self.assertEqual(payload['stats']['permissions']['admin'], 1)
+
+    def test_the_service_reads_the_table_the_panel_writes(self):
+        """**接线用例（v1.7.9）**：面板写的那份权限表，服务层必须读得到。
+
+        写侧落点是 `bridge.data_dir`（= 构造 `AstrbotInterludeContext` 时给的 `base_dir`），
+        读侧原先读的是 core 里**根本不存在**的 `self.context` → 恒回空表，
+        于是"界面能改、运行期不生效"（真 bug）。这里两侧都走**真实对象**：
+        目录同源 + 真写文件 + 真读回来。
+        """
+        service = self.bridge.service
+        self.assertEqual(
+            service.interlude_data_dir(), str(self.bridge.data_dir),
+            '写侧（bridge.data_dir）与读侧（ctx.base_dir）必须同源',
+        )
+        path = Path(self.bridge.data_dir) / 'action_permissions.json'
+        backup = path.read_text(encoding='utf-8') if path.exists() else None
+
+        def restore():
+            if backup is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(backup, encoding='utf-8')
+
+        self.addCleanup(restore)
+        # 默认档：`send_poke` 是 global（私聊可用）
+        self.assertIn('send_poke', service.available_platform_actions('', ('private',)))
+        path.write_text(json.dumps({'send_poke': 'admin'}), encoding='utf-8')
+        self.assertEqual(service.action_permission_table(), {'send_poke': 'admin'})
+        self.assertNotIn(
+            'send_poke', service.available_platform_actions('', ('private',)),
+            '表里降到「仅管理员」之后，普通私聊会话就不该再拿得到这条动作',
+        )
+
+    def test_permission_write_rejects_unknown_action_and_tier(self):
+        path = self._temp_permissions()
+        for action, tier in (('send_poke', 'owner'), ('send_poke', ''), ('nope', 'global'), ('', 'global')):
+            with self.subTest(action=action, tier=tier):
+                with self.assertRaises(ConsoleError):
+                    _run(self.api.set_action_permission(action, tier))
+        self.assertFalse(os.path.exists(path), '被拒绝的写入不能碰权限表')
+
+    def test_permission_reset_clears_the_table(self):
+        path = self._temp_permissions()
+        _run(self.api.set_action_permission('send_poke', 'disabled'))
+        result = _run(self.api.reset_action_permissions())
+        self.assertEqual(result['permissions'], {})
+        with open(path, encoding='utf-8') as handle:
+            self.assertEqual(json.load(handle), {})
+        payload = _run(self.api.actions_catalog())
+        row = next(item for item in payload['actions'] if item['id'] == 'send_poke')
+        self.assertEqual(row['permission'], 'global', '清空后回目录默认档')
+
+    def test_read_only_console_pages_have_no_permission_entry(self):
+        """「Token 统计」这类只读页面不属于权限表：目录里没有它，写入也会被拒。
+
+        v1.7.3 起「动作」页不再解释"只读页面"这件事，`permissionless_panels` 也随之
+        下线（前端那段说明整段删掉了）——边界本身仍然钉在这里。
+        """
+        payload = _run(self.api.actions_catalog())
+        self.assertNotIn('permissionless_panels', payload)
+        for name in ('tokens', 'token-stats', 'token_stats'):
+            with self.subTest(name=name):
+                self.assertNotIn(name, platform_actions.ACTIONS)
+                with self.assertRaises(ConsoleError):
+                    _run(self.api.set_action_permission(name, 'global'))
+        blob = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn('console/token-stats', blob)
 
     # ---- overview ----
 
@@ -165,6 +525,40 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(payload['vision']['mode'], 'sidecar')
         self.assertEqual(payload['embedding']['dimensions'], 1024)
         self.assertTrue(payload['failover']['enabled'])
+
+    def test_models_shows_the_works_writer_task_with_the_dual_read_binding(self):
+        """v1.7.9：写手模型也进「模型」页，但它有两套填法——老口径的值不能被报成
+        「某个 AstrBot Provider」（那会让用户去宿主的模型列表里找一个不存在的东西）。"""
+        row = _run(self.api.models())['task_models']['works']
+        self.assertEqual(row['label'], '共同作品写手')
+        self.assertEqual(row['astrbot_provider'], '', '夹具里没配写手模型')
+
+        # 新口径：指名了一个真实 Provider → 显示它，并算进那个 Provider 的 used_by。
+        bridge = _make_bridge({'works': {'enabled': True, 'model_id': 'ollama'}})
+        bridge.context.get_all_providers = lambda: [_ProviderStub('ollama')]
+        api = ConsoleApi(bridge)
+        self.assertEqual(_run(api.models())['task_models']['works']['astrbot_provider'], 'ollama')
+
+        # 老口径：值点的是一条连接行 → 不报成 Provider（值本身仍在配置里）。
+        legacy = _make_bridge({
+            'works': {'enabled': True, 'model_id': 'writer-conn'},
+            'model_center': {'providers': [{
+                'id': 'writer-conn', 'label': '写手连接', 'enabled': True, 'model': 'w',
+                'endpoint': 'https://gw.example.com/v1/chat/completions',
+            }]},
+        })
+        legacy.context.get_all_providers = lambda: [_ProviderStub('ollama')]
+        payload = _run(ConsoleApi(legacy).models())
+        self.assertEqual(payload['task_models']['works']['astrbot_provider'], '')
+        self.assertEqual(legacy.task_model_id('works'), 'writer-conn', '值本身不动')
+
+    def test_the_astrbot_provider_list_names_the_works_writer_task(self):
+        """「这个 Provider 被哪些任务在用」也要认写手（否则用户看到的是"没人用它"）。"""
+        bridge = _make_bridge({'works': {'enabled': True, 'model_id': 'ollama'}})
+        bridge.context.get_all_providers = lambda: [_ProviderStub('ollama')]
+        bridge.provider_by_id = lambda pid: _ProviderStub(pid)  # type: ignore[method-assign]
+        row = _run(ConsoleApi(bridge).models())['astrbot_providers'][0]
+        self.assertIn('共同作品写手', row['used_by'])
 
     def test_usage_buffer_starts_empty_and_accumulates(self):
         self.assertEqual(_run(self.api.models())['usage']['sum']['calls'], 0)
@@ -445,6 +839,27 @@ class ConsoleApiTests(unittest.TestCase):
         # 返回给前端的列表里没有密钥原文
         self.assertNotIn('sk-brand-new', json.dumps(result, ensure_ascii=False))
 
+    def test_save_connection_keeps_the_protocol_fields(self):
+        """协议两项必须在白名单里——不然用户填了 Anthropic 协议，**保存时被静默丢掉**。
+
+        这是 v1.7.0 加 Anthropic 时真实存在的缺口：schema 里早就有 `protocol` /
+        `anthropic_cache`，`CONNECTION_FIELDS` 却没放行，控制台连接编辑器读得到、
+        存不回。断言直接对着白名单 + 一次真实保存往返。
+        """
+        import asyncio
+
+        self.assertIn('protocol', console_module.ConsoleApi.CONNECTION_FIELDS)
+        self.assertIn('anthropic_cache', console_module.ConsoleApi.CONNECTION_FIELDS)
+        saved = self._wire_writes()
+        asyncio.run(self.api.save_connection({
+            'label': 'Claude', 'endpoint': 'https://api.anthropic.com/v1/messages',
+            'api_key': 'sk-ant', 'model': 'claude-sonnet-4-5',
+            'protocol': 'anthropic-messages', 'anthropic_cache': True,
+        }))
+        row = saved['model_center']['providers'][-1]
+        self.assertEqual(row['protocol'], 'anthropic-messages')
+        self.assertIs(row['anthropic_cache'], True)
+
     def test_save_connection_without_api_key_keeps_the_old_one(self):
         """编辑时前端拿不到旧密钥，所以"不传"必须等于"不改"。"""
         import asyncio
@@ -561,6 +976,146 @@ class ConsoleApiTests(unittest.TestCase):
     def test_merge_story_requires_a_source(self):
         with self.assertRaises(ConsoleError):
             _run(self.api.merge_story(''))
+
+    # ---- 上轮上下文构成（v1.4.0） ----
+
+    def test_context_metrics_are_labelled_and_sorted(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        extensions = {}
+        extensions['last_context_metrics'] = {
+            'at': '2026-09-27T02:00:00Z', 'phase': 'user-message', 'participant_id': 'p1',
+            'assembly_ms': 37, 'items': 9, 'characters': 4200, 'payload_characters': 5100,
+            'estimated_tokens': 1800,
+            'sections': {
+                'facts': {'items': 4, 'characters': 1200},
+                'recentEntries': {'items': 5, 'characters': 3000},
+                'unknownSection': {'items': 0, 'characters': 0},
+            },
+        }
+        self.bridge.db.update('interlude_story', {'id': sid}, {
+            'state': json.dumps({'extensions': extensions}),
+        })
+        payload = _run(self.api.overview(sid))
+        metrics = payload['context_metrics']
+        self.assertEqual(metrics['estimated_tokens'], 1800)
+        self.assertEqual(metrics['assembly_ms'], 37)
+        self.assertEqual(metrics['phase'], 'user-message')
+        self.assertEqual([row['key'] for row in metrics['sections']], ['recentEntries', 'facts', 'unknownSection'],
+                         '按占用字符数排序，未知段名也给出行')
+        self.assertEqual(metrics['sections'][0]['label'], '近期条目')
+        self.assertEqual(metrics['sections'][2]['label'], 'unknownSection')
+
+    def test_context_metrics_are_empty_without_a_story(self):
+        self.assertEqual(_run(self.api.overview())['context_metrics'], {})
+
+    def test_context_metrics_survive_a_broken_state(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        self.bridge.db.update('interlude_story', {'id': sid}, {'state': 'not-json'})
+        self.assertEqual(_run(self.api.overview(sid))['context_metrics'], {})
+
+    # ---- 设定改写候选：审批与回滚（v1.4.0） ----
+
+    def _patch_row(self, story_id: str, status: str = 'proposed') -> int:
+        row = self.bridge.db.insert('interlude_state_patch', {
+            'storyId': story_id, 'participantId': '', 'target': 'character',
+            'path': 'development.trait', 'proposedValue': '她把伞留在了门口',
+            'evidence': 'seen once', 'confidence': 0.83, 'impact': 'minor',
+            'status': status, 'sourceEntryIds': json.dumps([1]),
+            'createdAt': '2026-09-25T14:33:00Z', 'appliedAt': None,
+        })
+        return int(row) if isinstance(row, int) else int(row.get('id'))
+
+    class _DecisionService:
+        def __init__(self, calls: list, error: Exception | None = None):
+            self.calls = calls
+            self.error = error
+
+        async def decide_state_patch(self, story_id, patch_id, action, note=''):
+            self.calls.append(('decide', story_id, patch_id, action, note))
+            if self.error:
+                raise self.error
+            return {'id': patch_id, 'status': 'applied' if action == 'approve' else 'rejected',
+                    'target': 'character', 'path': 'development.trait',
+                    'decided_at': '2026-09-27T00:00:00Z', 'note': note}
+
+        async def rollback_state_patch(self, story_id, patch_id, note=''):
+            self.calls.append(('rollback', story_id, patch_id, note))
+            if self.error:
+                raise self.error
+            return {'id': patch_id, 'status': 'rolled-back', 'target': 'character',
+                    'path': 'development.trait', 'decided_at': '2026-09-27T00:00:00Z', 'note': note}
+
+    def test_decide_patch_requires_a_service(self):
+        self._story_row('qq:20000:10001')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.decide_patch('qq:20000:10001', 1, 'approve'))
+
+    def test_decide_patch_reports_an_unknown_action(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        self.bridge.service = self._DecisionService([])
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.decide_patch(sid, 1, 'maybe'))
+        self.assertIn('未知的操作', str(caught.exception))
+
+    def test_decide_patch_passes_the_decision_through_and_returns_the_panel(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        patch_id = self._patch_row(sid)
+        calls: list = []
+        self.bridge.service = self._DecisionService(calls)
+        payload = _run(self.api.decide_patch(sid, patch_id, 'approve', '看着像对的'))
+        self.assertEqual(calls[0][0], 'decide')
+        self.assertEqual(calls[0][3], 'approve')
+        self.assertEqual(payload['patch']['status'], 'applied')
+        self.assertEqual(payload['changed'], 'patch-approve #%d' % patch_id)
+        self.assertIn('patches', payload, '写操作回整页数据，前端不用再拉一次')
+
+    def test_decide_patch_explains_a_compacted_candidate(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        self.bridge.service = self._DecisionService([], ValueError('already-compacted'))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.decide_patch(sid, 1, 'reject'))
+        self.assertIn('周期摘要', str(caught.exception))
+
+    def test_rollback_patch_requires_a_service_and_a_story(self):
+        self.bridge.service = self._DecisionService([])
+        with self.assertRaises(ConsoleError):
+            _run(self.api.rollback_patch('qq:20000:10001', 1))
+
+    def test_rollback_patch_explains_a_non_applied_candidate(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        self.bridge.service = self._DecisionService([], ValueError('not-applied'))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.rollback_patch(sid, 1))
+        self.assertIn('已经生效', str(caught.exception))
+
+    def test_rollback_patch_returns_the_panel(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        patch_id = self._patch_row(sid, status='applied')
+        calls: list = []
+        self.bridge.service = self._DecisionService(calls)
+        payload = _run(self.api.rollback_patch(sid, patch_id, '写错了'))
+        self.assertEqual(calls[0][0], 'rollback')
+        self.assertEqual(payload['patch']['status'], 'rolled-back')
+        self.assertEqual(payload['changed'], 'patch-rollback #%d' % patch_id)
+
+    def test_patch_brief_exposes_the_decision_trail(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        patch_id = self._patch_row(sid, status='rolled-back')
+        self.bridge.db.update('interlude_state_patch', {'id': patch_id}, {
+            'decidedAt': '2026-09-27T01:02:03Z', 'decisionNote': '主人说这条不算',
+        })
+        payload = _run(self.api.memory(sid))
+        brief = next(item for item in payload['patches'] if item['id'] == patch_id)
+        self.assertTrue(brief['decided_at'].startswith('2026-09-27'), brief['decided_at'])
+        self.assertEqual(brief['decision_note'], '主人说这条不算')
 
     # ---- 承诺与意图：内部调度折叠 ----
 
@@ -703,7 +1258,9 @@ class ConfigEditorTests(unittest.TestCase):
 
     def test_schema_payload_covers_every_group_and_field(self):
         payload = _run(self.api.config_schema())
-        self.assertEqual(len(payload['groups']), 22, '22 个顶层分组都要下发给配置页')
+        # 与 schema 文件对账（而不是写死数字）：平台动作的开关组（`actions_*`）会随动作目录
+        # 增长，写死 25 每加一组都要来改这里；这里只钉"schema 里每个顶层分组都下发了"。
+        self.assertEqual(len(payload['groups']), len(console_module.load_config_schema()))
         qa = next(group for group in payload['groups'] if group['key'] == 'qq_access')
         fields = {field['key']: field for field in qa['fields']}
         self.assertEqual(fields['user_accounts']['value'], [])
@@ -941,3 +1498,2410 @@ class ConfigEditorTests(unittest.TestCase):
         payload = _run(self.api.participants())
         self.assertEqual(payload['participants'][0]['user_id'], '10001')
         self.assertEqual(payload['participants'][0]['display_name'], '主人')
+
+    # ---- v1.7.2 升级现场：启动时把旧动作分组折进新分组 ----
+
+    def test_startup_migration_folds_legacy_action_switches_into_the_nested_group(self):
+        """宿主已把 `actions_chat` 按 schema 补成默认值，用户的开关还在旧分组里。
+
+        启动迁移必须把用户的选择折进**嵌套**新路径、清空旧组并写盘；折完之后用户在新路径里
+        **把开关改回默认值**（关掉→打开）也必须真的生效——这正是"只靠读取侧归并"
+        做不到的那一步（旧组里的旧值会永远压着新组）。
+        """
+        with open(self.path, 'w', encoding='utf-8') as handle:
+            handle.write('\ufeff' + json.dumps({
+                'actions_chat': {
+                    'enabled': True, 'send_poke': True, 'send_like': True,
+                    'send_voice': True, 'default_voice': '',
+                },
+                'actions_interaction': {'enabled': True, 'send_poke': False, 'send_like': True},
+                'actions_voice': {'enabled': True, 'send_voice': False,
+                                  'default_voice': 'zh-CN-YunxiNeural'},
+            }, ensure_ascii=False))
+        self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 1)
+        data = self._read()
+        chat = data['robot_actions']['chat']
+        self.assertIs(chat['send_poke'], False)
+        self.assertIs(chat['send_voice'], False)
+        # v1.7.5：音色跟着**键级搬迁**走到「模型中心 → 语音 / 音频理解设置」；
+        # 旧位置（可见组）清回 schema 默认值，但键还在（宿主按 schema 重建配置）。
+        self.assertEqual(data['model_center']['audio']['default_voice'], 'zh-CN-YunxiNeural')
+        self.assertEqual(chat['default_voice'], '')
+        self.assertEqual(data['actions_chat'], {}, '退休的顶层组折完清空')
+        self.assertEqual(data['actions_interaction'], {})
+        self.assertEqual(data['actions_voice'], {})
+        # 运行期立刻读到折完的那份（`save_raw_config` 会用刚写下去的那份生效）
+        self.assertIs(self.bridge.section('robot_actions.chat')['send_poke'], False)
+        # 幂等：再跑一次没有可折的东西，不写盘、内容不变
+        self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 0)
+        self.assertEqual(self._read(), data)
+        # 折完之后"改回默认值"必须生效（否则界面上就是"改了没反应"）
+        _run(self.api.set_config_value('robot_actions.chat.send_poke', True))
+        self.assertIs(self.bridge.section('robot_actions.chat')['send_poke'], True)
+        self.assertIs(self._read()['robot_actions']['chat']['send_poke'], True)
+
+    def test_startup_migration_leaves_the_retired_risk_group_untouched(self):
+        """v1.7.4 升级现场：退休的 `actions_risks` 只留兼容位，迁移既不读它也不清它。
+
+        它不再是归并源（用户判断那些配置没人用），所以折叠不碰它——回退到 v1.7.2 时那个
+        版本读的就是它，留着才不丢；而可见子组的内容只由 `actions_group` 这类真正的源决定。
+        """
+        with open(self.path, 'w', encoding='utf-8') as handle:
+            handle.write('\ufeff' + json.dumps({
+                # `get_group_members_info` 默认 true，"用户关掉"才算写过。
+                'actions_group': {'enabled': True, 'get_group_members_info': False},
+                'actions_risks': {'enabled': True, 'set_group_kick': True,
+                                  'delete_qzone_post': True, 'delete_friend': True},
+            }, ensure_ascii=False))
+        self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 1)
+        data = self._read()
+        self.assertIs(data['robot_actions']['group']['get_group_members_info'], False,
+                      '用户关掉的开关折进嵌套子组')
+        self.assertEqual(data['actions_group'], {}, '独占旧组折完清空')
+        self.assertEqual(data['actions_risks']['set_group_kick'], True,
+                         '不参与归并的兼容位原样保留')
+        # 运行期读到的是同一份；退休组里的键**不会**因此漏进可见子组。
+        group = self.bridge.section('robot_actions.group')
+        self.assertIs(group['get_group_members_info'], False)
+        self.assertNotIn('set_group_kick', group)
+        # 幂等：没有可折的东西了，不写盘
+        self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 0)
+        self.assertEqual(self._read(), data)
+        # 用户在新子组里改回默认值：只写嵌套路径，兼容位不动
+        _run(self.api.set_config_value('robot_actions.group.get_group_members_info', True))
+        stored = self._read()
+        self.assertIs(stored['robot_actions']['group']['get_group_members_info'], True)
+        self.assertIs(stored['actions_risks']['set_group_kick'], True)
+        self.assertIs(self.bridge.section('robot_actions.group')['get_group_members_info'], True)
+
+
+# =========================================================================== #
+# 共同作品（「作品」面板）
+# =========================================================================== #
+
+class _StubWorksService:
+    """桩服务层：只实现面板用到的成员，形状与 `core/service/chunk14.py` 一致。
+
+    用它钉住控制台**自己**的形状与空壳 / 400 路径（另一 agent 的 chunk14 还在改的时候
+    这些断言也必须能跑）；"接线真的通了"由 `WorksIntegrationTests` 用真服务层钉。
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        snapshot=None,
+        projection=None,
+        parts=None,
+        resolve_result=None,
+        edit_result=None,
+        generate_result=None,
+        create_result=None,
+        cancel_result=None,
+        calls=None,
+    ) -> None:
+        self.enabled = enabled
+        self.snapshot = snapshot
+        self.projection = projection
+        self.parts = parts
+        self.resolve_result = resolve_result if resolve_result is not None else {'ok': True, 'error': ''}
+        self.edit_result = edit_result if edit_result is not None else {'ok': True, 'error': ''}
+        self.generate_result = generate_result if generate_result is not None else {'ok': True, 'error': ''}
+        self.create_result = create_result if create_result is not None else {'ok': True, 'error': ''}
+        self.cancel_result = cancel_result if cancel_result is not None else {'ok': True, 'error': ''}
+        self.calls = calls if calls is not None else []
+
+    def works_config(self):
+        return {'enabled': self.enabled, 'generation_mode': 'main', 'model_id': ''}
+
+    def explain_works_state(self):
+        return ('共同作品已启用：主连接模式（提案由主叙事回合给出）' if self.enabled
+                else '共同作品未启用（配置 works.enabled 为 false 或缺失）')
+
+    async def works_snapshot(self, story, participant):
+        self.calls.append(('snapshot', story, participant))
+        # 可调用时按参与者给不同形状（清单里每一行都该是自己的那件作品）。
+        return self.snapshot(participant) if callable(self.snapshot) else self.snapshot
+
+    async def shared_work_state(self, story, participant):
+        self.calls.append(('state', story, participant))
+        return self.projection
+
+    async def works_dump(self, story, participant):
+        self.calls.append(('dump', story, participant))
+        return self.parts
+
+    async def create_work(self, story, participant, title, content):
+        self.calls.append(('create', story, participant, title, content))
+        return self.create_result
+
+    async def cancel_work_generation(self, story, participant, job_id):
+        self.calls.append(('cancel', story, participant, job_id))
+        return self.cancel_result
+
+    async def accept_work_proposal(self, work_id, proposal_id):
+        self.calls.append(('accept', work_id, proposal_id))
+        return self.resolve_result
+
+    async def reject_work_proposal(self, work_id, proposal_id):
+        self.calls.append(('reject', work_id, proposal_id))
+        return self.resolve_result
+
+    async def edit_work(self, story, participant, edit, source_entry_id=None, operation_key=''):
+        self.calls.append(('edit', story, participant, edit))
+        return self.edit_result
+
+    async def start_work_generation(self, story, participant, request, source_entry_id=None, operation_key=''):
+        self.calls.append(('generate', story, participant, request))
+        return self.generate_result
+
+
+class _LegacyWorksService(_StubWorksService):
+    """契约摘要里那一版签字：`edit_work(story, participant, content, reason)`。
+
+    控制台按签名挑调用形状（`_call_work_edit` / `_call_work_generate`），两种都要能跑。
+    """
+
+    async def edit_work(self, story, participant, content, reason=''):
+        self.calls.append(('edit-legacy', story, participant, content, reason))
+        return self.edit_result
+
+    async def start_work_generation(self, story, participant, brief):
+        self.calls.append(('generate-legacy', story, participant, brief))
+        return self.generate_result
+
+
+def _works_bridge(config):
+    """真库 + 真服务层的桥：控制台与 `chunk14` 读同一份数据（接线真的通了才算过）。"""
+    database = Database(':memory:')
+    with mock.patch.object(bridge_module, 'Database', lambda path: database), \
+            mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: TEST_DATA_DIR):
+        bridge = bridge_module.AstrbotBridge(
+            context=FakeContext(), config=config, logger=sys.modules['astrbot'].logger,
+        )
+    database.register_tables()
+    return bridge, database
+
+
+def _work_state(head='rev-2', *, title='海边的信', revisions=None, proposals=None, jobs=None):
+    """一份合法的 `interlude_work.state`（上游形状：camelCase）。"""
+    revisions = revisions if revisions is not None else [
+        {'id': 'rev-1', 'parentId': None, 'author': 'user', 'content': '第一版正文',
+         'createdAt': '2026-09-01T10:00:00.000Z'},
+        {'id': 'rev-2', 'parentId': 'rev-1', 'author': 'protagonist', 'proposalId': 'prop-1',
+         'content': '她改过的正文', 'createdAt': '2026-09-02T10:00:00.000Z'},
+    ]
+    state = {
+        'schemaVersion': 1,
+        'title': title,
+        'head': head,
+        'revisions': revisions,
+        'proposals': proposals if proposals is not None else [],
+    }
+    if jobs is not None:
+        state['jobs'] = jobs
+    return state
+
+
+class WorksPanelTests(unittest.TestCase):
+    """「作品」面板的后端：清单 / 详情 / 接受 / 驳回 / 手改 / 起草 / 导出。"""
+
+    SID = 'character:qq:20000'
+    PID = 'p-kela'
+    WID = 'character:qq:20000:p-kela'
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.bridge = _make_bridge({'works': {'enabled': True}})
+        self.bridge.service = None
+        self.database = Database(':memory:')
+        self.addCleanup(self.database.close)
+        self.database.register_tables()
+        self.bridge.db = self.database
+        self.api = ConsoleApi(self.bridge)
+        self._story_row()
+        self._participant_row()
+
+    def _story_row(self, story_id=None, status='active'):
+        self.database.upsert('interlude_story', {
+            'id': story_id or self.SID, 'status': status, 'platform': 'qq',
+            'setting': {'character': {'name': '凌梦'}, 'user': {'name': '主人'}},
+            'state': {}, 'createdAt': '2026-09-01T00:00:00.000Z',
+            'updatedAt': '2026-09-02T00:00:00.000Z',
+        })
+
+    def _participant_row(self, participant_id=None, name='主人', story_id=None):
+        self.database.upsert('interlude_participant', {
+            'id': participant_id or self.PID, 'storyId': story_id or self.SID,
+            'platform': 'onebot', 'selfId': '20000', 'userId': '10001',
+            'channelId': 'private:10001', 'personId': 'kela', 'displayName': name,
+            'status': 'active', 'state': {},
+            'createdAt': '2026-09-01T00:00:00.000Z', 'updatedAt': '2026-09-02T00:00:00.000Z',
+        })
+
+    @staticmethod
+    def _calls(calls, kind):
+        """按类型挑服务层调用（读详情会先调一次 `works_snapshot`，别按位置取）。"""
+        return [call for call in calls if call[0] == kind]
+
+    def _work_row(self, state=None, work_id=None, story_id=None, participant_id=None, generation=3):
+        self.database.upsert('interlude_work', {
+            'id': work_id or self.WID,
+            'storyId': story_id or self.SID,
+            'participantId': participant_id or self.PID,
+            'generation': generation,
+            'state': state if state is not None else _work_state(),
+        })
+        return work_id or self.WID
+
+    def _snapshot(self, **overrides):
+        """`works_snapshot` 的返回形状（服务层原样投影，camelCase）。"""
+        snapshot = {
+            'workId': self.WID,
+            'title': '海边的信',
+            'head': 'rev-2',
+            'generation': 3,
+            'revisions': [
+                {'id': 'rev-1', 'parentId': None, 'author': 'user', 'proposalId': None,
+                 'createdAt': '2026-09-01T10:00:00.000Z', 'content': '第一版正文'},
+                {'id': 'rev-2', 'parentId': 'rev-1', 'author': 'protagonist', 'proposalId': 'prop-1',
+                 'createdAt': '2026-09-02T10:00:00.000Z', 'content': '她改过的正文'},
+            ],
+            'proposals': [
+                {'id': 'prop-2', 'baseRevisionId': 'rev-2', 'author': 'protagonist',
+                 'content': '再补一段', 'reason': '把结尾收一下', 'status': 'pending',
+                 'operationKey': 'live', 'createdAt': '2026-09-03T10:00:00.000Z'},
+                {'id': 'prop-1', 'baseRevisionId': 'rev-1', 'author': 'protagonist',
+                 'content': '她改过的正文', 'reason': '第一处修改', 'status': 'accepted',
+                 'operationKey': 'entry:7', 'createdAt': '2026-09-02T10:00:00.000Z'},
+            ],
+            'jobs': [
+                {'id': 'job-1', 'status': 'completed', 'modelId': 'demo', 'brief': '写一版',
+                 'createdAt': '2026-09-03T09:00:00.000Z', 'baseRevisionId': 'rev-2'},
+            ],
+            'lastFailure': None,
+            'revisionLimit': 64,
+        }
+        snapshot.update(overrides)
+        return snapshot
+
+    # ---- 服务层未就绪：空壳，不是 500 ----
+
+    def test_reads_without_a_service_are_shells_not_errors(self):
+        overview = _run(self.api.works_overview(self.SID))
+        self.assertFalse(overview['available'])
+        self.assertIn('服务层未就绪', overview['hint'])
+        self.assertEqual(overview['works'], [])
+        detail = _run(self.api.work_detail(self.WID))
+        self.assertFalse(detail['available'])
+        self.assertEqual(detail['work_id'], self.WID)
+        export = _run(self.api.export_work(self.WID))
+        self.assertFalse(export['available'])
+        self.assertEqual(export['parts'], [])
+
+    def test_writes_without_a_service_report_a_shell_instead_of_pretending(self):
+        self.assertEqual(_run(self.api.accept_work_proposal(self.WID, 'prop-2'))['available'], False)
+        self.assertEqual(_run(self.api.reject_work_proposal(self.WID, 'prop-2'))['available'], False)
+        self.assertEqual(_run(self.api.edit_work(self.WID, '新正文'))['available'], False)
+        self.assertEqual(_run(self.api.start_work_generation(self.WID, '写一版'))['available'], False)
+
+    def test_the_shell_carries_the_service_explanation_when_it_can(self):
+        """拿不到 `works_snapshot` 但有 `explain_works_state` 时，说明文案要用它那句。"""
+
+        class _ConfigOnly:
+            def explain_works_state(self):
+                return '共同作品未启用（配置 works.enabled 为 false 或缺失）'
+
+        self.bridge.service = _ConfigOnly()
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertIn('works_snapshot', payload['hint'], '缺哪个成员要说出来')
+        self.assertIn('共同作品未启用', payload['hint'])
+
+    # ---- 清单 ----
+
+    def test_overview_lists_one_row_per_participant(self):
+        self._work_row()
+        self._participant_row(participant_id='p-xishi', name='汐雨.')
+        self._work_row(work_id='%s:p-xishi' % self.SID, participant_id='p-xishi', generation=1,
+                       state=_work_state(head='rev-1', title='另一件',
+                                         revisions=[{'id': 'rev-1', 'parentId': None, 'author': 'user',
+                                                     'content': 'x', 'createdAt': '2026-08-01T00:00:00.000Z'}],
+                                         proposals=[]))
+        older = self._snapshot(
+            title='另一件', head='rev-1', generation=1, proposals=[], jobs=[],
+            revisions=[{'id': 'rev-1', 'parentId': None, 'author': 'user', 'proposalId': None,
+                        'createdAt': '2026-08-01T00:00:00.000Z', 'content': 'x'}],
+        )
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=lambda participant: self._snapshot() if participant == self.PID else older,
+            calls=calls,
+        )
+
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertTrue(payload['available'])
+        self.assertTrue(payload['enabled'])
+        self.assertEqual(payload['story']['character'], '凌梦')
+        rows = {item['participant_id']: item for item in payload['works']}
+        self.assertEqual(sorted(rows), ['p-kela', 'p-xishi'])
+        self.assertEqual(rows['p-kela']['participant'], '主人')
+        self.assertEqual(rows['p-kela']['title'], '海边的信')
+        self.assertEqual(rows['p-kela']['revision'], 2, '当前版本号 = head 在时间线里的位置')
+        self.assertEqual(rows['p-kela']['revision_count'], 2)
+        self.assertEqual(rows['p-kela']['pending_count'], 1)
+        self.assertEqual(rows['p-kela']['jobs_running'], 0)
+        self.assertEqual(rows['p-kela']['updated_at'], '2026-09-03T10:00:00.000Z')
+        self.assertTrue(rows['p-kela']['may_propose'])
+        self.assertNotIn('content', rows['p-kela'], '清单行不带正文（正文在详情里）')
+        self.assertEqual(rows['p-xishi']['title'], '另一件')
+        self.assertEqual(rows['p-xishi']['revision'], 1)
+        self.assertEqual(rows['p-xishi']['pending_count'], 0)
+        self.assertEqual(rows['p-xishi']['updated_at'], '2026-08-01T00:00:00.000Z')
+        # 参与者按更新时间倒序：p-kela 更新 → 排前面
+        self.assertEqual([item['participant_id'] for item in payload['works']], ['p-kela', 'p-xishi'])
+        json.dumps(payload, ensure_ascii=False)
+
+    def test_overview_marks_an_unreadable_row_instead_of_hiding_it(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(snapshot=None)
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertEqual(len(payload['works']), 1)
+        self.assertTrue(payload['works'][0]['broken'])
+        self.assertEqual(payload['works'][0]['revision_count'], 2, '坏行也得把能读的读出来')
+
+    def test_overview_without_a_story_or_work_is_an_empty_shell(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        clean = Database(':memory:')
+        self.addCleanup(clean.close)
+        clean.register_tables()
+        self.bridge.db = clean
+        empty = _run(self.api.works_overview(self.SID))
+        self.assertIsNone(empty['story'])
+        self.assertEqual(empty['works'], [])
+        self.assertTrue(empty['hint'])
+
+        self.bridge.db = self.database
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertTrue(payload['available'])
+        self.assertEqual(payload['works'], [], '开了但还没作品：空清单，不是空壳')
+
+    def test_works_disabled_says_so_instead_of_looking_empty(self):
+        self.bridge.service = _StubWorksService(enabled=False, snapshot=self._snapshot())
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertTrue(payload['available'], '功能没开不代表面板打不开')
+        self.assertFalse(payload['enabled'], '前端据此提示"去配置页打开共同作品"')
+
+    # ---- 详情 ----
+
+    def test_detail_returns_the_head_text_and_the_version_timeline(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        payload = _run(self.api.work_detail(self.WID))
+
+        self.assertTrue(payload['available'])
+        self.assertEqual(payload['participant'], '主人')
+        self.assertEqual(payload['title'], '海边的信')
+        self.assertEqual(payload['content'], '她改过的正文', '正文原样回，不做任何安全改写')
+        self.assertEqual(payload['content_chars'], 6)
+        self.assertEqual(payload['revision'], 2)
+        self.assertEqual(payload['revision_count'], 2)
+        revisions = {item['id']: item for item in payload['revisions']}
+        self.assertEqual([item['ordinal'] for item in payload['revisions']], [1, 2])
+        self.assertTrue(revisions['rev-2']['current'])
+        self.assertFalse(revisions['rev-1']['current'])
+        self.assertEqual(revisions['rev-1']['author'], 'user')
+        self.assertEqual(revisions['rev-2']['author'], 'protagonist')
+        self.assertEqual(revisions['rev-1']['created_at'], '2026-09-01T10:00:00.000Z')
+        self.assertNotIn('content', revisions['rev-1'], '历史版本只给预览，不给全文')
+        self.assertEqual(revisions['rev-1']['preview'], '第一版正文')
+        proposals = {item['id']: item for item in payload['proposals']}
+        self.assertEqual(proposals['prop-2']['status'], 'pending')
+        self.assertTrue(proposals['prop-2']['pending'])
+        self.assertEqual(proposals['prop-2']['reason'], '把结尾收一下')
+        self.assertEqual(proposals['prop-2']['base_revision_id'], 'rev-2')
+        self.assertEqual(proposals['prop-2']['base_revision'], 2)
+        self.assertFalse(proposals['prop-1']['pending'])
+        self.assertEqual(payload['pending_count'], 1)
+        self.assertEqual(payload['jobs'][0]['status'], 'completed')
+        self.assertEqual(payload['limits']['content'], console_module.WORK_CONTENT_MAX)
+        json.dumps(payload, ensure_ascii=False)
+
+    def test_detail_uses_the_service_projection_for_may_propose(self):
+        self._work_row(state=_work_state(jobs=[{'id': 'job-9', 'status': 'running',
+                                                'createdAt': '2026-09-04T00:00:00.000Z'}]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(jobs=[{'id': 'job-9', 'status': 'running',
+                                           'createdAt': '2026-09-04T00:00:00.000Z'}]),
+            projection={'mayPropose': False, 'lastFailure': {'sourceEntryId': 7,
+                                                             'status': 'proposal-not-saved',
+                                                             'at': '2026-09-04T01:00:00.000Z'}},
+            calls=calls,
+        )
+        payload = _run(self.api.work_detail(self.WID))
+        self.assertFalse(payload['may_propose'])
+        self.assertIn('在跑', payload['may_propose_reason'])
+        self.assertEqual(payload['jobs_running'], 1)
+        self.assertEqual(payload['last_failure']['status'], 'proposal-not-saved')
+        self.assertIn(('state', self.SID, self.PID), calls)
+
+    def test_detail_explains_a_disabled_feature_instead_of_a_dead_button(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(enabled=False, snapshot=self._snapshot())
+        payload = _run(self.api.work_detail(self.WID))
+        self.assertFalse(payload['may_propose'])
+        self.assertIn('配置', payload['may_propose_reason'])
+        self.assertEqual(payload['content'], '她改过的正文', '没开也得看得到她写过什么')
+
+    def test_detail_reports_a_broken_row_without_touching_it(self):
+        self._work_row(state={'schemaVersion': 99})
+        self.bridge.service = _StubWorksService(snapshot=None)
+        payload = _run(self.api.work_detail(self.WID))
+        self.assertTrue(payload['available'])
+        self.assertTrue(payload['broken'])
+        self.assertEqual(payload['revisions'], [])
+        self.assertIn('原数据', payload['hint'])
+        still = self.database.get('interlude_work', {'id': self.WID})
+        self.assertEqual(still['state'], {'schemaVersion': 99}, '坏行必须保持原样')
+
+    def test_detail_rejects_unknown_ids_with_a_400(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.work_detail(''))
+        self.assertIn('请选择', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.work_detail('不存在'))
+        self.assertIn('找不到', str(caught.exception))
+
+    # ---- 接受 / 驳回（只有用户能做） ----
+
+    def test_accept_passes_the_ids_through_and_returns_the_panel(self):
+        self._work_row()
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            resolve_result={'ok': True, 'error': '', 'workId': self.WID, 'head': 'rev-9', 'revisions': 3},
+            calls=calls,
+        )
+        payload = _run(self.api.accept_work_proposal(self.WID, 'prop-2'))
+        self.assertIn(('accept', self.WID, 'prop-2'), calls)
+        self.assertEqual(self._calls(calls, 'reject'), [], '接受不该顺带调驳回')
+        self.assertEqual(payload['changed'], 'work-accept prop-2')
+        self.assertEqual(payload['result']['head'], 'rev-9')
+        self.assertIn('proposals', payload, '写完备回整页数据，前端不用再拉一次')
+
+    def test_reject_goes_through_the_reject_member(self):
+        self._work_row(state=_work_state(proposals=[{'id': 'prop-2', 'status': 'pending',
+                                                    'baseRevisionId': 'rev-2'}]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), calls=calls)
+        payload = _run(self.api.reject_work_proposal(self.WID, 'prop-2'))
+        self.assertIn(('reject', self.WID, 'prop-2'), calls)
+        self.assertEqual(payload['changed'], 'work-reject prop-2')
+
+    def test_unknown_work_or_proposal_is_a_400(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.accept_work_proposal('不存在的作品', 'prop-2'))
+        self.assertIn('找不到这件共同作品', str(caught.exception))
+        self._work_row()
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.accept_work_proposal(self.WID, '不存在的提案'))
+        self.assertIn('找不到这条提案', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.accept_work_proposal(self.WID, ''))
+
+    def test_a_decided_proposal_can_not_be_resolved_again(self):
+        self._work_row(state=_work_state(proposals=[{'id': 'prop-1', 'status': 'accepted',
+                                                     'baseRevisionId': 'rev-1'}]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), calls=calls)
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.reject_work_proposal(self.WID, 'prop-1'))
+        self.assertIn('已经处理过', str(caught.exception))
+        self.assertEqual(self._calls(calls, 'reject'), [], '结论已定就别再去打扰服务层')
+
+    def test_a_service_side_failure_becomes_a_400_with_the_reason(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            resolve_result={'ok': False, 'error': '提案基于旧版本；保留提案，不覆盖当前作品。'},
+        )
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.accept_work_proposal(self.WID, 'prop-2'))
+        self.assertIn('基于旧版本', str(caught.exception))
+
+    # ---- 新建作品（整条链的起点） ----
+
+    def test_create_without_a_service_is_a_shell(self):
+        self.assertEqual(_run(self.api.create_work(self.SID, self.PID, '标题', '正文'))['available'], False)
+
+    def test_create_validates_the_inputs(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, '', '标题', '正文'))
+        self.assertIn('参与者', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, 'p-不存在', '标题', '正文'))
+        self.assertIn('不在当前剧本', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, self.PID, '  ', '正文'))
+        self.assertIn('标题', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.create_work(self.SID, self.PID, '标' * (console_module.WORK_TITLE_MAX + 1), '正文'))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, self.PID, '标题', '   '))
+        self.assertIn('不能为空', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, self.PID, '标题', '字' * (console_module.WORK_CONTENT_MAX + 1)))
+        self.assertIn('最多', str(caught.exception))
+
+    def test_create_passes_the_fields_through_and_returns_the_new_work(self):
+        wid = 'w-new'
+        self._work_row(work_id=wid, state=_work_state(head='rev-1', revisions=[
+            {'id': 'rev-1', 'parentId': None, 'author': 'user', 'content': '第一版正文',
+             'createdAt': '2026-09-01T10:00:00.000Z'},
+        ]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(workId=wid, head='rev-1', generation=0),
+            create_result={'ok': True, 'error': '', 'workId': wid, 'head': 'rev-1'},
+            calls=calls,
+        )
+        payload = _run(self.api.create_work('', self.PID, '海边的信', '第一版正文'))
+        self.assertEqual(self._calls(calls, 'create')[0],
+                         ('create', self.SID, self.PID, '海边的信', '第一版正文'))
+        self.assertEqual(payload['work_id'], wid)
+        self.assertEqual(payload['changed'], 'work-create %s' % wid)
+        self.assertEqual(payload['result']['head'], 'rev-1')
+
+    def test_create_reports_the_duplicate_refusal_verbatim(self):
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            create_result={'ok': False, 'error': '该私聊已有共同作品；请提出修改，不覆盖旧版本。'},
+        )
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, self.PID, '标题', '正文'))
+        self.assertIn('已有共同作品', str(caught.exception), '服务层那条"绝不覆盖"必须原样透给用户')
+
+    def test_create_without_a_story_is_a_400(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        empty = Database(':memory:')
+        self.addCleanup(empty.close)
+        empty.register_tables()
+        self.bridge.db = empty
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work('', self.PID, '标题', '正文'))
+        self.assertIn('剧本', str(caught.exception))
+
+    # ---- 取消写手任务 ----
+
+    def test_cancel_without_a_service_is_a_shell(self):
+        self.assertEqual(_run(self.api.cancel_work_generation(self.WID, 'job-1'))['available'], False)
+
+    def test_cancel_validates_the_job(self):
+        self._work_row(state=_work_state(jobs=[
+            {'id': 'job-1', 'status': 'completed', 'createdAt': '2026-09-03T09:00:00.000Z'},
+        ]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), calls=calls)
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.cancel_work_generation(self.WID, ''))
+        self.assertIn('请选择', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.cancel_work_generation(self.WID, 'job-不存在'))
+        self.assertIn('找不到', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.cancel_work_generation(self.WID, 'job-1'))
+        self.assertIn('已经结束', str(caught.exception))
+        self.assertEqual(self._calls(calls, 'cancel'), [], '结论已定的任务别去打扰服务层')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.cancel_work_generation('不存在的作品', 'job-1'))
+
+    def test_cancel_passes_the_ids_through(self):
+        self._work_row(state=_work_state(jobs=[
+            {'id': 'job-1', 'status': 'running', 'createdAt': '2026-09-03T09:00:00.000Z'},
+        ]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(jobs=[{'id': 'job-1', 'status': 'running',
+                                           'createdAt': '2026-09-03T09:00:00.000Z'}]),
+            calls=calls,
+        )
+        payload = _run(self.api.cancel_work_generation(self.WID, 'job-1'))
+        self.assertEqual(self._calls(calls, 'cancel')[0], ('cancel', self.SID, self.PID, 'job-1'))
+        self.assertEqual(payload['changed'], 'work-cancel job-1')
+
+    def test_cancel_accepts_an_interrupted_job(self):
+        """插件重启过、库里还留着 running 的遗留任务：它一直压着 mayPropose，得能取消。"""
+        self._work_row(state=_work_state(jobs=[
+            {'id': 'job-1', 'status': 'running', 'createdAt': '2026-09-03T09:00:00.000Z'},
+        ]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(jobs=[{'id': 'job-1', 'status': 'interrupted',
+                                           'createdAt': '2026-09-03T09:00:00.000Z'}]),
+            calls=calls,
+        )
+        _run(self.api.cancel_work_generation(self.WID, 'job-1'))
+        self.assertEqual(self._calls(calls, 'cancel')[0][3], 'job-1')
+
+    # ---- 用户手改 ----
+
+    def test_edit_uses_the_current_head_and_keeps_the_text_verbatim(self):
+        self._work_row()
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            edit_result={'ok': True, 'error': '', 'workId': self.WID, 'head': 'rev-3',
+                         'revision': {'id': 'rev-3'}},
+            calls=calls,
+        )
+        payload = _run(self.api.edit_work(self.WID, '我重写的一段\n带换行', '改个结尾'))
+        kind, story, participant, edit = self._calls(calls, 'edit')[0]
+        self.assertEqual((kind, story, participant), ('edit', self.SID, self.PID))
+        self.assertEqual(edit['baseRevisionId'], 'rev-2', '基础版本必须是当前 head')
+        self.assertEqual(edit['content'], '我重写的一段\n带换行')
+        self.assertEqual(edit['reason'], '改个结尾')
+        self.assertEqual(payload['changed'], 'work-edit %s' % self.WID)
+        self.assertEqual(payload['result']['revision_id'], 'rev-3')
+
+    def test_edit_fills_in_a_reason_when_the_user_left_it_empty(self):
+        self._work_row()
+        calls: list = []
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), calls=calls)
+        _run(self.api.edit_work(self.WID, '新正文'))
+        self.assertTrue(self._calls(calls, 'edit')[0][3]['reason'],
+                        '服务层要求理由非空，控制台别把空串塞进去')
+
+    def test_edit_rejects_empty_and_oversized_content(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.edit_work(self.WID, '   '))
+        self.assertIn('不能为空', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.edit_work(self.WID, '字' * (console_module.WORK_CONTENT_MAX + 1)))
+        self.assertIn('最多', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.edit_work(self.WID, '正文', '理由' * (console_module.WORK_REASON_MAX + 1)))
+        # 上限内照常通过
+        payload = _run(self.api.edit_work(self.WID, '字' * console_module.WORK_CONTENT_MAX))
+        self.assertTrue(payload['available'])
+
+    def test_edit_rejects_an_unknown_work(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError):
+            _run(self.api.edit_work('不存在', '正文'))
+
+    # ---- 让她起草 ----
+
+    def test_generate_requires_a_brief_and_caps_it(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.start_work_generation(self.WID, '  '))
+        self.assertIn('创作意图', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.start_work_generation(self.WID, '意' * (console_module.WORK_BRIEF_MAX + 1)))
+        self.assertIn('最多', str(caught.exception))
+
+    def test_generate_starts_a_job_with_the_current_head(self):
+        self._work_row()
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            generate_result={'ok': True, 'error': '', 'job': {'id': 'job-2', 'status': 'running'},
+                             'modelId': 'demo', 'generationMode': 'main'},
+            calls=calls,
+        )
+        payload = _run(self.api.start_work_generation(self.WID, '写一段海边的结尾'))
+        kind, story, participant, request = self._calls(calls, 'generate')[0]
+        self.assertEqual((kind, story, participant), ('generate', self.SID, self.PID))
+        self.assertEqual(request['baseRevisionId'], 'rev-2')
+        self.assertEqual(request['brief'], '写一段海边的结尾')
+        self.assertEqual(payload['job']['id'], 'job-2')
+        self.assertEqual(payload['changed'], 'work-generate %s' % self.WID)
+
+    def test_generate_reports_a_service_side_refusal(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            generate_result={'ok': False, 'error': '共同作品未启用。'},
+        )
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.start_work_generation(self.WID, '写一段'))
+        self.assertIn('未启用', str(caught.exception))
+
+    # ---- 调用形状自适应（服务层两种签字） ----
+
+    def test_edit_and_generate_adapt_to_the_content_reason_signature(self):
+        self._work_row()
+        calls: list = []
+        self.bridge.service = _LegacyWorksService(snapshot=self._snapshot(), calls=calls)
+        _run(self.api.edit_work(self.WID, '新正文', '理由'))
+        self.assertEqual(self._calls(calls, 'edit-legacy')[0],
+                         ('edit-legacy', self.SID, self.PID, '新正文', '理由'))
+        _run(self.api.start_work_generation(self.WID, '写一版'))
+        self.assertEqual(self._calls(calls, 'generate-legacy')[0],
+                         ('generate-legacy', self.SID, self.PID, '写一版'))
+
+    # ---- 导出 ----
+
+    def test_export_returns_the_service_parts_without_resplitting(self):
+        self._work_row()
+        parts = ['a' * 2400, 'b' * 2400, 'c' * 10]
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), parts=parts)
+        payload = _run(self.api.export_work(self.WID))
+        self.assertEqual(payload['parts'], parts, '分段归服务层切，控制台不许再切一遍')
+        self.assertEqual(payload['count'], 3)
+        self.assertEqual(payload['chars'], sum(len(part) for part in parts))
+        self.assertEqual(payload['title'], '海边的信')
+
+    def test_export_of_a_work_without_text_says_so(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), parts=[])
+        payload = _run(self.api.export_work(self.WID))
+        self.assertEqual(payload['count'], 0)
+        self.assertTrue(payload['hint'])
+
+    def test_export_rejects_an_unknown_work(self):
+        self.bridge.service = _StubWorksService(parts=['x'])
+        with self.assertRaises(ConsoleError):
+            _run(self.api.export_work('不存在'))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.export_work(''))
+
+    # ---- 容错 ----
+
+    def test_works_endpoints_survive_a_broken_database(self):
+        """表被删了（旧库 / 手工改过）也不能让面板 500。"""
+
+        class _Broken:
+            path = ''
+
+            def all(self, *_args, **_kwargs):
+                raise RuntimeError('no such table')
+
+            def get(self, *_args, **_kwargs):
+                raise RuntimeError('no such table')
+
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with mock.patch.object(self.bridge, 'db', _Broken()):
+            payload = _run(self.api.works_overview(self.SID))
+            self.assertEqual(payload['works'], [])
+            with self.assertRaises(ConsoleError):
+                _run(self.api.work_detail(self.WID))
+
+
+class WorksIntegrationTests(unittest.TestCase):
+    """真的接上了才算数：控制台 ↔ `chunk14` ↔ `interlude_work` 表跑一遍完整链路。
+
+    作品主键是 `work_key()` 的 sha256（不是 `story:participant`），所以 id 一律从服务层
+    的返回值里拿——测试里手拼一个 id 就等于自己骗自己。
+    """
+
+    SID = 'character:qq:20000'
+    PID = 'p-kela'
+
+    def setUp(self):
+        self.bridge, self.database = _works_bridge({'works': {'enabled': True}})
+        self.addCleanup(self.database.close)
+        self.api = ConsoleApi(self.bridge)
+        self.database.upsert('interlude_story', {
+            'id': self.SID, 'status': 'active', 'platform': 'qq',
+            'setting': {'character': {'name': '凌梦'}, 'user': {'name': '主人'}},
+            'state': {}, 'createdAt': '2026-09-01T00:00:00.000Z',
+            'updatedAt': '2026-09-02T00:00:00.000Z',
+        })
+        self.database.upsert('interlude_participant', {
+            'id': self.PID, 'storyId': self.SID, 'platform': 'onebot', 'selfId': '20000',
+            'userId': '10001', 'channelId': 'private:10001', 'personId': 'kela',
+            'displayName': '主人', 'status': 'active', 'state': {},
+            'createdAt': '2026-09-01T00:00:00.000Z', 'updatedAt': '2026-09-02T00:00:00.000Z',
+        })
+        self.wid = ''
+
+    def _create(self, title='海边的信', content='第一版正文'):
+        """用**服务层**建一件作品（与真实写法一致），返回 workId。"""
+        created = _run(self.bridge.service.create_work(self.SID, self.PID, title, content))
+        self.assertTrue(created['ok'], created)
+        self.wid = created['workId']
+        self.assertTrue(self.wid, 'workId 是服务层生成的（sha256），不许自己拼')
+        return self.wid
+
+    def _head(self):
+        row = self.database.get('interlude_work', {'id': self.wid})
+        return row['state']['head']
+
+    def test_the_whole_panel_flow_against_the_real_service(self):
+        service = self.bridge.service
+        self.assertTrue(callable(getattr(service, 'works_snapshot', None)),
+                        '服务层没接线时这条用例要红（面板就只剩空壳了）')
+        self._create()
+
+        # 她还什么都没提议时：清单一行、0 待决、可以让她起草
+        overview = _run(self.api.works_overview(self.SID))
+        self.assertTrue(overview['available'])
+        self.assertTrue(overview['enabled'])
+        self.assertEqual([item['work_id'] for item in overview['works']], [self.wid])
+        self.assertEqual(overview['works'][0]['participant'], '主人')
+        self.assertEqual(overview['works'][0]['title'], '海边的信')
+        self.assertEqual(overview['works'][0]['revision'], 1)
+        self.assertEqual(overview['works'][0]['pending_count'], 0)
+        self.assertTrue(overview['works'][0]['may_propose'])
+
+        # 她提了一条（作者 = protagonist，待决）→ 清单的待决徽章 +1、详情看得到正文与理由
+        proposal = _run(service.apply_work_proposal(self.SID, self.PID, {
+            'baseRevisionId': self._head(), 'content': '她提议的正文', 'reason': '把结尾收一下',
+        }))
+        self.assertIsNotNone(proposal, '模型侧的提案该落成待决提案')
+        overview = _run(self.api.works_overview(self.SID))
+        self.assertEqual(overview['works'][0]['pending_count'], 1)
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['content'], '第一版正文', '待决提案不该动 head')
+        self.assertEqual(detail['pending_count'], 1)
+        self.assertEqual(detail['proposals'][0]['author'], 'protagonist')
+        self.assertEqual(detail['proposals'][0]['reason'], '把结尾收一下')
+        self.assertEqual(detail['proposals'][0]['base_revision'], 1)
+
+        # 只有用户能接受：接受后 head 前移、版本数 +1
+        accepted = _run(self.api.accept_work_proposal(self.wid, proposal['id']))
+        self.assertEqual(accepted['changed'], 'work-accept %s' % proposal['id'])
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['content'], '她提议的正文')
+        self.assertEqual(detail['revision_count'], 2)
+        self.assertEqual(detail['revision'], 2)
+        self.assertEqual(detail['pending_count'], 0)
+        self.assertEqual([item['author'] for item in detail['revisions']], ['user', 'protagonist'])
+        self.assertTrue(detail['revisions'][1]['current'])
+        self.assertNotIn('content', detail['revisions'][0], '历史版本只给预览')
+
+        # 用户手改：一条新版本，作者 = user
+        edited = _run(self.api.edit_work(self.wid, '我自己改的正文', '还是我来收尾'))
+        self.assertEqual(edited['changed'], 'work-edit %s' % self.wid)
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['content'], '我自己改的正文')
+        self.assertEqual(detail['revision_count'], 3)
+        self.assertEqual(detail['revisions'][-1]['author'], 'user')
+        self.assertEqual(detail['revisions'][-1]['ordinal'], 3)
+        self.assertEqual(detail['content_chars'], len('我自己改的正文'))
+
+        # 导出：分段由服务层切好，拼回去就是完整的一行 JSON
+        exported = _run(self.api.export_work(self.wid))
+        self.assertGreaterEqual(exported['count'], 1)
+        self.assertEqual(''.join(exported['parts']), json.dumps(
+            self.database.get('interlude_work', {'id': self.wid}),
+            ensure_ascii=False, separators=(',', ':'),
+        ))
+        json.dumps(exported, ensure_ascii=False)
+
+    def test_a_long_work_is_split_into_message_sized_parts(self):
+        """长文导出要真的分段：每段都在单条消息的安全长度内，拼回来一字不差。"""
+        from plugin.core.works import DUMP_PART_MAX_LEN
+
+        self._create(content='正文。' * 2000)
+        exported = _run(self.api.export_work(self.wid))
+        self.assertGreater(exported['count'], 1)
+        for part in exported['parts']:
+            self.assertLessEqual(len(part), DUMP_PART_MAX_LEN, '每段都要能单条消息发出去')
+        self.assertEqual(exported['chars'], sum(len(part) for part in exported['parts']))
+        self.assertEqual(json.loads(''.join(exported['parts']))['id'], self.wid)
+
+    def test_create_through_the_panel_starts_the_chain(self):
+        """整条链的起点：没有它，保存提案 / 手改 / 起草全都无从下手。"""
+        payload = _run(self.api.create_work('', self.PID, '海边的信', '第一版正文'))
+        self.assertTrue(payload['available'])
+        self.assertTrue(payload['work_id'])
+        self.assertEqual(payload['changed'], 'work-create %s' % payload['work_id'])
+        self.assertEqual(payload['title'], '海边的信')
+        self.assertEqual(payload['content'], '第一版正文')
+        self.assertEqual(payload['revision_count'], 1)
+        self.assertEqual(payload['revisions'][0]['author'], 'user')
+        overview = _run(self.api.works_overview(self.SID))
+        self.assertEqual([item['work_id'] for item in overview['works']], [payload['work_id']])
+        self.assertEqual(overview['works'][0]['participant'], '主人')
+
+        # 再建一次：服务层拒绝（**绝不覆盖**），文案原样给用户
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, self.PID, '另一个标题', '另一份正文'))
+        self.assertIn('已有共同作品', str(caught.exception))
+        self.assertEqual(_run(self.api.work_detail(payload['work_id']))['content'], '第一版正文')
+
+    def test_create_uses_the_current_story_when_story_id_is_empty(self):
+        payload = _run(self.api.create_work('', self.PID, '海边的信', '第一版正文'))
+        row = self.database.get('interlude_work', {'id': payload['work_id']})
+        self.assertEqual(row['storyId'], self.SID)
+        self.assertEqual(row['participantId'], self.PID)
+
+    def test_cancel_frees_a_stale_running_job(self):
+        """插件重启过、库里留着 `running`：面板说成"中断"，取消是放开 mayPropose 的路。"""
+        self._create()
+        row = self.database.get('interlude_work', {'id': self.wid})
+        state = dict(row['state'])
+        state['jobs'] = [{
+            'id': 'job-stale', 'status': 'running', 'brief': '写一版结尾',
+            'baseRevisionId': state['head'], 'modelId': 'demo',
+            'createdAt': '2026-10-01T00:00:00.000Z',
+        }]
+        self.database.update('interlude_work', {'id': self.wid}, {'state': state})
+
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['jobs'][0]['status'], 'interrupted', '进程里没有的 running = 中断')
+        self.assertFalse(detail['may_propose'])
+
+        payload = _run(self.api.cancel_work_generation(self.wid, 'job-stale'))
+        self.assertEqual(payload['changed'], 'work-cancel job-stale')
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['jobs'][0]['status'], 'cancelled')
+        self.assertTrue(detail['may_propose'], '取消掉遗留任务后要能重新起草')
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.cancel_work_generation(self.wid, 'job-stale'))
+        self.assertIn('已经结束', str(caught.exception))
+
+    def test_reject_keeps_the_head_and_the_record(self):
+        service = self.bridge.service
+        self._create()
+        proposal = _run(service.apply_work_proposal(self.SID, self.PID, {
+            'baseRevisionId': self._head(), 'content': '不想要的改法', 'reason': '试试',
+        }))
+        payload = _run(self.api.reject_work_proposal(self.wid, proposal['id']))
+        self.assertEqual(payload['changed'], 'work-reject %s' % proposal['id'])
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['content'], '第一版正文', '驳回不动正文')
+        self.assertEqual(detail['revision_count'], 1)
+        self.assertEqual(detail['proposals'][0]['status'], 'rejected')
+        self.assertFalse(detail['proposals'][0]['pending'])
+
+    def test_disabled_works_still_show_what_was_written(self):
+        """关掉功能后旧作品还在库里，控制台要看得见（否则用户再也清理不掉它）。"""
+        self._create()
+        for holder in (self.bridge.config, self.bridge.service.config):
+            if isinstance(holder.get('works'), dict):
+                holder['works']['enabled'] = False
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertTrue(payload['available'])
+        self.assertFalse(payload['enabled'])
+        self.assertEqual(len(payload['works']), 1, '关掉功能不等于把作品藏起来')
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['content'], '第一版正文')
+        self.assertFalse(detail['may_propose'])
+        self.assertIn('配置', detail['may_propose_reason'])
+
+    def test_overview_without_any_work_is_an_empty_list_not_an_error(self):
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertTrue(payload['available'])
+        self.assertTrue(payload['enabled'])
+        self.assertEqual(payload['works'], [])
+        self.assertEqual(payload['hint'], '')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.work_detail('404'))
+
+
+# =========================================================================== #
+# 控制台「表情库」面板（v1.8.0）
+#
+# 这里跑的是**真实** `ServiceChunk2` + 真实内存库 + 真实临时目录：
+# 面板的全部价值是"读出来 / 写下去的确实是那件事"，桩掉服务层就什么都没验到。
+# 契约（端点 + 字段）冻结在 `docs/PORTING_NOTES.md` §45.3。
+# =========================================================================== #
+
+class _FilesystemStickerTransport(NullTransport):
+    """`NullTransport` + 真实的 `list_sticker_files`。
+
+    生产里这一步走适配器的同一个实现；`NullTransport` 的桩实现**故意回空**
+    （没有平台连接器时的降级），拿它跑扫描会把库里每一行都标成 missing。
+    """
+    from plugin.core.service.chunk2 import _list_sticker_files as _lister  # noqa: PLC0415
+
+    async def list_sticker_files(self, root: str) -> list:
+        return self._lister(root)
+
+
+class _StickerService(ServiceChunk2):
+    """只装配表情库需要的那几个字段的真实服务（绕开模型装配）。
+
+    `db` / `_db_write_lock` 与 `test_service_chunk2._host` 同一套：走**真实**的
+    `db_get` / `db_set` / `db_create`（含写队列），而不是把 CRUD 也桩掉。
+    """
+
+    def __init__(self, tmp: str, database: Any, directory: str = 'stickers') -> None:
+        self.ctx = InterludeContext(base_dir=tmp)
+        self.db = database
+        self._db_write_lock = asyncio.Lock()
+        self.config = {'stickers': {'enabled': True, 'directory': directory, 'catalogLimit': 40}}
+        self.transport = _FilesystemStickerTransport()
+        self.service_logger = None
+        self.cached_sticker_config = None
+        self.cached_audio_config = None
+        self.cached_blind_mode_config = None
+        self.embedder = None
+        self.sticker_catalog = []
+        self.sticker_by_id = {}
+        self.sticker_scan_running = False
+        self.sticker_describer = None
+        self._sticker_collect_warn_at = 0
+        self.reports: list[Any] = []
+        self.report = lambda *args, **kwargs: self.reports.append(args)
+        self.report_standalone = lambda *args, **kwargs: self.reports.append(args)
+        self.report_standalone_operation = lambda *args, **kwargs: self.reports.append(args)
+
+
+class ConsoleStickerLibraryTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = self._tmp.name
+        self.root = os.path.join(self.tmp, 'stickers')
+        os.makedirs(os.path.join(self.root, 'collected'))
+        self.bridge = _make_bridge({'stickers': {'enabled': True, 'directory': 'stickers'}})
+        self.database = Database(':memory:')
+        self.addCleanup(self.database.close)
+        self.database.register_tables()
+        self.bridge.db = self.database
+        self.service = _StickerService(self.tmp, self.database)
+        self.bridge.service = self.service
+        self.api = ConsoleApi(self.bridge)
+
+    # ---- 造数据 ----
+
+    def _row(self, asset_id, **patch):
+        base = {
+            'assetId': asset_id,
+            'filePath': '%s.png' % asset_id,
+            'group': 'collected',
+            'mimeType': 'image/png',
+            'animated': False,
+            'size': 40,
+            'hash': asset_id,
+            'description': '一只挥手的猫',
+            'aliases': ['打招呼'],
+            'status': 'active',
+            'embedding': [],
+            'name': '',
+            'source': 'auto' if asset_id.startswith('sticker-') else 'manual',
+            'uses': 0,
+            'descriptionManual': False,
+            # v1.8.0 第二层判据（§45.7）：默认不是"模型猜的"。
+            'guessed': False,
+            'createdAt': '2026-09-01T10:00:00.000Z',
+            'updatedAt': '2026-09-01T10:00:00.000Z',
+        }
+        base.update(patch)
+        return base
+
+    def _insert(self, asset_id, body: bytes = _PNG_BYTES, **patch):
+        with open(os.path.join(self.root, '%s.png' % asset_id), 'wb') as handle:
+            handle.write(body)
+        row = self._row(asset_id, **patch)
+        row['id'] = self.database.insert('interlude_sticker', row)
+        return row
+
+    # ---- 列表 ----
+
+    def test_empty_library_is_an_empty_shell_not_a_500(self):
+        payload = _run(self.api.stickers())
+        self.assertEqual(payload['items'], [])
+        self.assertEqual(payload['total'], 0)
+        self.assertFalse(payload['truncated'])
+        self.assertEqual(payload['counts'], {'total': 0, 'active': 0, 'pending': 0,
+                                             'missing': 0, 'disabled': 0})
+        self.assertTrue(payload['enabled'])
+        self.assertEqual(payload['root'], self.root)
+
+    def test_items_carry_the_frozen_contract_fields(self):
+        self._insert('sticker-abc-1')
+        payload = _run(self.api.stickers())
+        self.assertEqual(len(payload['items']), 1)
+        item = payload['items'][0]
+        for key in ('assetId', 'name', 'description', 'kind', 'source', 'addedAt',
+                    'uses', 'disabled', 'file', 'thumbnailUrl'):
+            self.assertIn(key, item, key)
+        self.assertEqual(item['assetId'], 'sticker-abc-1')
+        self.assertEqual(item['description'], '一只挥手的猫')
+        self.assertEqual(item['kind'], 'image')
+        self.assertEqual(item['source'], 'auto')
+        self.assertEqual(item['addedAt'], '2026-09-01T10:00:00+00:00',
+                         '时间列折成 ISO 文本（原始行回来的是 datetime）')
+        self.assertEqual(item['uses'], 0)
+        self.assertFalse(item['disabled'])
+        self.assertEqual(item['file'], 'sticker-abc-1.png')
+        self.assertEqual(
+            item['thumbnailUrl'], 'console/sticker-file?assetId=sticker-abc-1',
+        )
+
+    def test_gif_rows_report_the_animated_kind(self):
+        """`animated` 在原始行里是 SQLite 的 `1`，`is True` 会漏（实测踩到过）。"""
+        self._insert('sticker-gif-1', mimeType='image/gif', animated=True)
+        item = _run(self.api.stickers())['items'][0]
+        self.assertEqual(item['kind'], 'animated')
+        # `scan_sticker_library` 按扩展名建出来的行走的是 `mimeType` 这条路。
+        self._insert('sticker-gif-2', mimeType='image/gif', animated=False)
+        items = {entry['assetId']: entry for entry in _run(self.api.stickers())['items']}
+        self.assertEqual(items['sticker-gif-2']['kind'], 'animated')
+
+    def test_the_guessed_badge_is_exposed_as_an_extra_field(self):
+        """第二层判据（`§45.7`）：`guessed` 是**额外字段**（契约只有 auto / manual 两个 source）。
+
+        `source` 仍回 `auto`；"这一条是识图模型猜出来的"只能靠 `guessed` 暴露——
+        控制台**暂未显示**这个徽章，留给下一轮（`docs/PORTING_NOTES.md` §45.7）。
+        """
+        self._insert('sticker-guessed-1', guessed=True)
+        self._insert('sticker-plain-1', guessed=False)
+        items = {entry['assetId']: entry for entry in _run(self.api.stickers())['items']}
+        self.assertIn('guessed', items['sticker-guessed-1'], '额外字段也要在响应里')
+        self.assertTrue(items['sticker-guessed-1']['guessed'])
+        self.assertFalse(items['sticker-plain-1']['guessed'])
+        self.assertEqual(items['sticker-guessed-1']['source'], 'auto', 'source 不加第三个取值')
+        # 旧库补列前写入的行是 NULL，读取侧一律当 False（不是 None、不是报错）。
+        self.database.conn.execute(
+            "UPDATE interlude_sticker SET guessed = NULL WHERE assetId = 'sticker-guessed-1'",
+        )
+        self.database.conn.commit()
+        stale = {entry['assetId']: entry for entry in _run(self.api.stickers())['items']}
+        self.assertIs(stale['sticker-guessed-1']['guessed'], False)
+
+    def test_pagination_window_and_truncated_flag(self):
+        for index in range(5):
+            self._insert('sticker-%d' % index)
+        first = _run(self.api.stickers(limit=2, offset=0))
+        self.assertEqual(first['total'], 5)
+        self.assertEqual(len(first['items']), 2)
+        self.assertFalse(first['truncated'], '5 条远没到窗口上限')
+        second = _run(self.api.stickers(limit=2, offset=2))
+        self.assertEqual(len(second['items']), 2)
+        self.assertEqual(
+            [item['assetId'] for item in first['items']],
+            [item['assetId'] for item in first['items']],
+        )
+        self.assertEqual(
+            set(item['assetId'] for item in first['items'])
+            & set(item['assetId'] for item in second['items']),
+            set(), '两页不该重叠',
+        )
+
+    def test_filters_are_applied_server_side(self):
+        self._insert('sticker-a', description='一只猫')
+        self._insert('manual-b', description='一张狗', source='manual')
+        self._insert('sticker-c', description='', status='pending')
+        self._insert('sticker-d', description='被停用的', status='disabled')
+        self.assertEqual(_run(self.api.stickers(source='manual'))['total'], 1)
+        self.assertEqual(_run(self.api.stickers(status='pending'))['total'], 1)
+        self.assertEqual(_run(self.api.stickers(status='disabled'))['total'], 1)
+        self.assertEqual(_run(self.api.stickers(query='猫'))['total'], 1)
+        self.assertEqual(_run(self.api.stickers(query='sticker-'))['total'], 3)
+        counts = _run(self.api.stickers())['counts']
+        self.assertEqual(counts['total'], 4)
+        self.assertEqual(counts['active'], 2)
+        self.assertEqual(counts['disabled'], 1)
+
+    def test_source_falls_back_to_the_asset_id_namespace_for_old_rows(self):
+        """旧库没有 `source` 列时按 id 前缀判来源（不回填旧数据）。"""
+        row = self._row('sticker-legacy-1')
+        row['source'] = None
+        row['id'] = self.database.insert('interlude_sticker', row)
+        self.assertEqual(_run(self.api.stickers())['items'][0]['source'], 'auto')
+        row2 = self._row('manual-legacy-2')
+        row2['source'] = None
+        row2['id'] = self.database.insert('interlude_sticker', row2)
+        items = {item['assetId']: item for item in _run(self.api.stickers())['items']}
+        self.assertEqual(items['manual-legacy-2']['source'], 'manual')
+
+    # ---- 原图 ----
+
+    def test_file_endpoint_returns_a_path_inside_the_library(self):
+        self._insert('sticker-abc-1')
+        path = _run(self.api.sticker_file('sticker-abc-1'))
+        self.assertEqual(path, os.path.join(self.root, 'sticker-abc-1.png'))
+        self.assertTrue(os.path.isfile(path))
+
+    def test_file_endpoint_rejects_unknown_and_illegal_ids(self):
+        with self.assertRaises(ConsoleError):
+            _run(self.api.sticker_file(''))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.sticker_file('nope'))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.sticker_file('x' * 300))
+
+    def test_file_endpoint_refuses_to_escape_the_library(self):
+        """被改坏的 `filePath` 不许读出库外的文件（basename + 目录归属双保险）。"""
+        secret = os.path.join(self.tmp, 'secret.txt')
+        with open(secret, 'w', encoding='utf-8') as handle:
+            handle.write('top secret')
+        row = self._row('sticker-escape')
+        row['filePath'] = '../secret.txt'
+        self.database.insert('interlude_sticker', row)
+        with self.assertRaises(FileNotFoundError):
+            _run(self.api.sticker_file('sticker-escape'))
+
+    def test_file_endpoint_missing_file_is_a_404_shape(self):
+        self._insert('sticker-gone')
+        os.remove(os.path.join(self.root, 'sticker-gone.png'))
+        with self.assertRaises(FileNotFoundError):
+            _run(self.api.sticker_file('sticker-gone'))
+
+    # ---- 取图路由的两条分支（`inline=1` 的 JSON 信封 vs 缺省的图片字节） ----
+    #
+    # 这几条跑的是**真实** `main.page_console_sticker_file`（宿主响应桩），不是直接调
+    # `ConsoleApi`：两条分支的差别在**响应通道**上（JSON vs blob），只调 API 方法断言不到。
+    # 形状冻结在 `docs/PORTING_NOTES.md` §45.8，前端 `src/sticker-images.ts` 按它接。
+
+    def _page(self, **query):
+        """按查询参数跑一次 `page_console_sticker_file`（返回宿主响应桩）。"""
+        self.addCleanup(_install_web_request(query=query))
+        plugin = _make_plugin({})
+        plugin._console = self.api
+        return _run(plugin.page_console_sticker_file())
+
+    def test_inline_returns_a_base64_envelope_that_round_trips_the_file(self):
+        """`inline=1`：四字段信封 + `data` 解回**与原文件逐字节相同**的内容。"""
+        self._insert('sticker-abc-1')
+        response = self._page(assetId='sticker-abc-1', inline='1')
+        self.assertEqual(response.status_code, 200)
+        payload = response.payload
+        self.assertEqual(set(payload), {'assetId', 'mimeType', 'size', 'data'},
+                         '信封字段是冻结的（前端按这四个键解析）')
+        self.assertEqual(payload['assetId'], 'sticker-abc-1')
+        self.assertEqual(payload['mimeType'], 'image/png')
+        self.assertEqual(payload['size'], len(_PNG_BYTES))
+        self.assertFalse(payload['data'].startswith('data:'), '`data` 不含 data: 前缀')
+        with open(os.path.join(self.root, 'sticker-abc-1.png'), 'rb') as handle:
+            on_disk = handle.read()
+        self.assertEqual(base64.b64decode(payload['data']), on_disk, '必须逐字节相同')
+        self.assertEqual(payload['size'], len(on_disk))
+
+    def test_without_inline_the_response_is_still_the_raw_byte_stream(self):
+        """反向用例：缺省 / `inline=0` / `inline=` 一律**还是字节流**，不是 JSON 信封。"""
+        self._insert('sticker-abc-1')
+        expected = os.path.join(self.root, 'sticker-abc-1.png')
+        for query in ({'assetId': 'sticker-abc-1'}, {'assetId': 'sticker-abc-1', 'inline': '0'},
+                      {'assetId': 'sticker-abc-1', 'inline': ''}):
+            with self.subTest(query=query):
+                response = self._page(**query)
+                self.assertEqual(response.status_code, 200)
+                self.assertIsNone(response.payload, '老客户端拿到的不能是 JSON')
+                self.assertEqual(response.path, expected)
+                self.assertEqual(response.content_type, 'image/png', 'Content-Type 仍是图片')
+                self.assertEqual(response.filename, 'sticker-abc-1.png')
+                # `file_response` 是宿主侧的 blob 通道：body 就是这个路径的字节。
+                with open(response.path, 'rb') as handle:
+                    self.assertEqual(handle.read(), _PNG_BYTES)
+
+    def test_inline_keeps_the_same_400_and_404_wording(self):
+        """400 / 404 的措辞两条分支**逐字一致**（同一批校验、同一批 `except`）。"""
+        cases = (
+            ({'assetId': ''}, '缺少 assetId'),
+            ({'assetId': 'nope'}, '找不到这条素材：nope'),
+            ({'assetId': 'x' * 300}, 'assetId 过长'),
+        )
+        for params, message in cases:
+            with self.subTest(params=params):
+                plain = self._page(**params)
+                inline = self._page(inline='1', **params)
+                self.assertEqual(plain.status_code, 400, params)
+                self.assertEqual(inline.status_code, 400, params)
+                self.assertEqual(plain.payload['message'], message)
+                self.assertEqual(plain.payload['message'], inline.payload['message'])
+        self._insert('sticker-gone')
+        os.remove(os.path.join(self.root, 'sticker-gone.png'))
+        plain = self._page(assetId='sticker-gone')
+        inline = self._page(assetId='sticker-gone', inline='1')
+        self.assertEqual((plain.status_code, inline.status_code), (404, 404))
+        self.assertEqual(plain.payload['message'], inline.payload['message'])
+        self.assertEqual(plain.payload['message'], '表情包文件不存在（可能已被删除）')
+
+    def test_inline_refuses_huge_files_without_reading_them(self):
+        """超上限 → 400；**一个字节都不读进内存**（防轰炸：先判体积再读）。"""
+        path = os.path.join(self.root, 'sticker-huge.png')
+        with open(path, 'wb') as handle:
+            handle.write(_PNG_BYTES)
+            # 稀疏文件：体积够大但不真占盘（这里要的是 `getsize` 的值）。
+            handle.truncate(console_module.STICKER_INLINE_MAX_BYTES + 1)
+        self.database.insert('interlude_sticker', self._row('sticker-huge'))
+        opened: list[str] = []
+        real_open = open
+
+        def spy(file, *args, **kwargs):
+            opened.append(str(file))
+            return real_open(file, *args, **kwargs)
+
+        with mock.patch('builtins.open', spy):
+            response = self._page(assetId='sticker-huge', inline='1')
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn('data', response.payload, '拒绝时不许回任何内容')
+        self.assertIn('太大', response.payload['message'])
+        self.assertNotIn(path, opened, '先判体积：超限时不该打开文件')
+
+    def test_library_escape_and_unknown_ids_are_refused_on_both_branches(self):
+        """越界防护（被改坏的 `filePath`）两条分支都要挡住——库外文件一个字都不许回。"""
+        secret = os.path.join(self.tmp, 'secret.txt')
+        with open(secret, 'w', encoding='utf-8') as handle:
+            handle.write('top secret')
+        row = self._row('sticker-escape')
+        row['filePath'] = '../secret.txt'
+        self.database.insert('interlude_sticker', row)
+        plain = self._page(assetId='sticker-escape')
+        inline = self._page(assetId='sticker-escape', inline='1')
+        self.assertEqual((plain.status_code, inline.status_code), (404, 404))
+        self.assertEqual(plain.payload['message'], inline.payload['message'])
+        self.assertNotIn('data', plain.payload)
+        self.assertNotIn('data', inline.payload)
+        self.assertNotIn('top secret', json.dumps(inline.payload, ensure_ascii=False))
+        self.assertIsNone(inline.payload.get('path'), '信封里也不许泄露库外路径')
+
+    # ---- 改描述 / 名字 / 停用 ----
+
+    def test_description_edit_wins_over_the_automatic_one_and_enters_the_catalog(self):
+        """接线用例：改描述 → 写回 → **下一次 payload 里的目录文本真的变了**。"""
+        row = self._insert('sticker-abc-1', description='模型写的旧描述')
+        _run(self.service.refresh_sticker_catalog())
+        before = _run(self.service.sticker_catalog_for_session({'platform': 'onebot'}))
+        self.assertEqual([item['description'] for item in before], ['模型写的旧描述'])
+
+        payload = _run(self.api.update_sticker({
+            'assetId': 'sticker-abc-1', 'description': '她手写的：一只挥手的猫',
+        }))
+        self.assertEqual(payload['changed'], ['description'])
+        self.assertEqual(payload['item']['description'], '她手写的：一只挥手的猫')
+        self.assertTrue(payload['item']['manual'])
+
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['description'], '她手写的：一只挥手的猫')
+        self.assertTrue(stored['descriptionManual'], '手工标记必须落库（重扫据此跳过）')
+        self.assertEqual(stored['status'], 'active')
+
+        after = _run(self.service.sticker_catalog_for_session({'platform': 'onebot'}))
+        self.assertEqual([item['description'] for item in after], ['她手写的：一只挥手的猫'])
+        self.assertNotEqual(before, after, '目录文本必须随描述变化')
+
+    def test_manual_description_survives_a_full_rescan(self):
+        """手改 → 立刻重扫：描述不得被视觉模型顶掉（§45.2）。"""
+        self._insert('sticker-abc-1', description='模型写的')
+        _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'description': '人的描述'}))
+
+        async def _fake_describe(asset, payload, config=None):
+            raise AssertionError('手工描述的素材不该再被描述')
+
+        self.service.describe_sticker_asset = _fake_describe
+        _run(self.service.scan_sticker_library())
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['description'], '人的描述')
+        self.assertEqual(stored['status'], 'active')
+
+    def test_restore_hands_the_description_back_to_the_model(self):
+        self._insert('sticker-abc-1')
+        _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'description': '人的描述'}))
+        payload = _run(self.api.restore_sticker_description({'assetId': 'sticker-abc-1'}))
+        self.assertEqual(payload['changed'], ['description'])
+        self.assertFalse(payload['item']['manual'])
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['description'], '')
+        self.assertEqual(stored['status'], 'pending')
+
+    def test_name_edit_round_trips(self):
+        self._insert('sticker-abc-1')
+        payload = _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'name': '坏笑的猫'}))
+        self.assertEqual(payload['changed'], ['name'])
+        self.assertEqual(payload['item']['name'], '坏笑的猫')
+        self.assertEqual(
+            self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]['name'],
+            '坏笑的猫',
+        )
+
+    def test_disabled_toggles_out_of_the_model_catalog(self):
+        self._insert('sticker-abc-1')
+        _run(self.service.refresh_sticker_catalog())
+        self.assertEqual(len(self.service.sticker_catalog), 1)
+        payload = _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'disabled': True}))
+        self.assertTrue(payload['item']['disabled'])
+        self.assertEqual(
+            self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]['status'],
+            'disabled',
+        )
+        self.assertEqual(self.service.sticker_catalog, [], '停用后立刻退出模型目录')
+        _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'disabled': False}))
+        self.assertEqual(len(self.service.sticker_catalog), 1, '启用后回到目录（有描述 → active）')
+
+    def test_disabled_asset_is_not_resurrected_by_a_rescan(self):
+        """重扫不许把用户刻意停用的素材复活成 pending（那是"改了没反应"）。"""
+        self._insert('sticker-abc-1', description='')
+        _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'disabled': True}))
+        _run(self.service.scan_sticker_library())
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['status'], 'disabled')
+
+    def test_fields_outside_the_whitelist_are_rejected(self):
+        self._insert('sticker-abc-1')
+        for body in (
+            {'assetId': 'sticker-abc-1', 'status': 'active'},
+            {'assetId': 'sticker-abc-1', 'aliases': ['x']},
+            {'assetId': 'sticker-abc-1', 'hash': 'x'},
+            {'assetId': 'sticker-abc-1', 'filePath': '/etc/passwd'},
+            {'assetId': 'sticker-abc-1', 'description': 'x', 'embedding': [1.0]},
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.update_sticker(body))
+                self.assertIn('只能修改', str(caught.exception))
+        # 一个字段都没给也算错误（不是"什么都没改"的静默成功）。
+        with self.assertRaises(ConsoleError):
+            _run(self.api.update_sticker({'assetId': 'sticker-abc-1'}))
+
+    def test_write_operations_reject_an_unknown_asset_id(self):
+        for coro in (
+            self.api.update_sticker({'assetId': 'nope', 'description': 'x'}),
+            self.api.delete_sticker({'assetId': 'nope'}),
+            self.api.restore_sticker_description({'assetId': 'nope'}),
+        ):
+            with self.assertRaises(ConsoleError):
+                _run(coro)
+        for body in ({}, {'assetId': ''}, {'assetId': None}):
+            with self.assertRaises(ConsoleError):
+                _run(self.api.update_sticker(body))
+
+    def test_invalid_values_are_rejected_before_writing(self):
+        self._insert('sticker-abc-1')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'description': 'x' * 5000}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'name': 'x' * 500}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'disabled': 'yes'}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'description': None}))
+        # 一次都没写下去。
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['description'], '一只挥手的猫')
+        self.assertFalse(stored['descriptionManual'])
+
+    # ---- 删除 ----
+
+    def test_delete_defaults_to_marking_only(self):
+        self._insert('sticker-abc-1')
+        payload = _run(self.api.delete_sticker({'assetId': 'sticker-abc-1'}))
+        self.assertFalse(payload['purged'])
+        self.assertFalse(payload['deletedFile'])
+        self.assertTrue(os.path.isfile(os.path.join(self.root, 'sticker-abc-1.png')),
+                        '默认不许删文件')
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['status'], 'missing')
+        self.assertEqual(self.service.sticker_catalog, [])
+
+    def test_delete_with_purge_removes_the_file(self):
+        self._insert('sticker-abc-1')
+        path = os.path.join(self.root, 'sticker-abc-1.png')
+        payload = _run(self.api.delete_sticker({'assetId': 'sticker-abc-1', 'purge': True}))
+        self.assertTrue(payload['purged'])
+        self.assertTrue(payload['deletedFile'])
+        self.assertFalse(os.path.isfile(path))
+        # 行仍在（留痕：她曾经有过这个表情），但不再是 active。
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]['status'], 'missing')
+
+    def test_delete_rejects_a_non_boolean_purge(self):
+        self._insert('sticker-abc-1')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.delete_sticker({'assetId': 'sticker-abc-1', 'purge': 'yes'}))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, 'sticker-abc-1.png')))
+
+    # ---- 重扫 ----
+
+    def test_rescan_reports_what_it_found(self):
+        scan_calls: list[Any] = []
+
+        async def scan() -> None:
+            scan_calls.append(1)
+
+        self.service.scan_sticker_library = scan
+        payload = _run(self.api.rescan_stickers({}))
+        self.assertTrue(payload['scanned'])
+        self.assertEqual(len(scan_calls), 1)
+        self.assertIn('assets', payload)
+        self.assertIn('added', payload)
+
+    def test_rescan_refuses_when_the_library_is_off(self):
+        self.bridge.config = {'stickers': {'enabled': False, 'directory': 'stickers'}}
+        self.service.config = {'stickers': {'enabled': False, 'directory': 'stickers'}}
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.rescan_stickers({}))
+        self.assertIn('未启用', str(caught.exception))
+
+    def test_rescan_without_a_service_is_a_clear_error(self):
+        self.bridge.service = None
+        with self.assertRaises(ConsoleError):
+            _run(self.api.rescan_stickers({}))
+
+    def test_reads_survive_a_missing_service(self):
+        """服务层没起来时列表仍然是空壳 + 配置里的根目录（面板打得开）。"""
+        self.bridge.service = None
+        payload = _run(self.api.stickers())
+        self.assertEqual(payload['items'], [])
+        self.assertTrue(payload['root'].endswith('stickers'))
+
+
+class ConsoleStickerGroupTests(unittest.TestCase):
+    """表情库**分组 = 目录**与**上传**（v1.8.3 起，v1.8.5 返工；`docs/PORTING_NOTES.md` §47）。
+
+    跑的是真实的 `ConsoleApi` + 真实的 `ServiceChunk2` 写路径（只有模型/传输是桩），
+    与 `ConsoleStickerLibraryTests` 同一套夹具。**磁盘是真的**：移动 / 改名 / 删除
+    都会真的搬文件，所以夹具按"文件的第一个目录段 = `group`"来造。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = self._tmp.name
+        self.root = os.path.join(self.tmp, 'stickers')
+        os.makedirs(os.path.join(self.root, 'collected'))
+        self.bridge = _make_bridge({'stickers': {'enabled': True, 'directory': 'stickers'}})
+        self.database = Database(':memory:')
+        self.addCleanup(self.database.close)
+        self.database.register_tables()
+        self.bridge.db = self.database
+        self.service = _StickerService(self.tmp, self.database)
+        self.bridge.service = self.service
+        self.api = ConsoleApi(self.bridge)
+
+    # ---- 造数据 ----
+
+    def _row(self, asset_id, **patch):
+        base = {
+            'assetId': asset_id,
+            'filePath': '%s.png' % asset_id,
+            'group': 'collected',
+            'mimeType': 'image/png',
+            'animated': False,
+            'size': len(_PNG_BYTES),
+            'hash': asset_id,
+            'description': '一只挥手的猫',
+            'aliases': [],
+            'status': 'active',
+            'embedding': [],
+            'name': '',
+            'source': 'manual',
+            'uses': 0,
+            'descriptionManual': False,
+            'guessed': False,
+            'createdAt': '2026-09-01T10:00:00.000Z',
+            'updatedAt': '2026-09-01T10:00:00.000Z',
+        }
+        base.update(patch)
+        if 'filePath' not in patch:
+            # 组名就是一级目录名：默认让文件真的躺在自己那一组的目录里。
+            group = str(base.get('group') or '').strip()
+            base['filePath'] = ('%s/%s.png' % (group, asset_id)) if group else ('%s.png' % asset_id)
+        return base
+
+    def _insert(self, asset_id, body=_PNG_BYTES, **patch):
+        row = self._row(asset_id, **patch)
+        row['id'] = self.database.insert('interlude_sticker', row)
+        path = os.path.join(self.root, row['filePath'].replace('/', os.sep))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as handle:
+            handle.write(body)
+        return row
+
+    def _group(self, item):
+        return {group['groupId']: group for group in item['items']}
+
+    def _stored(self, asset_id):
+        rows = self.database.all('interlude_sticker', {'assetId': asset_id})
+        self.assertEqual(len(rows), 1, asset_id)
+        return rows[0]
+
+    # ---- 分组列表 ----
+
+    def test_the_builtin_default_group_is_always_in_the_list(self):
+        """没有素材、表里也没有行时也要有内置默认组（「未整理」）——否则收藏的素材无所属。"""
+        payload = _run(self.api.sticker_groups())
+        self.assertEqual(payload['total'], 1)
+        self.assertEqual(payload['defaultGroupId'], 'collected')
+        item = payload['items'][0]
+        self.assertEqual(item['groupId'], 'collected')
+        # v1.8.4（§48）：显示名从「自动收藏」改成「未整理」（目录名 `collected` 一字未动）。
+        # 这是**唯一**一个"显示名 ≠ 目录名"的特例。
+        self.assertEqual(item['name'], '未整理')
+        # 描述：描述行没写过就回落到**内置那句默认描述**（v1.8.4，§48.5）——控制台与
+        # 模型目录看到的必须是同一句话，两处说法不一致就是"两处判据"。
+        self.assertEqual(item['description'], console_module.COLLECTED_STICKER_GROUP_DESCRIPTION)
+        self.assertEqual(
+            item['description'], '自动收藏与手动上传都先落这里，还没归组。',
+        )
+        self.assertEqual(item['count'], 0)
+        self.assertTrue(item['builtin'])
+        self.assertTrue(item['registered'], '兼容字段恒 true：表里有行 = 有描述，不是"注册"')
+        self.assertFalse(payload['truncated'])
+
+    def test_the_builtin_group_description_prefers_the_description_row(self):
+        """§48.5：描述行写了自己的描述就用它，没写才回落内置那句（两处同一句话）。"""
+        default = console_module.COLLECTED_STICKER_GROUP_DESCRIPTION
+        before = self._group(_run(self.api.sticker_groups()))['collected']
+        self.assertEqual(before['description'], default, '没写过 → 内置那句')
+        _run(self.api.save_sticker_group({
+            'groupId': 'collected', 'name': '未整理', 'description': '她自己写的',
+        }))
+        after = self._group(_run(self.api.sticker_groups()))['collected']
+        self.assertEqual(after['description'], '她自己写的', '描述行有描述 → 用描述行的')
+        self.assertTrue(after['builtin'], '写描述不改"内置组"这件事')
+        self.assertEqual(after['name'], '未整理', '内置组的显示名是常量，写描述不会改它')
+
+    def test_sticker_items_expose_the_two_group_ownership_flags(self):
+        """§48 / §50：素材 item **只加**三个字段（归属两枚 + `disabledBy`），旧字段一个没动。"""
+        self._insert('a-1', group='collected')
+        self.database.update('interlude_sticker', {'assetId': 'a-1'},
+                             {'groupGuessed': True, 'groupManual': False})
+        self._insert('a-2', group='g-1')
+        self.database.update('interlude_sticker', {'assetId': 'a-2'},
+                             {'groupGuessed': False, 'groupManual': True})
+        # §50：**启用状态是谁定的**（模型停的 / 人停过或启用的），如实带出去。
+        self.database.update('interlude_sticker', {'assetId': 'a-1'},
+                             {'status': 'disabled', 'disabledBy': 'model'})
+        self.database.update('interlude_sticker', {'assetId': 'a-2'},
+                             {'status': 'active', 'disabledBy': 'manual'})
+        self._insert('a-3', group='g-1')
+        listing = _run(self.api.stickers())
+        by_id = {item['assetId']: item for item in listing['items']}
+        self.assertTrue(by_id['a-1']['groupGuessed'])
+        self.assertFalse(by_id['a-1']['groupManual'])
+        self.assertTrue(by_id['a-2']['groupManual'])
+        self.assertFalse(by_id['a-2']['groupGuessed'])
+        self.assertTrue(by_id['a-1']['disabled'])
+        self.assertEqual(by_id['a-1']['disabledBy'], 'model', '模型停的')
+        self.assertFalse(by_id['a-2']['disabled'])
+        self.assertEqual(by_id['a-2']['disabledBy'], 'manual', '人启用的（模型不许再停）')
+        # 旧库补列前写入的行是 NULL → 布尔当 false、字符串当空串（不是 None / 缺键）。
+        self.assertIs(by_id['a-3']['groupGuessed'], False)
+        self.assertIs(by_id['a-3']['groupManual'], False)
+        self.assertEqual(by_id['a-3']['disabledBy'], '')
+        # 既有字段名一个都没动。
+        for key in ('assetId', 'group', 'groupId', 'groupName', 'manual', 'guessed'):
+            with self.subTest(key=key):
+                self.assertIn(key, by_id['a-1'])
+
+    def test_every_group_comes_from_the_disk_and_no_asset_disappears(self):
+        """目录即分组：磁盘上的目录 / 有素材挂着的值**一律是正常分组**，素材一条不少。"""
+        self._insert('a-1', group='collected')
+        self._insert('a-2', group='collected')
+        self._insert('b-1', group='default')
+        self._insert('c-1', group='', source='manual')
+        os.makedirs(os.path.join(self.root, '手工建的', 'sub'))  # 盘上有目录、没素材、没描述
+        groups = self._group(_run(self.api.sticker_groups()))
+        self.assertEqual(groups['collected']['count'], 2)
+        self.assertEqual(groups['collected']['name'], '未整理')
+        self.assertTrue(groups['collected']['builtin'])
+        # 有素材挂着的目录名：它就是一个正常分组（名字就是目录名，没有"未注册"这一等）。
+        self.assertEqual(groups['default']['name'], 'default')
+        self.assertTrue(groups['default']['registered'])
+        self.assertEqual(groups['default']['count'], 1)
+        # 磁盘上**真的存在**的空目录也在列表里（新建分组 / 手动 mkdir 之后看得见）。
+        self.assertEqual(groups['手工建的']['count'], 0)
+        self.assertEqual(groups['手工建的']['name'], '手工建的')
+        # 空 group 的旧行单列"未分组"，计数不被吞掉。
+        self.assertEqual(groups['']['name'], console_module.STICKER_UNGROUPED_NAME)
+        self.assertEqual(groups['']['count'], 1)
+        # 素材一个都没少，而且每一条都能说出自己的组名。
+        payload = _run(self.api.stickers())
+        self.assertEqual(payload['total'], 4)
+        by_id = {item['assetId']: item for item in payload['items']}
+        self.assertEqual(by_id['a-1']['groupId'], 'collected')
+        self.assertEqual(by_id['a-1']['groupName'], '未整理')
+        self.assertEqual(by_id['b-1']['groupName'], 'default')
+        self.assertEqual(by_id['c-1']['groupName'], console_module.STICKER_UNGROUPED_NAME)
+        # 老字段 `group` 没变（只加字段，不动已有字段名）。
+        self.assertEqual(by_id['b-1']['group'], 'default')
+
+    def test_group_list_survives_a_missing_service_and_a_missing_table(self):
+        """服务层没起来 / 表没建：列表仍是空壳 + 内置默认组，从不 500。"""
+        self.bridge.service = None
+        payload = _run(self.api.sticker_groups())
+        self.assertEqual([item['groupId'] for item in payload['items']], ['collected'])
+
+        # 没建表的库（`_safe_all` / `count_by` 都取不到 → 空壳）。
+        bare = Database(':memory:')
+        self.addCleanup(bare.close)
+        self.bridge.db = bare
+        self.bridge.service = self.service
+        payload = _run(self.api.sticker_groups())
+        self.assertEqual([item['groupId'] for item in payload['items']], ['collected'])
+        self.assertEqual(payload['items'][0]['count'], 0)
+
+    def test_stickers_can_be_filtered_by_group_id(self):
+        self._insert('a-1', group='collected')
+        self._insert('b-1', group='default')
+        self.assertEqual(_run(self.api.stickers(group='collected'))['total'], 1)
+        self.assertEqual(
+            _run(self.api.stickers(group='collected'))['items'][0]['assetId'], 'a-1',
+        )
+        self.assertEqual(_run(self.api.stickers(group='nope'))['total'], 0)
+        # 空 = 不过滤（与其他筛选项同一条规矩）。
+        self.assertEqual(_run(self.api.stickers(group=''))['total'], 2)
+
+    # ---- 新建 / 改名 ----
+
+    def test_create_group_makes_a_directory_named_after_the_group(self):
+        """**新建分组 = 建目录**：`groupId` 就是目录名（这里用的是中文组名）。"""
+        payload = _run(self.api.save_sticker_group({
+            'name': '猫猫', 'description': '撒娇、求摸头的时候用',
+        }))
+        group_id = payload['groupId']
+        self.assertEqual(group_id, '猫猫', 'id 的字面量就是磁盘目录名，不再由服务端生成')
+        self.assertTrue(os.path.isdir(os.path.join(self.root, '猫猫')))
+        self.assertEqual(payload['item']['name'], '猫猫', '组名 = 目录名')
+        self.assertEqual(payload['item']['description'], '撒娇、求摸头的时候用')
+        self.assertEqual(payload['item']['count'], 0)
+        self.assertFalse(payload['item']['builtin'])
+        self.assertTrue(payload['item']['registered'])
+        self.assertTrue(payload['item']['createdAt'])
+        stored = self.database.all('interlude_sticker_groups', {'groupId': group_id})[0]
+        self.assertEqual(stored['description'], '撒娇、求摸头的时候用')
+
+        # 改名 = **重命名目录**（`groupId` 跟着变），描述跟着走。
+        renamed = _run(self.api.save_sticker_group({
+            'groupId': group_id, 'name': '猫猫们', 'description': '换了个说法',
+        }))
+        self.assertEqual(renamed['groupId'], '猫猫们')
+        self.assertEqual(renamed['item']['name'], '猫猫们')
+        self.assertEqual(renamed['item']['description'], '换了个说法')
+        self.assertFalse(os.path.exists(os.path.join(self.root, '猫猫')))
+        self.assertTrue(os.path.isdir(os.path.join(self.root, '猫猫们')))
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 1)
+
+    def test_asset_items_report_the_directory_name(self):
+        created = _run(self.api.save_sticker_group({'name': '猫猫'}))
+        group_id = created['groupId']
+        self._insert('a-1', group=group_id)
+        item = _run(self.api.stickers())['items'][0]
+        self.assertEqual(item['groupId'], group_id)
+        self.assertEqual(item['groupName'], '猫猫', '组名就是目录名')
+
+    def test_duplicate_group_name_is_rejected(self):
+        _run(self.api.save_sticker_group({'name': '猫猫'}))
+        for name in ('猫猫', ' 猫猫 '):
+            with self.subTest(name=name):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.save_sticker_group({'name': name}))
+                self.assertIn('已存在', str(caught.exception))
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 1)
+        self.assertEqual(sorted(os.listdir(self.root)), ['collected', '猫猫'], '不许建出第二个目录')
+
+    def test_group_name_and_description_are_validated(self):
+        cases = (
+            ({'name': ''}, '不能为空'),
+            ({'name': '   '}, '不能为空'),
+            # 上限按**字节**：33 个汉字（99 字节）行，40 个（120 字节）不行。
+            ({'name': '猫' * 40}, '最长'),
+            ({'name': 'x' * (helpers_module.STICKER_GROUP_NAME_MAX_BYTES + 1)}, '最长'),
+            ({'name': 'a/b'}, '不能包含'),
+            ({'name': '..'}, '开头'),
+            ({'name': 'ok', 'description': 'x' * (helpers_module.STICKER_GROUP_DESCRIPTION_MAX + 1)}, '最长'),
+            ({'name': 'ok', 'description': 5}, 'description'),
+            ({'description': '没有名字'}, 'name'),
+        )
+        for body, needle in cases:
+            with self.subTest(body=str(body)[:40]):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.save_sticker_group(body))
+                self.assertIn(needle, str(caught.exception))
+        # 一律先校验后写：上面这些一条都没落库、也没建目录。
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 0)
+        self.assertEqual(os.listdir(self.root), ['collected'])
+
+    def test_the_root_bucket_name_is_reserved_for_write_targets(self):
+        """收尾②：`default` 是保留名——新建 / 改名 / 移动 / 上传 / 删组目标全是 400。"""
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.save_sticker_group({'name': 'default'}))
+        self.assertIn('保留名', str(caught.exception))
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        for body in (
+            {'groupId': group_id, 'name': 'default'},
+            {'groupId': 'collected', 'name': 'default'},
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.save_sticker_group(body))
+                self.assertIn('default', str(caught.exception))
+        self._insert('a-1')
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.move_stickers({'assetIds': ['a-1'], 'groupId': 'default'}))
+        self.assertIn('保留名', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.upload_sticker(_PNG_BYTES, group_id='default'))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.delete_sticker_group({'groupId': group_id, 'moveTo': 'default'}))
+        self.assertIn('保留名', str(caught.exception))
+        self.assertEqual(self._stored('a-1')['group'], 'collected')
+        self.assertEqual(sorted(os.listdir(self.root)), ['collected', '猫猫'], '一个目录都不许建出来')
+
+    def test_a_legacy_default_group_still_shows_up_and_can_be_managed(self):
+        """既有 `default` 目录/桶：照样在列表里、照样能写描述、能当**来源**删掉。"""
+        self._insert('a-1', group='default')
+        groups = self._group(_run(self.api.sticker_groups()))
+        self.assertEqual(groups['default']['count'], 1)
+        self.assertEqual(groups['default']['name'], 'default')
+        saved = _run(self.api.save_sticker_group({
+            'groupId': 'default', 'name': 'default', 'description': '根桶遗留',
+        }))
+        self.assertEqual(saved['item']['description'], '根桶遗留')
+        payload = _run(self.api.delete_sticker_group({'groupId': 'default'}))
+        self.assertTrue(payload['deleted'])
+        self.assertEqual(payload['moved'], 1)
+        self.assertEqual(self._stored('a-1')['group'], 'collected')
+
+    def test_group_items_expose_auto_created(self):
+        """收尾①：接口如实带出 `autoCreated`（要不要显示由前端定；人工建的一律 false）。"""
+        _run(self.api.save_sticker_group({'name': '猫猫'}))
+        self.database.insert('interlude_sticker_groups', {
+            'groupId': '模型建的', 'description': '', 'autoCreated': True,
+            'createdAt': '2026-09-01T10:00:00.000Z', 'updatedAt': '2026-09-01T10:00:00.000Z',
+        })
+        groups = self._group(_run(self.api.sticker_groups()))
+        self.assertIs(groups['collected']['autoCreated'], False, '内置组不是自动建的')
+        self.assertIs(groups['猫猫']['autoCreated'], False)
+        self.assertIs(groups['模型建的']['autoCreated'], True)
+        # 旧库补列前的行是 NULL → false（不是 None / 缺键）。
+        self.database.insert('interlude_sticker_groups', {
+            'groupId': '老行', 'description': '',
+            'createdAt': '2026-09-01T10:00:00.000Z', 'updatedAt': '2026-09-01T10:00:00.000Z',
+        })
+        self.assertIs(self._group(_run(self.api.sticker_groups()))['老行']['autoCreated'], False)
+    def test_group_endpoints_reject_fields_outside_the_whitelist(self):
+        for body in (
+            {'name': 'ok', 'count': 3},
+            {'name': 'ok', 'builtin': True},
+            {'groupId': 'g-1', 'name': 'ok', 'createdAt': 'x'},
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.save_sticker_group(body))
+                self.assertIn('不认识这些字段', str(caught.exception))
+
+    def test_unknown_group_id_cannot_be_saved(self):
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.save_sticker_group({'groupId': 'nope', 'name': '凭空捏造'}))
+        self.assertIn('找不到这个分组', str(caught.exception))
+
+    def test_writing_a_description_for_an_existing_directory_is_just_a_save(self):
+        """**没有"采纳"这个动作了**：给一个历史目录补描述 = `groupId == name` 的写入。
+
+        唯一的门槛是"这个分组真的存在"（有素材挂着 / 盘上有目录）——否则就是凭空捏造。
+        """
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.save_sticker_group({
+                'groupId': 'default', 'name': 'default', 'description': '顺手存的',
+            }))
+        self.assertIn('找不到这个分组', str(caught.exception))
+        self._insert('b-1', group='default')
+        payload = _run(self.api.save_sticker_group({
+            'groupId': 'default', 'name': 'default', 'description': '顺手存的',
+        }))
+        self.assertEqual(payload['groupId'], 'default')
+        self.assertTrue(payload['item']['registered'])
+        self.assertEqual(payload['item']['count'], 1)
+        self.assertEqual(payload['item']['name'], 'default', '写描述不会顺手改名')
+        self.assertEqual(payload['item']['description'], '顺手存的')
+        # 素材的 groupName 就是目录名（没有被改名）。
+        self.assertEqual(_run(self.api.stickers())['items'][0]['groupName'], 'default')
+        # 盘上真有目录的也一样（哪怕还没有素材）。
+        os.makedirs(os.path.join(self.root, '手工建的'))
+        written = _run(self.api.save_sticker_group({
+            'groupId': '手工建的', 'name': '手工建的', 'description': '手动放的目录',
+        }))
+        self.assertEqual(written['item']['description'], '手动放的目录')
+
+    def test_unsafe_group_ids_are_rejected(self):
+        for group_id in ('../evil', 'a/b', 'a\\b', '.hidden', 'a:b', 'x' * 200):
+            with self.subTest(group_id=group_id):
+                with self.assertRaises(ConsoleError):
+                    _run(self.api.save_sticker_group({'groupId': group_id, 'name': 'ok'}))
+        self.assertEqual(os.listdir(self.root), ['collected'], '一个目录都不许建出来')
+
+    def test_the_builtin_group_cannot_be_renamed_but_takes_a_description(self):
+        """内置组的目录名不许改（老库里已经有素材在 `collected/`），写描述照常。"""
+        payload = _run(self.api.save_sticker_group({
+            'groupId': 'collected', 'name': '未整理', 'description': '别人发来的表情包',
+        }))
+        self.assertEqual(payload['groupId'], 'collected')
+        self.assertTrue(payload['item']['builtin'])
+        self.assertEqual(payload['item']['name'], '未整理')
+        self.assertEqual(payload['item']['description'], '别人发来的表情包')
+        self._insert('a-1', group='collected')
+        item = _run(self.api.stickers())['items'][0]
+        self.assertEqual(item['groupName'], '未整理')
+        # 改名请求：400，而且目录一个字节都没动。
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.save_sticker_group({'groupId': 'collected', 'name': '收藏夹'}))
+        self.assertIn('不能改', str(caught.exception))
+        self.assertTrue(os.path.isdir(os.path.join(self.root, 'collected')))
+
+    def test_group_writes_need_a_service(self):
+        self.bridge.service = None
+        with self.assertRaises(ConsoleError):
+            _run(self.api.save_sticker_group({'name': 'ok'}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.save_sticker_group({'groupId': 'collected', 'name': 'ok'}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.delete_sticker_group({'groupId': 'g-1'}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.move_stickers({'assetIds': ['a-1'], 'groupId': 'collected'}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.upload_sticker(_PNG_BYTES))
+
+    # ---- 删除分组 ----
+
+    def test_deleting_a_group_moves_its_assets_instead_of_deleting_them(self):
+        """红线：**绝不悄悄删素材**——删组 = 把文件搬进目标目录 + 删目录与描述行。"""
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        for index in range(3):
+            self._insert('cat-%d' % index, group=group_id)
+        self.assertTrue(os.path.isdir(os.path.join(self.root, '猫猫')))
+        payload = _run(self.api.delete_sticker_group({'groupId': group_id}))
+        self.assertTrue(payload['deleted'])
+        self.assertEqual(payload['moved'], 3)
+        self.assertEqual(payload['moveTo'], 'collected')
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 0)
+        self.assertFalse(os.path.exists(os.path.join(self.root, '猫猫')), '组目录该没了')
+        for index in range(3):
+            stored = self._stored('cat-%d' % index)
+            self.assertEqual(stored['group'], 'collected')
+            self.assertEqual(stored['filePath'], 'collected/cat-%d.png' % index)
+            self.assertTrue(os.path.isfile(os.path.join(self.root, stored['filePath'])))
+        # 三条素材一条都没少，而且现在属于默认组。
+        listing = _run(self.api.stickers())
+        self.assertEqual(listing['total'], 3)
+        self.assertEqual({item['groupName'] for item in listing['items']}, {'未整理'})
+
+    def test_delete_group_honours_move_to(self):
+        first = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        second = _run(self.api.save_sticker_group({'name': '狗狗'}))['groupId']
+        self._insert('cat-1', group=first)
+        payload = _run(self.api.delete_sticker_group({
+            'groupId': first, 'moveTo': second,
+        }))
+        self.assertEqual(payload['moved'], 1)
+        self.assertEqual(payload['moveTo'], second)
+        self.assertEqual(self._stored('cat-1')['group'], second)
+
+    def test_delete_rejects_the_builtin_group_and_unknown_targets(self):
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.delete_sticker_group({'groupId': 'collected'}))
+        self.assertIn('内置分组不能删除', str(caught.exception))
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        # 带 `moveTo`（指向一个真实存在的分组）也照样 400：内置组的素材不能被搬空。
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.delete_sticker_group({'groupId': 'collected', 'moveTo': group_id}))
+        self.assertIn('内置分组不能删除', str(caught.exception))
+        self._insert('cat-1', group=group_id)
+        # moveTo 指向不存在的组：400，而且**什么都没动**（素材还在原组，组也还在）。
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.delete_sticker_group({'groupId': group_id, 'moveTo': 'nope'}))
+        self.assertIn('找不到要挪入的分组', str(caught.exception))
+        self.assertEqual(self._stored('cat-1')['group'], group_id)
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 1)
+        # 挪进"正在删除的组"也是 400。
+        with self.assertRaises(ConsoleError):
+            _run(self.api.delete_sticker_group({'groupId': group_id, 'moveTo': group_id}))
+        # 删一个根本没注册的 id：400。
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.delete_sticker_group({'groupId': 'nope'}))
+        self.assertIn('找不到这个分组', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.delete_sticker_group({}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.delete_sticker_group({'groupId': group_id, 'purge': True}))
+
+    # ---- 批量移动 ----
+
+    def test_move_reassigns_assets_and_returns_the_fresh_rows(self):
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        self._insert('a-1')
+        self._insert('a-2')
+        payload = _run(self.api.move_stickers({
+            'assetIds': ['a-1', 'a-2'], 'groupId': group_id,
+        }))
+        self.assertEqual(payload['moved'], 2)
+        self.assertEqual([item['assetId'] for item in payload['item']], ['a-1', 'a-2'])
+        self.assertEqual({item['groupName'] for item in payload['item']}, {'猫猫'})
+        self.assertEqual(self._stored('a-1')['group'], group_id)
+        self.assertEqual(self._stored('a-2')['group'], group_id)
+        # 已经在目标组里的也算"移动成功"（幂等：重复点不会报错）。
+        again = _run(self.api.move_stickers({'assetIds': ['a-1'], 'groupId': group_id}))
+        self.assertEqual(again['moved'], 1)
+
+    def test_move_validates_every_id_before_writing_anything(self):
+        """先校验后写：有一条不合法就一条都不写（批量操作"改了一半"最难收拾）。"""
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        self._insert('a-1')
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.move_stickers({'assetIds': ['a-1', 'nope'], 'groupId': group_id}))
+        self.assertIn('找不到这条素材', str(caught.exception))
+        self.assertEqual(self._stored('a-1')['group'], 'collected', '前一条也不许被改')
+
+    def test_move_rejects_bad_payloads(self):
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        self._insert('a-1')
+        cases = (
+            ({'assetIds': [], 'groupId': group_id}, 'assetIds'),
+            ({'assetIds': 'a-1', 'groupId': group_id}, 'assetIds'),
+            ({'assetIds': [''], 'groupId': group_id}, '空值'),
+            ({'assetIds': [None], 'groupId': group_id}, '空值'),
+            ({'assetIds': ['x' * 300], 'groupId': group_id}, '过长'),
+            ({'assetIds': ['a-1']}, 'groupId'),
+            ({'assetIds': ['a-1'], 'groupId': ''}, 'groupId'),
+            ({'assetIds': ['a-1'], 'groupId': '../evil'}, '分组名'),
+            # 不存在的组名不能当目标（先建组再挪），否则它会变成谁都能写进去的暗号。
+            # `default` 是保留名（根目录素材的桶）：先撞保留名那条闸。
+            ({'assetIds': ['a-1'], 'groupId': 'default'}, '保留名'),
+            ({'assetIds': ['a-1'], 'groupId': group_id, 'purge': True}, '不认识这些字段'),
+        )
+        for body, needle in cases:
+            with self.subTest(body=str(body)[:50]):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.move_stickers(body))
+                self.assertIn(needle, str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.move_stickers({
+                'assetIds': ['a-%d' % index for index in range(console_module.STICKER_MOVE_MAX + 1)],
+                'groupId': group_id,
+            }))
+        self.assertIn('最多', str(caught.exception))
+        self.assertEqual(self._stored('a-1')['group'], 'collected')
+
+    def test_the_service_layer_owns_the_same_gates_on_its_own(self):
+        """服务层的写入路径**自己**也要挡：控制台只是第一层。
+
+        路径安全不嫌两层——控制台判一次（请求形状 + 快速失败 + 好文案），服务层再判一次
+        （它是**唯一写入路径**，别的调用方也会走它）。这条**直接调服务层**，
+        所以哪一层被改坏都能分别被抓住（只测控制台的话，服务层那道闸永远不会红）。
+        """
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        row = self._insert('a-1')
+
+        with self.assertRaises(ValueError):
+            _run(self.service.move_sticker_assets([row['id']], '../evil'))
+        with self.assertRaises(ValueError):
+            _run(self.service.delete_sticker_group('collected'))
+        # 带 `moveTo` 指向**另一个真实分组**时，唯一挡得住的就是"内置组不许删"那一条
+        # （没有 moveTo 时 `target == wanted` 也会挡，所以这一条才是真正的闸门用例）。
+        with self.assertRaises(ValueError):
+            _run(self.service.delete_sticker_group('collected', move_to=group_id))
+        with self.assertRaises(ValueError):
+            _run(self.service.delete_sticker_group(group_id, move_to='nope'))
+        with self.assertRaises(ValueError):
+            _run(self.service.upload_sticker_asset(_PNG_BYTES, '../evil'))
+        with self.assertRaises(ValueError):
+            _run(self.service.upload_sticker_asset(_PNG_BYTES, group_id='nope'))
+        with self.assertRaises(ValueError):
+            _run(self.service.save_sticker_group('', '   '))
+        with self.assertRaises(ValueError):
+            _run(self.service.save_sticker_group('', 'a/b'))
+        with self.assertRaises(ValueError):
+            _run(self.service.save_sticker_group('nope', '凭空捏造'))
+        # 内置组的目录名不许改（改名 = 让已有素材集体换目录）。
+        with self.assertRaises(ValueError):
+            _run(self.service.save_sticker_group('collected', '收藏夹'))
+
+        # 服务层拒绝之后**什么都没动**（素材还在原组、组目录还在、没多出素材）。
+        self.assertEqual(self._stored('a-1')['group'], 'collected')
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 1)
+        self.assertEqual(self.database.count('interlude_sticker'), 1)
+        self.assertEqual(sorted(os.listdir(self.root)), ['collected', '猫猫'])
+
+    # ---- 上传 ----
+
+    def test_upload_writes_the_file_by_content_hash_and_never_trusts_the_name(self):
+        payload = _run(self.api.upload_sticker(_PNG_BYTES, name='坏笑的猫'))
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        self.assertFalse(payload['duplicated'])
+        self.assertEqual(payload['assetId'], 'upload-%s' % digest[:16])
+        item = payload['item']
+        self.assertEqual(item['name'], '坏笑的猫')
+        self.assertEqual(item['mimeType'], 'image/png')
+        self.assertEqual(item['size'], len(_PNG_BYTES))
+        self.assertEqual(item['source'], 'manual')
+        self.assertEqual(item['groupId'], 'collected')
+        self.assertEqual(item['groupName'], '未整理')
+        self.assertFalse(item['manual'])
+        # 落盘名 = 内容哈希 + 嗅探出来的扩展名（文件名参数根本不在路径里）。
+        self.assertEqual(item['file'], '%s.png' % digest)
+        stored = self._stored(payload['assetId'])
+        self.assertEqual(stored['hash'], digest)
+        self.assertEqual(stored['filePath'], 'collected/%s.png' % digest)
+        self.assertEqual(stored['status'], 'pending', '没给描述 → 等模型/重扫')
+        self.assertTrue(os.path.isfile(os.path.join(self.root, 'collected', '%s.png' % digest)))
+
+    def test_upload_rejects_non_image_bytes(self):
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.upload_sticker(b'<html>not an image</html>'))
+        self.assertIn('不是图片', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.upload_sticker(b''))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.upload_sticker('not bytes'))
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
+        self.assertEqual(os.listdir(os.path.join(self.root, 'collected')), [])
+
+    def test_upload_rejects_oversized_images_before_touching_the_disk(self):
+        self.service.cached_sticker_config = {
+            'enabled': True, 'directory': 'stickers', 'max_file_size_mb': 0.0001,
+            'catalog_limit': 40,
+        }
+        big = b'\x89PNG\r\n\x1a\n' + b'x' * 400
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.upload_sticker(big))
+        self.assertIn('体积上限', str(caught.exception))
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
+        self.assertEqual(os.listdir(os.path.join(self.root, 'collected')), [])
+
+    def test_duplicate_upload_returns_the_existing_row_and_writes_nothing(self):
+        """同一个文件再传一次：回已存在那条，**不新建文件、不覆盖、不改行**。"""
+        first = _run(self.api.upload_sticker(_PNG_BYTES, description='第一次的描述'))
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        path = os.path.join(self.root, 'collected', '%s.png' % digest)
+        before = os.stat(path).st_mtime_ns
+        second = _run(self.api.upload_sticker(
+            _PNG_BYTES, group_id='', description='第二次想改的描述', name='另一个名字',
+        ))
+        self.assertTrue(second['duplicated'])
+        self.assertEqual(second['assetId'], first['assetId'])
+        # 已存在那条的描述 / 名字 / 手工标记都没被第二次上传顶掉。
+        self.assertEqual(second['item']['description'], '第一次的描述')
+        self.assertTrue(second['item']['manual'])
+        self.assertEqual(second['item']['name'], 'upload-%s' % digest[:8])
+        self.assertEqual(self.database.count('interlude_sticker'), 1)
+        self.assertEqual(os.stat(path).st_mtime_ns, before, '重复上传不该重写文件')
+
+    def test_duplicate_upload_matches_disabled_and_missing_rows_too(self):
+        """去重看**内容**，不看状态：停用过的素材再传一次仍然回那一条（不复活、不顶替）。"""
+        first = _run(self.api.upload_sticker(_PNG_BYTES))
+        _run(self.api.update_sticker({'assetId': first['assetId'], 'disabled': True}))
+        again = _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertTrue(again['duplicated'])
+        self.assertTrue(again['item']['disabled'], '不许把停用决定顶掉')
+        self.assertEqual(self.database.count('interlude_sticker'), 1)
+
+    def test_upload_without_a_describer_stays_pending_and_warns(self):
+        """没配识图模型：行留在 `pending`、描述为空，而且**有一条 warn**。
+
+        这是"能力缺失"（坑 25）：用户刚上传完，得能看见"它还没被描述"，
+        而不是以为模型会自己搞定。下一次「重扫表情库」会补上。
+        """
+        self.service.sticker_describer = None
+        payload = _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertEqual(payload['item']['status'], 'pending')
+        self.assertEqual(payload['item']['description'], '')
+        self.assertFalse(payload['item']['manual'])
+        self.assertTrue(
+            any('视觉模型' in str(args) for args in self.service.reports),
+            '能力缺失必须留一条 warn：%s' % (self.service.reports,),
+        )
+
+    def test_upload_losing_a_concurrent_race_returns_the_winning_row(self):
+        """并发上传同一个文件：一边赢了写入，另一边**回那一行**，而不是 400。
+
+        模拟：去重检查那一次假装库里没有（同时"另一边"已经把行写进去了），
+        于是 `db_create` 撞 `assetId` 唯一索引——这时必须回过头按内容哈希找回那一行。
+        """
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        winner_id = 'upload-%s' % digest[:16]
+        original = self.service._sticker_prior_by_hash
+        calls = []
+
+        async def _first_miss_then_hit(value):
+            calls.append(value)
+            if len(calls) == 1:
+                row = self._row(winner_id, hash=digest, filePath='collected/%s.png' % digest)
+                row['id'] = self.database.insert('interlude_sticker', row)
+                return None
+            return await original(value)
+
+        self.service._sticker_prior_by_hash = _first_miss_then_hit
+        payload = _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertTrue(payload['duplicated'])
+        self.assertEqual(payload['assetId'], winner_id)
+        self.assertEqual(len(calls), 2, '去重查一次、撞索引后再查一次')
+        self.assertEqual(self.database.count('interlude_sticker'), 1)
+
+    def test_upload_with_a_description_pins_it_and_never_calls_the_model(self):
+        async def _boom(*_args, **_kwargs):
+            raise AssertionError('上传时给了描述就不该再调视觉模型')
+
+        self.service.describe_sticker_asset = _boom
+        payload = _run(self.api.upload_sticker(
+            _PNG_BYTES, description='她手写的：一只挥手的猫', name='挥手',
+        ))
+        item = payload['item']
+        self.assertEqual(item['description'], '她手写的：一只挥手的猫')
+        self.assertTrue(item['manual'], '人写的描述要置 descriptionManual（扫描不得覆盖）')
+        self.assertFalse(item['disabled'])
+        stored = self._stored(payload['assetId'])
+        self.assertEqual(stored['status'], 'active', '有描述 = 立刻进目录')
+        self.assertEqual(stored['descriptionManual'], 1)
+
+    def test_upload_without_a_description_asks_the_model_then_refreshes_the_catalog(self):
+        calls = []
+
+        async def _describe(asset, data, config=None):
+            calls.append((asset.get('assetId'), bytes(data)))
+            # 模拟真实描述成功：写库 + 刷新目录（真实实现在 chunk2.describe_sticker_asset）。
+            await self.service.db_set('interlude_sticker', {'id': asset.get('id')}, {
+                'description': '模型写的描述', 'status': 'active',
+            })
+            return True
+
+        self.service.describe_sticker_asset = _describe
+        payload = _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertEqual(len(calls), 1, '没给描述就必须问一次模型')
+        self.assertEqual(calls[0][1], _PNG_BYTES, '把**原始字节**交给描述器')
+        self.assertEqual(payload['item']['description'], '模型写的描述')
+        self.assertFalse(payload['item']['manual'])
+        self.assertEqual(
+            [row.get('assetId') for row in self.service.sticker_catalog],
+            [payload['assetId']],
+            '描述完要刷目录，下一回合的 stickerCatalog 里才有它',
+        )
+
+    def test_upload_lands_in_the_named_group(self):
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        payload = _run(self.api.upload_sticker(_PNG_BYTES, group_id=group_id))
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        self.assertEqual(payload['item']['groupId'], group_id)
+        self.assertEqual(payload['item']['groupName'], '猫猫')
+        self.assertEqual(self._stored(payload['assetId'])['group'], group_id)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, group_id, '%s.png' % digest)))
+        # 分组计数跟着涨（面板的"每组多少张"是精确的）。
+        groups = self._group(_run(self.api.sticker_groups()))
+        self.assertEqual(groups[group_id]['count'], 1)
+
+    def test_upload_rejects_an_unknown_or_unsafe_group(self):
+        for group_id in ('nope', 'default', '../evil', 'a/b'):
+            with self.subTest(group_id=group_id):
+                with self.assertRaises(ConsoleError):
+                    _run(self.api.upload_sticker(_PNG_BYTES, group_id=group_id))
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
+        self.assertEqual(os.listdir(os.path.join(self.root, 'collected')), [])
+
+    def test_upload_is_refused_while_the_library_is_off(self):
+        self.bridge.config = {'stickers': {'enabled': False, 'directory': 'stickers'}}
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertIn('未启用', str(caught.exception))
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
+
+    def test_upload_refuses_to_overwrite_a_different_file_at_the_same_path(self):
+        """同名不同内容（只可能是哈希碰撞）：**拒绝**，绝不覆盖。"""
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        path = os.path.join(self.root, 'collected', '%s.png' % digest)
+        with open(path, 'wb') as handle:
+            handle.write(b'\x89PNG\r\n\x1a\n' + b'DIFFERENT' * 8)
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertIn('拒绝覆盖', str(caught.exception))
+        with open(path, 'rb') as handle:
+            self.assertIn(b'DIFFERENT', handle.read(), '盘上那份必须原封不动')
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
+
+    def test_upload_reuses_an_orphan_file_with_identical_bytes(self):
+        """盘上有同名文件但库里没行（比如手删了行）：内容一致就直接复用，不重写。"""
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        path = os.path.join(self.root, 'collected', '%s.png' % digest)
+        with open(path, 'wb') as handle:
+            handle.write(_PNG_BYTES)
+        before = os.stat(path).st_mtime_ns
+        payload = _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertFalse(payload['duplicated'])
+        self.assertEqual(os.stat(path).st_mtime_ns, before)
+        self.assertEqual(self.database.count('interlude_sticker'), 1)
+
+    # ---- 上传路由（multipart 的两条参数通道） ----
+
+    def _page(self, **kwargs):
+        self.addCleanup(_install_web_request(**kwargs))
+        plugin = _make_plugin({})
+        plugin._console = self.api
+        return _run(plugin.page_console_sticker_upload())
+
+    def test_group_routes_are_wired_to_the_real_handlers(self):
+        """四条分组路由的接线（`_console_json` / `_console_write`）+ 400 映射。
+
+        只调 `ConsoleApi` 断言不到"路由注册没注册、方法对不对"——所以这里跑真的 handler
+        （宿主响应用桩），与 `console/sticker-file` 那两条分支同一套做法。
+        """
+        plugin = _make_plugin({})
+        plugin._console = self.api
+
+        self.addCleanup(_install_web_request(query={}))
+        listed = _run(plugin.page_console_sticker_groups())
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.payload['defaultGroupId'], 'collected')
+        self.assertEqual(len(listed.payload['items']), 1)
+
+        self.addCleanup(_install_web_request(body={'name': '猫猫', 'description': '撒娇用'}))
+        saved = _run(plugin.page_console_sticker_group_save())
+        self.assertEqual(saved.status_code, 200)
+        group_id = saved.payload['groupId']
+        self.assertEqual(saved.payload['item']['name'], '猫猫')
+
+        self._insert('a-1')
+        self.addCleanup(_install_web_request(
+            body={'assetIds': ['a-1'], 'groupId': group_id},
+        ))
+        moved = _run(plugin.page_console_sticker_move())
+        self.assertEqual(moved.status_code, 200)
+        self.assertEqual(moved.payload['moved'], 1)
+        self.assertEqual(moved.payload['item'][0]['groupName'], '猫猫')
+
+        self.addCleanup(_install_web_request(body={'groupId': group_id}))
+        deleted = _run(plugin.page_console_sticker_group_delete())
+        self.assertEqual(deleted.status_code, 200)
+        self.assertTrue(deleted.payload['deleted'])
+        self.assertEqual(deleted.payload['moved'], 1)
+        self.assertEqual(deleted.payload['moveTo'], 'collected')
+
+        # 校验失败一律 400 + 原文案（不是 500）。
+        self.addCleanup(_install_web_request(body={'name': '   '}))
+        bad = _run(plugin.page_console_sticker_group_save())
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn('不能为空', bad.payload['message'])
+
+    def test_upload_route_reads_the_file_field_and_form_options(self):
+        response = self._page(
+            uploads={'file': _FakeUpload('../../evil.png', _PNG_BYTES)},
+            form={'groupId': '', 'description': '上传时写的描述', 'name': '猫猫图'},
+        )
+        self.assertEqual(response.status_code, 200)
+        item = response.payload['item']
+        self.assertFalse(response.payload['duplicated'])
+        self.assertEqual(item['name'], '猫猫图')
+        self.assertEqual(item['description'], '上传时写的描述')
+        self.assertTrue(item['manual'])
+        # 上传的文件名（`../../evil.png`）绝不进路径。
+        self.assertNotIn('..', item['file'])
+        self.assertNotIn('evil', item['file'])
+
+    def test_upload_route_falls_back_to_query_params(self):
+        """宿主 bridge 的 `upload(endpoint, file)` 只能发 `file` 一个字段——
+        所以参数必须能从查询串带进来（老宿主没有 `form()` 也一样）。"""
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        response = self._page(
+            uploads={'file': _FakeUpload('x.png', _PNG_BYTES)},
+            query={'group_id': group_id, 'description': '走查询串的描述'},
+            form_error=RuntimeError('老宿主没有 form()'),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.payload['item']['groupId'], group_id)
+        self.assertEqual(response.payload['item']['description'], '走查询串的描述')
+
+    def test_upload_route_without_a_file_is_a_400(self):
+        response = self._page()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('没有收到文件内容', response.payload['message'])
+        response = self._page(uploads={'file': _FakeUpload('x.png', b'')})
+        self.assertEqual(response.status_code, 400)
+
+    def test_upload_route_maps_console_errors_to_400(self):
+        response = self._page(uploads={'file': _FakeUpload('x.txt', b'not an image')})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('不是图片', response.payload['message'])
+        self.assertEqual(self.database.count('interlude_sticker'), 0)

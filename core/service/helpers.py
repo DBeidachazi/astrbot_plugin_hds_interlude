@@ -31,6 +31,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from datetime import datetime
@@ -61,11 +62,77 @@ __all__ = [
     'extract_session_audio_sources',
     'extract_session_file_facts',
     'describe_group_attachments',
+    'normalize_media_segments',
+    'describe_image_media',
+    'describe_card_media',
+    'media_kind_label',
+    'card_media_label',
     'guess_audio_format',
     # ---- 表情 / 表态 ----
     'calibrated_native_face_willingness',
     'stable_sticker_asset_id',
     'normalize_allowed_reactions',
+    # ---- 自动收藏入站表情包（本移植版新增）----
+    'collectible_sticker_kind',
+    'verify_sticker_image_bytes',
+    'collected_sticker_asset_id',
+    'COLLECTED_STICKER_DIR',
+    'COLLECTIBLE_STICKER_KINDS',
+    'STICKER_CANDIDATE_KIND',
+    'WIRE_MEDIA_KINDS',
+    'wire_media_kind',
+    'STICKER_IMAGE_MIMES',
+    'STICKER_FILE_SUFFIX',
+    # ---- 表情库分组 / 上传（本移植版新增，§47）----
+    'COLLECTED_STICKER_GROUP_ID',
+    'COLLECTED_STICKER_GROUP_NAME',
+    'COLLECTED_STICKER_GROUP_DESCRIPTION',
+    'STICKER_GROUP_NAME_MAX_BYTES',
+    'STICKER_GROUP_NAME_FORBIDDEN',
+    'STICKER_GROUP_RESERVED_NAMES',
+    'STICKER_GROUP_ROOT_BUCKET',
+    'STICKER_GROUP_DESCRIPTION_MAX',
+    'STICKER_NAME_MAX',
+    'STICKER_DESCRIPTION_MAX',
+    'safe_sticker_group_name',
+    'sticker_group_name_problem',
+    'uploaded_sticker_asset_id',
+    # ---- 两级表情选择 / 描述时定组（本移植版新增，§48）----
+    'STICKER_GROUP_INLINE_ASSET_LIMIT',
+    'STICKER_GROUP_ITEM_LIMIT',
+    'STICKER_FOLLOW_UP_MAX_PER_TURN',
+    'STICKER_FOLLOW_UP_TIMEOUT_SECONDS',
+    'STICKER_AUTO_GROUP_MAX_GROUPS',
+    'STICKER_AUTO_GROUP_MAX_NEW_PER_DAY',
+    'STICKER_AUTO_GROUP_WINDOW_HOURS',
+    'sticker_group_directory',
+    'sticker_group_directory_ids',
+    'sticker_group_items',
+    'parse_sticker_group_choice',
+    'parse_sticker_selection_receipt',
+    'parse_sticker_auto_group',
+    'visible_reply_text',
+    'apply_sticker_follow_up_content',
+    # ---- 第二层：普通图片的模型判定（本移植版新增，§45.7）----
+    'GUESS_STICKER_KIND',
+    'GUESS_STICKER_MAX_DIMENSION',
+    'GUESS_STICKER_MAX_ASPECT',
+    'GUESS_STICKER_MIN_CONFIDENCE',
+    'STICKER_GUESS_KINDS',
+    'guess_image_dimensions',
+    'sticker_media_signal',
+    'sticker_guess_candidate',
+    'sticker_guess_result',
+    'sticker_disabled_by',
+    'sticker_not_sticker_verdict',
+    'STICKER_NOT_A_STICKER',
+    'STICKER_NAME_RE',
+    'STICKER_NAME_PLACEHOLDERS',
+    'STICKER_SIGNAL_NONE',
+    'STICKER_SIGNAL_NAME',
+    'STICKER_SIGNAL_GIF',
+    'STICKER_SIGNAL_ALPHA',
+    'STICKER_SIGNAL_SHAPE',
     # ---- 用户自报时间 / 引用消息 ----
     'extract_user_reported_times',
     'describe_quoted_message',
@@ -281,6 +348,15 @@ def resolve_sticker_config(value: Any = None) -> dict[str, Any]:
     directory = config_get(configured, 'directory')
     return {
         'enabled': config_get(configured, 'enabled') is True,
+        # 两级表情选择 / 描述时定组（v1.8.4，§48）：**默认真**，只有显式 false 才关。
+        # `is not False` 是刻意的：缺失 / NULL / 字符串一律按默认（开）走——
+        # 这两把闸的默认行为就是今天已经验收过的那套（关掉即回到平铺目录）。
+        'group_selection': config_get(configured, 'group_selection', 'groupSelection') is not False,
+        'auto_group': config_get(configured, 'auto_group', 'autoGroup') is not False,
+        # 描述时判"不是表情包"就停用（v1.8.4，§50）：**默认真**，只有显式 false 才关。
+        # 同一把尺子（`is not False`）：缺失 / NULL / 字符串一律按默认（开）走；
+        # 关掉它就只写描述、一个字的启用状态都不动。
+        'auto_disable': config_get(configured, 'auto_disable', 'autoDisable') is not False,
         'directory': str(directory if directory else 'data/hds-interlude/stickers').strip(),
         'max_file_size_mb': max(1.0, min(30.0, _config_number_or(
             configured, 'maxFileSizeMB', 'max_file_size_mb', 10,
@@ -437,7 +513,7 @@ def extract_session_audio_sources(session: Any) -> list[str]:
     """上游 `extractSessionAudioSources`：抽出原生音频通道可取回的语音 / 音频 token。
 
     与图片不同，语音记录优先用 OneBot 的 file token：原始语音 URL 提供的是 SILK，
-    只有 SnowLuma 的服务端转码（`get_record out_format`）才能变成模型可读的载荷。
+    只有服务端转码（NapCat `get_record` 的 `out_format`）才能变成模型可读的载荷。
     """
     raw = _str(session.get('content') if isinstance(session, dict) else getattr(session, 'content', None))
     sources: list[str] = []
@@ -478,7 +554,7 @@ def extract_session_audio_sources(session: Any) -> list[str]:
         for match in _AUDIO_TAG_RE.finditer(raw):
             add(match.group(1))
     # OneBot 可能只留下一个只带 file token 的 CQ record 段（典型的 NapCat /
-    # SnowLuma 私聊语音），或者带一个我们无法转码的额外 url 字段。
+    # 私聊语音），或者带一个我们无法转码的额外 url 字段。
     for match in _CQ_RECORD_RE.finditer(raw):
         fields: dict[str, str] = {}
         for part in match.group(1).split(','):
@@ -551,16 +627,125 @@ def extract_session_file_facts(session: Any) -> list[SessionFileFact]:
     return facts
 
 
+# ---------------------------------------------------------------------------
+# 入站媒体标记 → 叙述者可见的语义标签（受控偏离，见 `docs/PORTING_NOTES.md` §29）
+#
+# 上游把一切图片都记成 `[图片]`：实拍照片、截图、收藏表情包、QQ 商城表情、
+# 小程序卡片在文本里长得一模一样，模型只能靠猜。这里把适配器从原始段里捞回来的
+# 种类（`kind` / `summary`）翻译成稳定的中文标签。**普通图片仍然是 `[图片]`**
+# （上游行为），只有确实能分出来的种类才换词。
+# ---------------------------------------------------------------------------
+
+#: `<img kind="...">` → 标签。`market` 只作为兜底（商城表情正常走 `<mface>`）。
+IMAGE_MEDIA_KIND_LABELS = {
+    'sticker': '[表情包]',
+    'animated': '[动画表情]',
+    'market': '[QQ 商城表情]',
+}
+
+
+def _media_attr(attributes: Any, key: str) -> str:
+    """从标签属性串里读一个属性（属性串来自适配器，永远当成不可信文本）。"""
+    found = re.search(r'%s=["\']([^"\']*)["\']' % re.escape(key), _str(attributes), re.IGNORECASE)
+    return found.group(1).strip() if found else ''
+
+
+def describe_image_media(attributes: Any) -> str:
+    """`<img>` → `[图片]` / `[表情包]` / `[动画表情]` / `[QQ 商城表情]`（文本入口）。"""
+    return media_kind_label(_media_attr(attributes, 'kind'), _media_attr(attributes, 'summary'))
+
+
+def media_kind_label(kind: Any, summary: Any) -> str:
+    """媒体种类 + 平台原文 → 给人/模型看的标签（**唯一判据，两个入口共用**）。
+
+    入口一：`describe_image_media()`（文本里的 `<img kind=… summary=…>`，只用来出标签）；
+    入口二：`chunk3` 读**结构化媒体表**（`session.media`，种类与来源都在里面，
+    §46）。标签必须逐字一致，所以两处都走这一个函数。
+    """
+    kind_text = _str(kind).strip().lower()
+    summary_text = _str(summary).strip()
+    # 平台给的 summary 比我们推测的 kind 更具体：`[动画表情]` 说明它还会动。
+    if '动画' in summary_text:
+        return '[动画表情]'
+    if kind_text in IMAGE_MEDIA_KIND_LABELS:
+        return IMAGE_MEDIA_KIND_LABELS[kind_text]
+    if '表情' in summary_text:
+        return '[表情包]'
+    return '[图片]'
+
+
+#: wire（`currentEvent.attachments[].kind` 与侧端视觉的 `mediaKind`）**只认**这几个值 ——
+#: 提示词就是按这份枚举教模型的。
+WIRE_MEDIA_KINDS = frozenset({'image', 'sticker', 'animated', 'market', 'card'})
+
+
+def wire_media_kind(kind: Any) -> str:
+    """内部媒体种类 → **wire 词汇表**：候选档对外就是普通图（§49.1）。
+
+    为什么必须收口：`sticker-candidate` 只说明"平台标了候选、结构检查还没做" ——
+    它既不是"观测到的表情"，也不是提示词教过的种类（提示词枚举的是
+    `image / sticker / animated / market / card`），漏出去等于让模型读一个没定义的词。
+    其余种类**原样透传**（`photo` 这种外部写法不许被悄悄改掉）。
+    """
+    text = _str(kind).strip().lower()
+    if not text or text == STICKER_CANDIDATE_KIND:
+        return GUESS_STICKER_KIND  # `image`
+    return text
+
+
+def describe_card_media(attributes: Any) -> str:
+    """`<card>`（QQ 小程序 / 分享卡片）→ `[QQ小程序：标题]` / `[分享卡片：标题]`（文本入口）。
+
+    卡片必须带上**是什么**：只有 `<card/>` 时模型只能含糊成"他发了点什么"。
+    """
+    return card_media_label(
+        _media_attr(attributes, 'app'),
+        _media_attr(attributes, 'title') or _media_attr(attributes, 'prompt'),
+    )
+
+
+def card_media_label(app: Any, title: Any) -> str:
+    """卡片属性 → 标签（**唯一判据，两个入口共用**，同 `media_kind_label`）。"""
+    app_text = _str(app).strip()
+    title_text = _str(title).strip()
+    mini = app_text.startswith('com.tencent.miniapp') or app_text.startswith('110')
+    if title_text:
+        return ('[QQ小程序：%s]' if mini else '[分享卡片：%s]') % title_text[:40]
+    return '[QQ小程序]' if mini else '[分享卡片]'
+
+
+def normalize_media_segments(content: Any) -> str:
+    """把入站的图片 / 表情 / 卡片标记换成带种类的语义标签。
+
+    比上游的"全记 `[图片]`"多一层：`kind` 与 `summary` 由适配层从 OneBot 原始段里
+    捞回来（见 `astrbot_bridge.raw_media_hints`），到这里才变成模型看得懂的词。
+    原生表情仍走 `normalize_qq_native_face_segments`（唯一入口，别在这里重复处理）。
+    """
+    text = normalize_qq_native_face_segments(content)
+    text = re.sub(
+        r'<(?:img|image)\b([^>]*)/?>(?:</(?:img|image)>)?',
+        lambda match: describe_image_media(match.group(1)),
+        text, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r'<card\b([^>]*)/?>(?:</card>)?',
+        lambda match: describe_card_media(match.group(1)),
+        text, flags=re.IGNORECASE,
+    )
+    # CQ 码没有 kind/summary（原始段的种类信息在适配器那层就取了），保守回落 `[图片]`。
+    text = re.sub(r'\[CQ:image,[^\]]*\]', '[图片]', text, flags=re.IGNORECASE)
+    return text
+
+
 def describe_group_attachments(content: Any) -> str:
     """上游 `describeGroupAttachments`：把群聊入站的附件标记转成事实占位。
 
     群聊入站没有原生附件通道：保留「发过什么」的信息，URL 污水不进群上下文，
     也不再被模型复述。
     """
-    text = normalize_qq_native_face_segments(_str(content))
     # 注意先替换 `<file ...>` 再删闭合标签：上游用 `name|file|title` 抽文件名。
+    text = normalize_media_segments(_str(content))
     text = re.sub(r'<(?:record|audio)\b[^>]*/?>', '[语音]', text, flags=re.IGNORECASE)
-    text = re.sub(r'<(?:img|image)\b[^>]*/?>', '[图片]', text, flags=re.IGNORECASE)
     text = re.sub(r'<video\b[^>]*/?>', '[视频]', text, flags=re.IGNORECASE)
 
     def file_replacement(match: re.Match[str]) -> str:
@@ -720,6 +905,780 @@ def stable_sticker_asset_id(file_path: Any, hash_value: Any) -> str:
     stem = stem[:220] or 'sticker'
     suffix = re.sub(r'[^a-fA-F0-9]', '', _str(hash_value))[:16].lower() or 'unhashed'
     return ('%s-%s' % (stem, suffix))[:255]
+
+
+# =========================================================================== #
+# 自动收藏入站表情包（本移植版新增，受控偏离；见 `docs/PORTING_NOTES.md` §45）
+#
+# 判据是**适配层观测到的种类**，不是名字、不是画面内容、更不是"看着像表情包"。
+# 这些是纯函数：种类的归一化、字节的图片校验、落地文件名的派生。
+# =========================================================================== #
+
+#: 表情库根目录下自动收藏落地的子目录（`scan_sticker_library` 会把它当分组）。
+COLLECTED_STICKER_DIR = 'collected'
+
+#: 「值得收藏」的入站种类。**`image` 不在里面**（普通照片 / 截图一律不收），
+#: `card`（小程序 / 分享卡片）不在里面（它不是图片，也没有可下载的图片字节）。
+COLLECTIBLE_STICKER_KINDS = frozenset({'sticker', 'animated', 'market'})
+
+#: **只在内部流通**的媒体种类：平台标了"表情包候选"（OneBot `sub_type` 2/3/7），
+#: 但"像不像表情包"的结构检查还没做完（§49.1 的第二档）。
+#: 它**绝不能**出现在模型看得见的 wire 上 —— 出口统一走 `wire_media_kind()`。
+STICKER_CANDIDATE_KIND = 'sticker-candidate'
+
+#: 自动收藏接受的图片 MIME（校验用的魔数就在 `guess_image_mime` 里，一份实现两处用）。
+STICKER_IMAGE_MIMES = frozenset({'image/png', 'image/jpeg', 'image/gif', 'image/webp'})
+
+#: 落地文件的扩展名（按**嗅探出来的** MIME 取，不按入站 URL 的后缀——URL 是对方给的）。
+STICKER_FILE_SUFFIX = {
+    'image/png': '.png',
+    'image/jpeg': '.jpg',
+    'image/gif': '.gif',
+    'image/webp': '.webp',
+}
+
+# --------------------------------------------------------------------------- #
+# 表情库分组（本移植版新增，见 `docs/PORTING_NOTES.md` §47）
+#
+# **磁盘目录结构是分组的唯一事实来源**：`interlude_sticker.group` 一直就是
+# "素材落在哪个子目录"的字符串（上游 `database.ts:164` 本来就有这一列 +
+# `group` 索引），子目录名 = 分组名。本移植版只补了两件上游没有的东西：
+# **描述**（给模型看的那一份）与**建组 / 改名 / 上传的操作面**。
+# 表 `interlude_sticker_groups` 因此只存"描述与时间"，键就是目录名。
+# --------------------------------------------------------------------------- #
+
+#: 内置默认组的目录名（= `groupId`）。它**永远**出现在分组列表里（哪怕没有素材、
+#: 表里也没有行），否则自动收藏与手动上传的素材无所属。
+COLLECTED_STICKER_GROUP_ID = COLLECTED_STICKER_DIR
+
+#: 内置默认组的**显示名**。这是全库**唯一**一个"显示名 ≠ 目录名"的特例：
+#: `collected` 是老库里已有素材的目录（改目录名 = 让已有素材集体搬家），
+#: 所以它的显示名固定成「未整理」；它同时**不许改名**（改名 = 换目录）。
+#:
+#: v1.8.4 起叫「未整理」：它不是一个"风格分组"，而是**落脚点**——自动收藏与
+#: 手动上传都先落这里，等着被（人或模型）归组。旧名「自动收藏」只描述了来源，
+#: 会让模型以为"这一组 = 自动收来的"，从而永远不去动它。
+COLLECTED_STICKER_GROUP_NAME = '未整理'
+
+#: 内置默认组的**模型可见描述**（用户在控制台写了描述就覆盖它）。它同时也是给模型的
+#: 那句"这一组怎么用"：没有它，模型只看到一个叫「未整理」的桶，不会想到把里面的素材
+#: 归到更合适的组里（§48 乙）。
+COLLECTED_STICKER_GROUP_DESCRIPTION = '自动收藏与手动上传都先落这里，还没归组。'
+
+#: 分组名 = **目录名**，所以规则按文件系统来（不是"标识符"）：
+#:
+#: * 字节上限（不是字符数）：文件系统按字节算，100 字节 ≈ 33 个汉字；
+#: * 禁字符集：路径分隔符与各平台的保留字符（Windows 上这几个真的建不出目录）；
+#: * 首字符不许 `.`（`..` / 隐藏目录因此**结构性**进不来）、首尾空白一律去掉、
+#:   空名字拒、控制字符拒。
+#:
+#: **允许**中日韩文字、字母、数字、空格、`-` `_` `.` `（）` 这类常见符号——
+#: 中文目录名是这个库的常态，上一版"ASCII only"的白名单会把它整个挡在门外。
+STICKER_GROUP_NAME_MAX_BYTES = 100
+STICKER_GROUP_NAME_FORBIDDEN = frozenset('/\\:*?"<>|')
+
+#: 根目录素材的桶名：`scan_sticker_library()` 给**没有子目录**的文件打的 `group` 值
+#: （`<根>/a.png` → `group = 'default'`）。它**不是目录**，所以它同时是**保留名**——
+#: 见下。一处定义：扫描写它、保留名集合也读它。
+STICKER_GROUP_ROOT_BUCKET = 'default'
+
+#: **保留名**：这些名字已经被"别的桶"占用，不能当**新写入的**分组名（新建 / 改名 /
+#: 移动 / 上传的目标一律 400）。现在只有一个：
+#:
+#: * `default` = 根目录素材的桶（上面那个常量）。允许建同名目录的话，`default` 这个
+#:   计数会把"散在根目录的"和"`default/` 里的"混在一起——用户根本分不清谁是谁。
+#:
+#: ⚠️ 只在**写入**这一侧判：**既有**的 `default/` 目录照常收录、照常显示、照常写描述
+#: （规则管的是"新写入的名字"，不是"让别人的素材消失"，与扫描那条同一条纪律）。
+STICKER_GROUP_RESERVED_NAMES = frozenset({STICKER_GROUP_ROOT_BUCKET})
+
+#: 分组描述上限（它要进提示词：50 组 × 500 字就是上限量级）。
+STICKER_GROUP_DESCRIPTION_MAX = 500
+
+#: 一条素材的短名 / 描述上限。单一事实源在这里：控制台（`console_api`）与服务层
+#: （`chunk2` 的上传管线）读同一份数字，不各抄一个（抄一份就会漂移一次）。
+STICKER_NAME_MAX = 60
+STICKER_DESCRIPTION_MAX = 2_000
+
+# --------------------------------------------------------------------------- #
+# 两级表情选择 / 描述时定组（本移植版新增，见 `docs/PORTING_NOTES.md` §48）
+#
+# 模型想发表情时的两步：先看**分组目录**（只有 id / 名字 / 描述 / 条数）点名一组，
+# 宿主再把该组的条目给它挑。省一次模型调用的办法是"条目本来就少"——直接内联。
+# --------------------------------------------------------------------------- #
+
+#: 内联阈值：目录里的条目**总数**不超过它就整份平铺（不花第二次调用）。
+STICKER_GROUP_INLINE_ASSET_LIMIT = 8
+
+#: 追问时一次最多给模型看多少条候选（与 `catalog_limit` 同量级；超出的截断）。
+STICKER_GROUP_ITEM_LIMIT = 40
+
+#: 一个回合最多额外问几次模型。**1 是铁律**：追问的回执里再点名一组也不许接着问，
+#: 否则"模型想说话 → 宿主无限追问"会变成一个死循环。
+STICKER_FOLLOW_UP_MAX_PER_TURN = 1
+
+#: 追问的总超时（秒）。追问是**锦上添花**：超时按"没有候选"继续，
+#: 正文照发、绝不让一次表情选择把整个回合卡住。
+STICKER_FOLLOW_UP_TIMEOUT_SECONDS = 20.0
+
+#: 自动定组的分组总数上限（模型看到的目录再大也不该长过这个数）。
+STICKER_AUTO_GROUP_MAX_GROUPS = 30
+
+#: 自动定组的**新建速率**上限与窗口：`STICKER_AUTO_GROUP_MAX_NEW_PER_DAY` 个 /
+#: `STICKER_AUTO_GROUP_WINDOW_HOURS` 小时（滚动窗口，看注册行的 `createdAt`）。
+#: 用滚动窗口而不是"自然日"是因为 `Database` 只有等值 `where`（没有范围算子，见坑 54 一带），
+#: 而读回来的注册表本来就在手上——在 Python 侧数一遍比加一张计数表省得多。
+STICKER_AUTO_GROUP_MAX_NEW_PER_DAY = 5
+STICKER_AUTO_GROUP_WINDOW_HOURS = 24
+
+
+def sticker_group_name_problem(value: Any, *, reserved: bool = False) -> str:
+    """分组名（= 目录名）不合法时回**中文原因**，合法回空串。
+
+    这是命名规则的**唯一定义处**：新建分组 / 改名 / 上传 / 移动 / 自动定组全走它，
+    控制台与服务层读的是同一句话（两处各写一份判据，迟早会一处宽一处严）。
+    扫描遇到不合规的既有目录名**照常收录**（只记 debug）——规则管的是"新写入的名字"，
+    不是"删掉别人已经放好的文件"。
+
+    首尾空白**归一化**（去掉）而不是拒绝：写进磁盘的名字里因此永远没有首尾空白，
+    比"拒一次、让用户自己回去删空格"更省事，也不留"名字看起来一样、实际两个目录"的坑。
+    中间的换行 / 制表符则直接拒——它会让一个目录名在界面上显示成两行。
+
+    `reserved=True` 是**写入侧**的加严：连保留名（`default` = 根目录素材的桶）也拒。
+    给既有的 `default/` 目录写描述、或把它改名成别的名字时**不传**它（历史目录要能管理）。
+    """
+    text = _str(value).strip()
+    if not text:
+        return '分组名不能为空'
+    if reserved and text in STICKER_GROUP_RESERVED_NAMES:
+        return '「%s」是保留名（那是根目录素材用的桶，不是一个分组），不能当分组名' % text
+    if text.startswith('.'):
+        return '分组名不能以「.」开头'
+    if len(text.encode('utf-8')) > STICKER_GROUP_NAME_MAX_BYTES:
+        return '分组名最长 %d 字节（一个汉字算 3 字节）' % STICKER_GROUP_NAME_MAX_BYTES
+    for character in text:
+        if character in STICKER_GROUP_NAME_FORBIDDEN:
+            return '分组名不能包含 %s' % character
+        if ord(character) < 32 or ord(character) == 127:
+            return '分组名不能包含控制字符'
+        if character.isspace() and character != ' ':
+            return '分组名不能包含换行或制表符'
+    return ''
+
+
+def safe_sticker_group_name(value: Any, *, reserved: bool = False) -> str:
+    """分组名归一化：合法回**去首尾空白后**的名字，不合法回空串（调用方据此拒绝）。
+
+    "拿不准 = 拒绝"：这个名字会被拼进文件路径（`<表情库根>/<目录名>/<hash>.<ext>`），
+    所以 `/` `\\` `:` 等一律拒；`..` 因为"首字符不许 `.`"**结构性**进不来，不靠调用方
+    记得过滤。落盘前控制台 / 服务层还会再复验一次 `commonpath`（第二道闸）。
+    `reserved=True` 见 `sticker_group_name_problem()`。
+    """
+    text = _str(value).strip()
+    if sticker_group_name_problem(text, reserved=reserved):
+        return ''
+    return text
+
+
+def _dual_field(value: Any, camel: str, snake: Optional[str] = None) -> Any:
+    """读**外部**（模型原样返回 / 跨 chunk 传递）的 dict：两种拼写都认，**优先 camelCase**。
+
+    与 `config_get()` 的方向刻意相反：配置层由 `normalize_config()` 归一成 snake_case，
+    而模型回的是 camelCase（键名法）。本模块只读模型与数据库那一侧，所以这里 camel 优先。
+    """
+    if not isinstance(value, dict):
+        return None
+    if camel in value:
+        return value[camel]
+    if snake is not None and snake in value:
+        return value[snake]
+    return None
+
+
+def sticker_group_directory(
+    assets: Any, rows: Any, limit: Optional[int] = STICKER_AUTO_GROUP_MAX_GROUPS,
+    include_empty: bool = False, directories: Any = None,
+) -> list[dict[str, Any]]:
+    """模型可见的**分组目录**：`[{groupId, name, description, count}]`（**不列条目**）。
+
+    这是 §48 的**唯一事实源**：两级选择的第一次 payload 与「描述时定组」的提示词
+    都读这一份。目录文本写两份，迟早会漂移成"模型挑组时看到的描述"与"整理时看到的
+    描述"不一样——那正是这一轮要避免的事。
+
+    **分组的名字就是目录名**（`groupId`）。`rows` 是描述表 `interlude_sticker_groups`
+    的行——表里没有行不是"未注册"，只是**这一组还没有描述**；组的成员资格来自
+    "有素材挂着它"或"磁盘上真有这个目录"（`directories`）。
+
+    口径：
+
+    * `include_empty=False`（甲：**要把表情发出去**）：只列真的有条目的组——选一个空组
+      只能空手而归，白烧一次调用；
+    * `include_empty=True`（乙：**要把素材归进去**）：没有条目的组也要列（描述行里的、
+      以及 `directories` 里那些刚建好的空目录）——不然第一条素材永远进不了一个
+      刚建好、还没东西的分组（这是这一功能的入口本身）；
+    * 内置默认组永远排第一，名字固定 `COLLECTED_STICKER_GROUP_NAME`（唯一一个
+      "显示名 ≠ 目录名"的特例），描述缺省用 `COLLECTED_STICKER_GROUP_DESCRIPTION`
+      （用户在控制台写过就听用户的）；
+    * 空 `group`（"未分组"桶）**不列**：它不是合法目标（目录名规则会拒）；
+    * `limit=None` = 不截断（"这个组合法吗"的校验用得上，提示词那边一定带上限）。
+    """
+    counts: dict[str, int] = {}
+    for asset in assets or []:
+        if not isinstance(asset, dict):
+            continue
+        group_id = _str(asset.get('group')).strip()
+        if not group_id:
+            continue
+        counts[group_id] = counts.get(group_id, 0) + 1
+    described: dict[str, dict[str, Any]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        group_id = _str(row.get('groupId')).strip()
+        if group_id and group_id not in described:
+            described[group_id] = row
+    on_disk = {
+        _str(name).strip() for name in (directories or []) if _str(name).strip()
+    }
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(group_id: str, name: str, description: str) -> None:
+        seen.add(group_id)
+        items.append({
+            'groupId': group_id, 'name': name, 'description': description,
+            'count': counts.get(group_id, 0),
+        })
+
+    def describe(group_id: str) -> str:
+        row = described.get(group_id) or {}
+        return _str(row.get('description')).strip()
+
+    if counts.get(COLLECTED_STICKER_GROUP_ID) or include_empty:
+        add(
+            COLLECTED_STICKER_GROUP_ID,
+            COLLECTED_STICKER_GROUP_NAME,
+            describe(COLLECTED_STICKER_GROUP_ID) or COLLECTED_STICKER_GROUP_DESCRIPTION,
+        )
+    # 描述表按 `createdAt` 升序（与控制台列表同一条规矩），同刻按目录名定序保证可复现。
+    for group_id in sorted(described, key=lambda key: (_str(described[key].get('createdAt')), key)):
+        if group_id in seen or not (counts.get(group_id) or include_empty):
+            continue
+        add(group_id, group_id, describe(group_id))
+    # 剩下的：磁盘上有目录的、以及有素材挂着的（都没描述行）——按目录名排序。
+    for group_id in sorted(
+        key for key in (set(counts) | on_disk)
+        if key and key not in seen and (counts.get(key) or include_empty)
+    ):
+        add(group_id, group_id, '')
+    if limit is None:
+        return items
+    return items[:max(1, int(limit))]
+
+
+def sticker_group_directory_ids(directory: Any) -> set[str]:
+    """目录里出现过的 groupId 集合（"这一组存在吗"的**唯一**判据）。"""
+    return {
+        _str(item.get('groupId')).strip()
+        for item in (directory or [])
+        if isinstance(item, dict) and _str(item.get('groupId')).strip()
+    }
+
+
+def sticker_group_items(
+    assets: Any, group_id: Any, limit: int = STICKER_GROUP_ITEM_LIMIT,
+) -> list[dict[str, Any]]:
+    """某分组里**可以让模型挑**的条目：`[{assetId, description}]`（**不含图字节**）。
+
+    没描述的条目不进候选：模型只能靠描述挑图，给一条没有描述的等于让它瞎猜
+    （而投递时真会发出去那张图）。
+    """
+    wanted = _str(group_id).strip()
+    if not wanted:
+        return []
+    items: list[dict[str, Any]] = []
+    for asset in assets or []:
+        if not isinstance(asset, dict):
+            continue
+        if _str(asset.get('group')).strip() != wanted:
+            continue
+        asset_id = _str(asset.get('assetId')).strip()
+        description = _str(asset.get('description')).strip()
+        if not asset_id or not description:
+            continue
+        items.append({'assetId': asset_id, 'description': description})
+        if len(items) >= max(1, int(limit)):
+            break
+    return items
+
+
+def parse_sticker_group_choice(decision: Any) -> str:
+    """模型**点名了哪个分组**：`localMedia.stickerGroupId` 优先，其次顶层同名字段。
+
+    双读 camelCase / snake_case（键名法：模型原样返回的 JSON 两种拼写都认）。
+    拿不准一律回空串——调用方据此走"没有候选"的兜底，绝不替模型猜一个组。
+    """
+    local_media = _dual_field(decision, 'localMedia', 'local_media')
+    for container in (local_media, decision):
+        if not isinstance(container, dict):
+            continue
+        for key in ('stickerGroupId', 'sticker_group_id'):
+            if key in container:
+                candidate = safe_sticker_group_name(container.get(key))
+                if candidate:
+                    return candidate
+    return ''
+
+
+def parse_sticker_selection_receipt(payload: Any) -> dict[str, Any]:
+    """追问回执 → `{assetId, content, willingness}`；**只归一化，不做决定**。
+
+    发不发那张图仍由 `resolve_sticker()`（意愿阈值 + 目录成员资格）一处判——
+    这里多一个判据，就会出现"两处都以为对方会拦"的空档。
+    """
+    if not isinstance(payload, dict):
+        return {}
+    asset_id = ''
+    for camel, snake in (('stickerAssetId', 'sticker_asset_id'), ('assetId', 'asset_id')):
+        value = _dual_field(payload, camel, snake)
+        if isinstance(value, str) and value.strip():
+            asset_id = value.strip()
+            break
+    content = ''
+    value = _dual_field(payload, 'content')
+    if isinstance(value, str) and value.strip():
+        content = value
+    return {
+        'assetId': asset_id,
+        'content': content,
+        'willingness': _dual_field(payload, 'willingness'),
+    }
+
+
+def parse_sticker_auto_group(receipt: Any) -> Optional[dict[str, Any]]:
+    """描述回执里的分组选择 → `{'mode': 'existing'|'new', …}`；没有 / 坏形状回 `None`。
+
+    形状契约（§48 乙）：
+
+    ```jsonc
+    {"description": "…", "group": {"existing": "<groupId>"}}
+    {"description": "…", "group": {"new": {"name": "…", "description": "…"}}}
+    ```
+
+    这里只做**形状与字面**校验：名字压掉控制字符与多余空白、过一遍与人工建组**同一条**
+    命名规则（`sticker_group_name_problem`：允许中文，禁路径分隔符等）；描述压掉控制字符、
+    截到 `STICKER_GROUP_DESCRIPTION_MAX`。名字会变成**磁盘目录名**，所以这条规则不能松。
+    **新建**那一支还要连**保留名**（`default`）一起拒（`reserved=True`）——那是根目录素材
+    的桶，不是分组；**点名已有组**那一支不传它（模型指着一个既有的 `default` 桶说
+    "归这里"是合法的）。
+    "这个组到底存不存在 / 该不该新建"是策略，在服务层判（那里才知道磁盘与描述表）。
+    """
+    raw = _dual_field(receipt, 'group')
+    if not isinstance(raw, dict):
+        return None
+    existing = _clean_group_text(_dual_field(raw, 'existing'))
+    if existing and not sticker_group_name_problem(existing):
+        return {'mode': 'existing', 'groupId': existing}
+    new = _dual_field(raw, 'new')
+    if isinstance(new, dict):
+        name = _clean_group_text(_dual_field(new, 'name'))
+        if name and not sticker_group_name_problem(name, reserved=True):
+            return {
+                'mode': 'new',
+                'name': name,
+                'description': _clean_group_text(_dual_field(new, 'description'))[
+                    :STICKER_GROUP_DESCRIPTION_MAX
+                ],
+            }
+    return None
+
+
+def _clean_group_text(value: Any) -> str:
+    """模型给的分组名 / 描述：控制字符换空格、压缩空白、去首尾（一行可读文本）。"""
+    text = re.sub(r'[\x00-\x1f\x7f]+', ' ', _str(value))
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def visible_reply_text(decision: Any) -> str:
+    """本回合**已经写好的可见正文**（群回复优先，其次 `interaction.reply`）。
+
+    只有 `mode == 'immediate'` 才算"要说的话"：`none` / `deferred` 是模型明确的
+    沉默或延后，追问回执不许把它们变成一条消息。
+    """
+    if not isinstance(decision, dict):
+        return ''
+    group_reply = _dual_field(decision, 'groupReply', 'group_reply')
+    if isinstance(group_reply, dict) and group_reply.get('mode') == 'immediate':
+        text = group_reply.get('content')
+        if isinstance(text, str) and text.strip():
+            return text
+    interaction = _dual_field(decision, 'interaction')
+    reply = interaction.get('reply') if isinstance(interaction, dict) else None
+    if isinstance(reply, dict) and reply.get('mode') == 'immediate':
+        text = reply.get('content')
+        if isinstance(text, str) and text.strip():
+            return text
+    return ''
+
+
+def apply_sticker_follow_up_content(decision: Any, content: Any) -> bool:
+    """把追问回执里的正文**补**进 decision 的空正文处；没补成回 `False`。
+
+    **正文以第一段为准**（§48.1）：第一段带着完整叙事上下文写出来的，第二段手里只有
+    "分组条目 + 那一句话"——让它重写等于用信息更少的一次调用覆盖信息更多的一次，
+    文本质量风险 > 收益。所以这里**只填空**：`mode == 'immediate'`（本来就要说话）
+    但正文是空 / 全空白时，才用回执里的正文补进去；第一段已经写了正文，一个字都不动
+    （返回 `False`，调用方据它记 debug）。`mode == 'none'` 是模型明确的沉默，同样不补。
+    """
+    text = _str(content).strip()
+    if not text or not isinstance(decision, dict):
+        return False
+    group_reply = _dual_field(decision, 'groupReply', 'group_reply')
+    if (
+        isinstance(group_reply, dict) and group_reply.get('mode') == 'immediate'
+        and not _str(group_reply.get('content')).strip()
+    ):
+        group_reply['content'] = text
+        return True
+    interaction = _dual_field(decision, 'interaction')
+    reply = interaction.get('reply') if isinstance(interaction, dict) else None
+    if (
+        isinstance(reply, dict) and reply.get('mode') == 'immediate'
+        and not _str(reply.get('content')).strip()
+    ):
+        reply['content'] = text
+        return True
+    return False
+
+
+def uploaded_sticker_asset_id(content_hash: Any) -> str:
+    """上传素材的 `assetId`：`upload-<哈希前 16 位>`。
+
+    与自动收藏（`sticker-…`）分居两个命名空间，日志与控制台里一眼可分来源；
+    同一个文件重复上传**必然**被内容哈希去重掉，所以这个 id 不会撞。
+    """
+    digest = re.sub(r'[^a-fA-F0-9]', '', _str(content_hash)).lower()[:16] or 'unhashed'
+    return 'upload-%s' % digest
+
+
+def collectible_sticker_kind(value: Any) -> str:
+    """入站附件的种类 → 「可收藏的种类」；**拿不准一律回空串**。
+
+    这是本功能的红线（用户点名的那条）：只有适配层从 OneBot 原始段**观测到**的
+    `sticker` / `animated` / `market` 才算数。缺失、未知、`image`、`card`、
+    大小写噪声、`None`、非字符串——全部回空串，调用方据此跳过并记 debug。
+
+    读外部输入两种拼写都认（`kind` / `kinds` 这种多值形态不在契约里，不认）。
+    """
+    text = _str(value).strip().lower()
+    return text if text in COLLECTIBLE_STICKER_KINDS else ''
+
+
+def verify_sticker_image_bytes(data: Any) -> str:
+    """字节是不是真图片？是就回 MIME（`image/…`），否则回空串。
+
+    要求「字节要真的验过是图片」：`guess_image_mime` 认的正是 gif / png / jpg / webp
+    四种魔数，嗅不出来（HTML 错误页、纯文本、空字节、别的格式）一律回空串。
+    空结果与 `random` 之类的碰撞无关——这里只看头几个字节。
+    """
+    if not data:
+        return ''
+    mime = guess_image_mime(data)
+    return mime if mime in STICKER_IMAGE_MIMES else ''
+
+
+def collected_sticker_asset_id(name: Any, content_hash: Any) -> str:
+    """自动收藏资产的 `assetId`：`sticker-<名字>--<哈希片段>`。
+
+    带 `sticker-` 前缀是为了让 id **自述来源**（控制台的 `source` 字段据此派生，
+    不必给表加一列），也让自动资产与磁盘扫描出来的资产在日志里一眼可分。
+    哈希片段让同内容永远得到同一个 id —— `assetId` 有唯一索引，撞了就是写失败。
+    """
+    digest = re.sub(r'[^a-fA-F0-9]', '', _str(content_hash)).lower()[:16] or 'unhashed'
+    stem = re.sub(r'[^a-zA-Z0-9_-]+', '-', _str(name).strip())[:80].strip('-') or 'inbound'
+    return ('sticker-%s-%s' % (stem, digest))[:255]
+
+
+# =========================================================================== #
+# 第二层判据：让识图模型确认"这张普通图片到底是不是表情包"（v1.8.0，受控偏离 §45.7）
+#
+# 第一层 `collectible_sticker_kind()` 只认**适配层观测到的**三类；这一层处理那些
+# **被当成普通图片发过来**的表情包。两层互不越权：
+#
+# * 第一层认了的种类**直接收**，永远不走模型（也永远不经过下面任何函数）；
+# * 这一层只处理 `kind == 'image'`，**永远不能否决第一层**；
+# * 这一层先做便宜的预筛（纯 Python 解析图片头），值得问才调模型。
+# =========================================================================== #
+
+#: 第二层唯一处理的入站种类（普通图片）。别的种类要么第一层已经收了，要么不收。
+GUESS_STICKER_KIND = 'image'
+
+#: —— 以下三个是**启发式阈值，不是平台规则** ——
+#:
+#: 聊天软件里的表情包几乎都是小尺寸、近方形的图；实拍照片与截图通常是长宽比明显的
+#: 大图。这三个数只用来把"明显不像"的图挡在模型调用之前（省 token 是这条功能的成败点），
+#: 判定权在模型回执与用户的开关，不在它们身上。
+GUESS_STICKER_MAX_DIMENSION = 512
+GUESS_STICKER_MAX_ASPECT = 1.6
+#: 判成"是表情包"的最低置信度（同样是**启发式**）：低于它按"拿不准"处理 = 不收。
+GUESS_STICKER_MIN_CONFIDENCE = 0.6
+
+#: 模型回执里认得的 `kind`（提示词逐字要求这几档）；白名单外一律归 `other`。
+STICKER_GUESS_KINDS = ('meme', 'reaction', 'caption_photo', 'photo', 'screenshot', 'other')
+
+#: 描述回执里"这不是表情包"的判定名（§50）。与第二层共用同一个置信度门槛。
+STICKER_NOT_A_STICKER = 'not-a-sticker'
+
+
+def sticker_disabled_by(value: Any) -> str:
+    """归一新列 `disabledBy`：只认 `''` / `'model'` / `'manual'`，其余一律 `''`。
+
+    `'model'` = 模型读描述时判定它不是表情包而停用；`'manual'` = 人对启用状态表过态
+    （停用**或**启用都算）—— 见 `interlude_sticker` 的列注释与 §50。
+    """
+    text = _str(value).strip().lower()
+    return text if text in ('model', 'manual') else ''
+
+
+def sticker_not_sticker_verdict(value: Any) -> bool:
+    """描述回执 → "这行不是表情包，应当停用"？**拿不准一律 False（不动）**（§50）。
+
+    收的充要条件（都在这一处，别在服务层再判一遍）：
+
+    * 回执是对象，且 `is_sticker` **显式是布尔 `False`**（缺字段 / 字符串 / `None` 都不算）；
+    * `confidence` 是数字且 `>= GUESS_STICKER_MIN_CONFIDENCE`（与第二层同一把尺子）。
+
+    与 `sticker_guess_result()` 的分工：那个回答"**收不收**"（第二层），这个回答
+    "**要不要停用**"（描述之后）；两者共用同一个置信度常量，但方向相反、都不接受
+    "拿不准"。回执坏 / 超时 / 没配模型时调用方压根走不到这里，判据本身也回 `False`。
+    """
+    if not isinstance(value, dict):
+        return False
+    if value.get('is_sticker') is not False:
+        return False
+    confidence = value.get('confidence')
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return False
+    return float(confidence) >= GUESS_STICKER_MIN_CONFIDENCE
+
+#: JPEG 里带尺寸的段（`SOF0`…`SOF15`，跳过 `DHT`=0xC4 / `JPG`=0xC8 / `DAC`=0xCC）。
+_JPEG_SOF_MARKERS = frozenset(
+    {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF},
+)
+
+
+def guess_image_dimensions(data: Any) -> 'tuple[int, int] | None':
+    """按**图片头**解析 `(宽, 高)`；认不出来回 `None`（**不引入 Pillow**）。
+
+    只认自动收藏放行的四种格式的常见头：PNG `IHDR` / GIF 逻辑屏幕 / JPEG `SOF*` /
+    WebP `VP8X`、`VP8 `、`VP8L`。为什么不用 Pillow：它是**可选依赖**（`requirements.txt`
+    里 try-import 降级），把"能不能判定"绑在可选依赖上不值当——与 §45.1 里
+    "去重不做 dHash"是同一条理由。
+
+    解析不出来（截断 / 冷门变体 / 不是这四种）回 `None`，调用方按"拿不准"处理。
+    """
+    if not data or len(data) < 16:
+        return None
+    if bytes(data[:8]) == b'\x89PNG\r\n\x1a\n':
+        return _png_dimensions(data)
+    if bytes(data[:6]) in (b'GIF87a', b'GIF89a'):
+        width = int.from_bytes(data[6:8], 'little')
+        height = int.from_bytes(data[8:10], 'little')
+        return (width, height) if width and height else None
+    if bytes(data[:2]) == b'\xff\xd8':
+        return _jpeg_dimensions(data)
+    if bytes(data[:4]) == b'RIFF' and bytes(data[8:12]) == b'WEBP':
+        return _webp_dimensions(data)
+    return None
+
+
+def _png_dimensions(data: Any) -> 'tuple[int, int] | None':
+    """PNG：8 字节签名 + 4 字节块长 + `IHDR`，宽高各 4 字节**大端**（偏移 16 / 20）。"""
+    if len(data) < 24 or bytes(data[12:16]) != b'IHDR':
+        return None
+    width = int.from_bytes(data[16:20], 'big')
+    height = int.from_bytes(data[20:24], 'big')
+    return (width, height) if width and height else None
+
+
+def _png_has_alpha(data: Any) -> bool:
+    """PNG 带透明通道？（色彩类型 4=灰+alpha / 6=RGBA，或有 `tRNS` 块）。
+
+    `tRNS` 按规范必须在 `IDAT` 之前，所以扫到 `IDAT` / `IEND` 就可以停。
+    """
+    if len(data) < 26:
+        return False
+    if data[25] in (4, 6):
+        return True
+    index = 8
+    while index + 8 <= len(data):
+        length = int.from_bytes(data[index:index + 4], 'big')
+        name = bytes(data[index + 4:index + 8])
+        if name == b'tRNS':
+            return True
+        if name in (b'IDAT', b'IEND'):
+            break
+        index += 12 + length
+    return False
+
+
+def _jpeg_dimensions(data: Any) -> 'tuple[int, int] | None':
+    """JPEG：扫到 `SOF*` 段读高 / 宽（各 2 字节大端，偏移 +5 / +7）。"""
+    index = 2
+    size = len(data)
+    while index + 4 <= size:
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        # 0xFF 填充、0x00 转义、TEM(0x01) 与 RST0..RST7 / SOI 都没有长度字段。
+        if marker in (0xFF, 0x00, 0x01) or 0xD0 <= marker <= 0xD8:
+            index += 2
+            continue
+        if marker == 0xDA:  # SOS：之后是压缩数据，不会再有段头
+            return None
+        length = int.from_bytes(data[index + 2:index + 4], 'big')
+        if length < 2:
+            return None
+        if marker in _JPEG_SOF_MARKERS:
+            if index + 9 > size:
+                return None
+            height = int.from_bytes(data[index + 5:index + 7], 'big')
+            width = int.from_bytes(data[index + 7:index + 9], 'big')
+            return (width, height) if width and height else None
+        index += 2 + length
+    return None
+
+
+def _webp_dimensions(data: Any) -> 'tuple[int, int] | None':
+    """WebP：`VP8X`（扩展）/ `VP8 `（有损）/ `VP8L`（无损）三种头各读各的。
+
+    RIFF 头 12 字节，块负载从偏移 20 开始；三种块的尺寸字段位置与位宽都不同。
+    """
+    if len(data) < 20:
+        return None
+    chunk = bytes(data[12:16])
+    if chunk == b'VP8X':
+        # 负载 = flags(1) + reserved(3) + (宽-1)(3, 小端) + (高-1)(3, 小端)。
+        if len(data) < 30:
+            return None
+        width = int.from_bytes(data[24:27], 'little') + 1
+        height = int.from_bytes(data[27:30], 'little') + 1
+        return (width, height)
+    if chunk == b'VP8 ':
+        # 帧头：3 字节 frame tag + 3 字节起始码，然后各 16 位（有效 14 位）。
+        if len(data) < 30 or bytes(data[23:26]) != b'\x9d\x01\x2a':
+            return None
+        width = int.from_bytes(data[26:28], 'little') & 0x3FFF
+        height = int.from_bytes(data[28:30], 'little') & 0x3FFF
+        return (width, height) if width and height else None
+    if chunk == b'VP8L':
+        if len(data) < 25 or data[20] != 0x2F:  # 25 字节够读满 14+14 位；0x2F 是无损签名
+            return None
+        bits = int.from_bytes(data[21:25], 'little')
+        return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    return None
+
+
+#: 表情包的"名字"形状：平台给表情名时是**方括号包起来的**（`[中午好]`）。
+#: `[图片]` 是**普通图的占位**（NapCat `packet/message/element.ts:372` 对 `picSubType === 0`
+#: 写的就是它），所以它不算"名字" —— `sub_type=7 + summary=[图片]` 必须**不收**。
+STICKER_NAME_PLACEHOLDERS = frozenset({'[图片]'})
+STICKER_NAME_RE = re.compile(r'^\[[^\[\]]{1,32}\]$')
+
+#: 结构信号名（诊断用；也是"它为什么被当成表情包候选"的唯一解释）。
+STICKER_SIGNAL_NONE = ''
+STICKER_SIGNAL_NAME = 'name'
+STICKER_SIGNAL_GIF = 'gif'
+STICKER_SIGNAL_ALPHA = 'alpha'
+STICKER_SIGNAL_SHAPE = 'shape'
+
+
+def sticker_media_signal(name: Any = '', mime_type: Any = '', data: Any = None) -> str:
+    """这张图"像不像表情包"的**结构信号** → 命中的信号名（都不命中回空串）。
+
+    从便宜到贵，**字节是可选的** —— §49.1 的三档表正是靠这一点把"不用下载"与
+    "要下载"分开：
+
+    1. `name`：方括号包起来的平台命名（`[中午好]`）—— **入站就有，不用下载**；
+       `[图片]` 这种普通图占位不算（`STICKER_NAME_PLACEHOLDERS`）；
+    2. `mime_type` / `data`：GIF（聊天里几乎只有动图 / 表情用途）；
+    3. `data`：带 alpha 的 PNG（表情通常是透明底）；
+    4. `data`：近方形 + 两边都不大（表情包的典型尺寸）。
+
+    阈值与判据都是**启发式**（`GUESS_STICKER_*`），不是平台规则。这个函数是
+    "像不像表情包"的**唯一实现**，两处共用（§49.1）：
+
+    * 第一层·候选档：`astrbot_bridge._image_media_kind()` 先用**只有名字**的那一半
+      （入站、零下载）判一次；剩下的（GIF / alpha / 尺寸）在 `chunk2` 拿到字节后判；
+    * 第二层：`sticker_guess_candidate()` 是它在"值不值得花一次识图调用"上的薄包装。
+    """
+    text = _str(name).strip()
+    if text and text not in STICKER_NAME_PLACEHOLDERS and STICKER_NAME_RE.match(text):
+        return STICKER_SIGNAL_NAME
+    mime = _str(mime_type).strip().lower()
+    if mime == 'image/gif':
+        return STICKER_SIGNAL_GIF
+    if mime == 'image/png' and _png_has_alpha(data or b''):
+        return STICKER_SIGNAL_ALPHA
+    dimensions = guess_image_dimensions(data)
+    if dimensions is None:
+        return STICKER_SIGNAL_NONE
+    width, height = dimensions
+    if not width or not height:
+        return STICKER_SIGNAL_NONE
+    if max(width, height) > GUESS_STICKER_MAX_DIMENSION:
+        return STICKER_SIGNAL_NONE
+    longest, shortest = max(width, height), min(width, height)
+    return STICKER_SIGNAL_SHAPE if longest <= shortest * GUESS_STICKER_MAX_ASPECT else STICKER_SIGNAL_NONE
+
+
+def sticker_guess_candidate(data: Any, mime_type: Any = '') -> bool:
+    """**便宜的预筛**：这张图值不值得花一次识图调用？
+
+    只排除"明显不像表情包"的：GIF（聊天里几乎只有动图 / 表情用途）、带 alpha 的
+    PNG（表情通常是透明底），或者"近方形 + 两边都小"（表情包的典型尺寸）。
+    大图、长宽比明显像照片 / 截图的，以及**解析不出宽高**的，一律回 False——
+    "拿不准就不收"在这里等价于"拿不准就不花钱问"。
+
+    这些阈值都是**启发式**（见上面的常量），不是平台规则；真正的判定权在
+    `sticker_guess_result()` 与用户开关手里。
+
+    ⚠️ 实现**委托** `sticker_media_signal()`（§49.1 收口）：候选档与这一层用的是
+    同一把尺子，改阈值只改一处；这里的入参没有"名字"，所以名字信号天然不参与。
+    """
+    return bool(sticker_media_signal(mime_type=mime_type, data=data))
+
+
+def sticker_guess_result(value: Any) -> 'dict[str, Any] | None':
+    """模型回执 → 判定结果；**"收"的充要条件只有这一处**（第二层）。
+
+    收：`is_sticker == true` **且** `confidence >= GUESS_STICKER_MIN_CONFIDENCE`。
+    其余全部回 `None`（= 不收）：不是对象 / 缺 `is_sticker` / 不是布尔 / 缺 `confidence` /
+    置信度不是数 / 置信度不够。阈值是启发式常量。
+
+    `is_sticker` 这个键名**逐字保持**（提示词就是这么要求的，模型照这个键回）；
+    从外部读入按本仓库的规矩双读 `isSticker`，万一中转站改写了键名也认。
+    `kind` 只做白名单归一（不认识 → `other`），它**不参与**收不收的判断。
+    """
+    if not isinstance(value, dict):
+        return None
+    flag = value.get('is_sticker', value.get('isSticker'))
+    if flag is not True:
+        return None
+    confidence = value.get('confidence')
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return None
+    if float(confidence) < GUESS_STICKER_MIN_CONFIDENCE:
+        return None
+    kind = _str(value.get('kind')).strip().lower()
+    description = value.get('description')
+    return {
+        'is_sticker': True,
+        'kind': kind if kind in STICKER_GUESS_KINDS else 'other',
+        'confidence': float(confidence),
+        'description': description.strip()[:180] if isinstance(description, str) else '',
+    }
 
 
 # =========================================================================== #
@@ -885,8 +1844,7 @@ def describe_quoted_message(session: Any, character_name: str = '主角') -> dic
 
 def normalize_quoted_message_content(value: Any) -> str:
     """上游 `normalizeQuotedMessageContent`：引用消息的有界纯文本化。"""
-    raw = normalize_qq_native_face_segments(value)
-    content = re.sub(r'<(?:img|image)\b[^>]*/?>(?:</(?:img|image)>)?', '[图片]', raw, flags=re.IGNORECASE)
+    content = normalize_media_segments(value)
     content = re.sub(r'<(?:audio|record)\b[^>]*/?>(?:</(?:audio|record)>)?', '[语音]', content, flags=re.IGNORECASE)
     content = re.sub(r'<video\b[^>]*/?>(?:</video>)?', '[视频]', content, flags=re.IGNORECASE)
     content = re.sub(r'<(?:face|mface)\b[^>]*/?>(?:</(?:face|mface)>)?', '[表情]', content, flags=re.IGNORECASE)
@@ -1372,7 +2330,12 @@ def _has_structured_group_reply_field(value: Any) -> bool:
 
 
 def _has_structured_interaction(value: Any) -> bool:
-    if not is_record(value) or not isinstance(value.get('seen'), bool) or not is_record(value.get('reply')):
+    # `seen` 与 `normalize_interaction` 保持一致地宽容：这是恢复检查（读的是**归一化
+    # 之前**的 decision），漏 seen 的 DeepSeek V4.1 回复如果在这里被否掉，就会白烧一次
+    # 重写。见 `PORTING_NOTES.md` 的 rc28 条目。
+    if not is_record(value) or not is_record(value.get('reply')):
+        return False
+    if value.get('seen') is not None and not isinstance(value.get('seen'), bool):
         return False
     reply = value['reply']
     mode = reply.get('mode')
@@ -1392,6 +2355,71 @@ def _has_structured_interaction(value: Any) -> bool:
     if mode == 'immediate':
         return True
     return isinstance(reply.get('sendAt'), str) and bool(reply['sendAt'].strip())
+
+
+#: 上游 `detectMessageRepetition`：最多看 8 批、触发要求 bubbles>=2 且连续 >=2 批。
+_REPETITION_MAX_BATCHES = 8
+
+
+def _safe_bubble_count(value: Any) -> Optional[int]:
+    """上游 `safeCount`：非负安全整数才算数（bool 不算）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
+def detect_message_repetition(entries: Any) -> Optional[dict[str, int]]:
+    """上游 1.0.1-rc18 `detectMessageRepetition(entries)`：条数锚定检测。
+
+    倒序把 `character-message` 归批：**批次首领的投递元数据是权威**
+    （`bubbleIndex == 0` 且 `bubbleCount` 合法），其余 `character-message` 累计成
+    回退批次；任何其它 kind 的条目都会截断当前批次。尾部连续 >=2 批同为 x 条（x>=2）
+    时返回 `{'bubbles': x, 'consecutive': n}`，否则 `None`（单条习惯 x=1 永不触发）。
+
+    我方把气泡元数据**平铺**在 `script_entry.metadata` 里（见 `delivery.py` 的
+    `message_event_reference`），而上游是 `metadata.scriptEvent.bubbleIndex/bubbleCount`；
+    这里两种形状都读（优先上游嵌套形态）。
+    """
+    if not isinstance(entries, list):
+        return None
+    batches: list[int] = []
+    pending = 0
+    for entry in reversed(entries):
+        if len(batches) >= _REPETITION_MAX_BATCHES:
+            break
+        if not isinstance(entry, dict) or entry.get('kind') != 'character-message':
+            if pending:
+                batches.append(pending)
+                pending = 0
+            continue
+        metadata = entry.get('metadata')
+        metadata = metadata if isinstance(metadata, dict) else {}
+        nested = metadata.get('scriptEvent', metadata.get('script_event'))
+        nested = nested if isinstance(nested, dict) else {}
+        bubble_count = _safe_bubble_count(
+            nested.get('bubbleCount', nested.get('bubble_count')) if nested
+            else metadata.get('bubbleCount', metadata.get('bubble_count'))
+        )
+        bubble_index = _safe_bubble_count(
+            nested.get('bubbleIndex', nested.get('bubble_index')) if nested
+            else metadata.get('bubbleIndex', metadata.get('bubble_index'))
+        )
+        if bubble_count is not None and bubble_index == 0:
+            batches.append(bubble_count)
+            pending = 0
+            continue
+        pending += 1
+    if pending and len(batches) < _REPETITION_MAX_BATCHES:
+        batches.append(pending)
+    if not batches:
+        return None
+    bubbles = batches[0]
+    if not isinstance(bubbles, int) or isinstance(bubbles, bool) or bubbles < 2:
+        return None
+    consecutive = 1
+    while consecutive < len(batches) and batches[consecutive] == bubbles:
+        consecutive += 1
+    return {'bubbles': bubbles, 'consecutive': consecutive} if consecutive >= 2 else None
 
 
 def safe_json_preview(value: Any) -> str:
@@ -1659,12 +2687,25 @@ def normalize_interaction(value: Any, now: datetime, runtime: dict[str, Any]) ->
     输出键名 camelCase（`seen` / `reply` / `mode` / `content` / `sendAt`）：wire format；
     读取侧同时接受 snake_case（`send_at`）。
     """
-    if not is_record(value) or not isinstance(value.get('seen'), bool) or not is_record(value.get('reply')):
+    if not is_record(value) or not is_record(value.get('reply')):
         return None
     reply = value['reply']
     mode = reply.get('mode')
+    if not isinstance(mode, str):
+        mode = None
+    raw_content = reply.get('content')
+    # 上游 1.0.1-rc15：`mode` 的宽容归一。弱模型（Gemini Flash 等）常把 mode 写成
+    # text/send/reply/message；只要带了 content 就按 immediate 处理，整条丢掉等于
+    # 白扔一条有效回复。缺失 mode 且没有 content 才算 none；其它任何词、或者
+    # 缺 mode 却带 content 之外的情形，才丢整条。
     if mode not in ('none', 'immediate', 'delayed'):
-        return None
+        has_content = isinstance(raw_content, str) and bool(raw_content.strip())
+        if has_content and mode in (None, 'text', 'send', 'reply', 'message'):
+            mode = 'immediate'
+        elif mode is None and not has_content:
+            mode = 'none'
+        else:
+            return None
     content = (
         _normalize_visible_message_content(
             reply.get('content'),
@@ -1674,7 +2715,12 @@ def normalize_interaction(value: Any, now: datetime, runtime: dict[str, Any]) ->
         if isinstance(reply.get('content'), str) else None
     )
     send_at = to_date(reply.get('sendAt', reply.get('send_at')))
-    seen = value.get('seen') is True
+    # 上游 1.0.1-rc28（DeepSeek V4.1 修复）：`seen` 非布尔时**不再丢弃整条**。
+    # V4.1 偶发漏 seen，旧写法会把一条有效的 immediate 回复打成 none，并正好落进
+    # 「结构化可见回复缺失 → 重写一次」的环里（用户实测重写无效、只会烧调用）。
+    # reply 本身有效时按已读处理；seen 只是"是否读了这条消息"的信息性字段。
+    raw_seen = value.get('seen')
+    seen = raw_seen if isinstance(raw_seen, bool) else True
     if mode == 'none':
         return {'seen': seen, 'reply': {'mode': 'none'}}
     if not content:
@@ -1999,8 +3045,16 @@ def fact_score(fact: dict[str, Any], config: dict[str, Any], query_embedding: li
                query: str = '') -> float:
     """上游 `factScore`：事实相关度打分（重要性 / 置信 / 新近 / 语义 / 词法 / 未结）。"""
     embedding = query_embedding or []
-    last_seen = to_date(fact.get('lastSeenAt'))
-    age_days = max(0.0, (dt_ms(utc_now()) - dt_ms(last_seen)) / (24 * 60 * 60 * 1000)) if last_seen else 0.0
+    # 上游 1.0.1-rc4：`lastSeenAt` 可能为空（rc2/rc3 写入的补充事实、更老的自由写入行），
+    # 回退到 updatedAt → createdAt → now——检索排序不能因为一个空时间戳崩掉，也不能
+    # 把一条旧事实当成"刚刚见过"（那会让它白拿满分近因）。
+    last_seen = (
+        to_date(fact.get('lastSeenAt') or fact.get('last_seen_at'))
+        or to_date(fact.get('updatedAt') or fact.get('updated_at'))
+        or to_date(fact.get('createdAt') or fact.get('created_at'))
+        or utc_now()
+    )
+    age_days = max(0.0, (dt_ms(utc_now()) - dt_ms(last_seen)) / (24 * 60 * 60 * 1000))
     recency = math.exp(-age_days / 30)
     similarity = cosine_similarity(embedding, fact.get('embedding') or [])
     # 负相似度视为无语义支撑：避免一条无关事实仅因为余弦值数学上落在
@@ -2016,6 +3070,434 @@ def fact_score(fact: dict[str, Any], config: dict[str, Any], query_embedding: li
         + lexical * max(1.0, semantic_weight)
         + (1.0 if fact.get('scope') == 'promise' and fact.get('unresolved') else 0.0)
         * _number(config_get(config, 'unresolved_weight', 'unresolvedWeight'))
+    )
+
+
+#: 遗忘评分的权重与参考值（`docs/MEMORY_MAINTENANCE.md`）。
+#: 评分越高越值得留：近因 / 频次 / 置信 / 重要度四项加权。
+FORGETTING_WEIGHTS: dict[str, float] = {
+    'recency': 0.35,
+    'frequency': 0.25,
+    'confidence': 0.20,
+    'importance': 0.20,
+}
+
+#: 频次项到达 0.5 分所需的召回次数。
+FORGETTING_FREQUENCY_REFERENCE = 6.0
+
+
+def fact_forgetting_score(fact: dict[str, Any], now: datetime, half_life_days: float = 30.0) -> float:
+    """事实的遗忘评分（受控偏离，`docs/MEMORY_MAINTENANCE.md` §4）。
+
+    与参考实现的差别：我们只有事实一层，没有图谱"孤立度"项，所以取
+    近因 / 频次 / 置信 / 重要度四项。近因优先看**最后一次被召回**的时间
+    （`lastAccessAt`），没有召回记录时退回写入时的 `lastSeenAt` / `createdAt`。
+
+    返回 [0, 1]，越低越接近被淘汰。
+    """
+    weights = FORGETTING_WEIGHTS
+    life = max(1.0, float(half_life_days or 30.0))
+    stamp = to_date(fact.get('lastAccessAt')) or to_date(fact.get('lastSeenAt')) or to_date(fact.get('createdAt'))
+    if stamp is None:
+        recency = 0.5
+    else:
+        age_days = max(0.0, (dt_ms(now) - dt_ms(stamp)) / (24 * 60 * 60 * 1000))
+        recency = math.exp(-age_days / life)
+    count = max(0.0, _number(fact.get('accessCount')))
+    frequency = count / (count + FORGETTING_FREQUENCY_REFERENCE) if count > 0 else 0.0
+    confidence = max(0.0, min(1.0, _number(fact.get('confidence'))))
+    importance = max(0.0, min(1.0, _number(fact.get('importance'))))
+    return (
+        recency * weights['recency']
+        + frequency * weights['frequency']
+        + confidence * weights['confidence']
+        + importance * weights['importance']
+    )
+
+
+#: 我们自己发出去的消息用 `msg-<条目id>` 当平台消息 id（见 `chunk2.group_message_ref`）。
+_SYNTHETIC_MESSAGE_REF = re.compile(r'^msg-(\d+)$')
+
+
+def backfilled_quote_content(quote: Any, entries: list[Any]) -> str:
+    """用**我们自己的记录**补出被回复消息的正文（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）。
+
+    平台给不给被引内容不一致：多数 QQ 客户端会给 `message_str`，但只给一个 id 的情况也常见
+    （尤其转发、跨端回复、部分平台适配器）。给不出正文时，模型看到的就是一条"她引用了某条
+    看不见的消息"——那比不引用更糟。
+
+    回填按两种 id 找：
+
+    1. `msg-<条目id>`（我们自己的投递账本用的合成 id）→ 直接取那条剧本条目；
+    2. 平台消息 id → 在条目 `metadata.messageId` 里找（群里收到的消息会带这个键）。
+
+    找不到就返回空串：**不编内容**，宁可保持"引用了但看不到"。
+    平台已经给了正文时也返回空串——只补空，绝不覆盖平台给的事实。
+    """
+    if not isinstance(quote, dict):
+        return ''
+    if _str(quote.get('content')).strip():
+        return ''
+    for key in ('messageId', 'message_id', 'messageRef', 'message_ref', 'id'):
+        raw = _str(quote.get(key)).strip()
+        if not raw:
+            continue
+        synthetic = _SYNTHETIC_MESSAGE_REF.match(raw)
+        if synthetic:
+            wanted = int(synthetic.group(1))
+            match = next(
+                (entry for entry in (entries or [])
+                 if isinstance(entry, dict) and entry.get('id') == wanted),
+                None,
+            )
+            content = _str((match or {}).get('content')).strip()
+            if content:
+                return content
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            metadata = entry.get('metadata') if isinstance(entry.get('metadata'), dict) else {}
+            platform_id = _str(metadata.get('messageId') or metadata.get('message_id') or '').strip()
+            if platform_id and platform_id == raw:
+                content = _str(entry.get('content')).strip()
+                if content:
+                    return content
+    return ''
+
+
+#: 图片感知哈希的去重容差：汉明距离 ≤ 该值视为同一张图。
+#: 4/64 位能容忍重新编码与轻微压缩，又不会把两张相似的图混为一谈。
+IMAGE_HASH_TOLERANCE = 4
+
+
+def image_perceptual_hash(data: Any) -> str:
+    """图片的 64 位感知哈希（aHash，十六进制字符串；算不出给空串）。
+
+    只在 `PIL` 可用时工作——`PIL` 是本插件的**可选**依赖，缺了就当没有这个能力
+    （不抛异常、不阻断投递，与降采样同一条降级路径）。用 aHash 而不是更精细的
+    pHash：识图去重只需要"这张图是不是刚发过"，aHash 够用且零依赖（PIL 自带）。
+    """
+    if not data:
+        return ''
+    try:
+        import io as _io
+
+        from PIL import Image  # type: ignore[import-not-found]
+    except Exception:  # noqa: BLE001 - 没装 Pillow 就是没有这个能力
+        return ''
+    try:
+        with Image.open(_io.BytesIO(data)) as image:
+            small = image.convert('L').resize((8, 8))
+            pixels = list(small.getdata())
+    except Exception:  # noqa: BLE001 - 坏图/不支持格式都只是"算不出哈希"
+        return ''
+    if len(pixels) != 64:
+        return ''
+    # 纯色图没有可比较的结构：aHash 会给出全 0 / 全 1，两张不同的纯色图就"相等"了。
+    # 这种图不参与去重（返回空串 = 算不出可用的哈希），宁可不省那一次识图。
+    if max(pixels) - min(pixels) < 8:
+        return ''
+    average = sum(pixels) / len(pixels)
+    bits = ''.join('1' if value >= average else '0' for value in pixels)
+    return '%016x' % int(bits, 2)
+
+
+def hamming_distance(left: str, right: str) -> int:
+    """两个十六进制哈希的汉明距离；形状不对时给一个"必然不等"的大值。"""
+    left_text, right_text = _str(left).strip(), _str(right).strip()
+    if not left_text or len(left_text) != len(right_text):
+        return 64
+    try:
+        return bin(int(left_text, 16) ^ int(right_text, 16)).count('1')
+    except ValueError:
+        return 64
+
+
+def split_described_images(
+    images: list[Any], known: list[str], tolerance: int = IMAGE_HASH_TOLERANCE,
+) -> tuple[list[Any], list[str]]:
+    """按"已经识过的图"分流：返回 `(要识的图, 被跳过的哈希列表)`。
+
+    重复贴同一张图（表情包、截图）在真机上很常见，而识图按图计费。
+    """
+    fresh: list[Any] = []
+    skipped: list[str] = []
+    for image in images or []:
+        digest = _str(_value_of(image, 'perceptualHash')).strip()
+        if digest and find_seen_image([digest], known, tolerance) >= 0:
+            skipped.append(digest)
+            continue
+        fresh.append(image)
+    return fresh, skipped
+
+
+def remember_described_hashes(
+    known: list[str], images: list[Any], limit: int = 32,
+) -> list[str]:
+    """把这一批识过的图片哈希并进"最近识过"的列表（先进先出，上限默认 32）。"""
+    merged = list(known or [])
+    for image in images or []:
+        digest = _str(_value_of(image, 'perceptualHash')).strip()
+        if digest and digest not in merged:
+            merged.append(digest)
+    return merged[-max(1, limit):]
+
+
+def _value_of(value: Any, key: str) -> Any:
+    """从 dict 或对象上读一个键（引文/图片既可能是 dict 也可能是领域对象）。"""
+    if isinstance(value, dict):
+        return value.get(key)
+    return getattr(value, key, None)
+
+
+def find_seen_image(hashes: list[str], known: list[str], tolerance: int = IMAGE_HASH_TOLERANCE) -> int:
+    """在 `known` 里找与 `hashes` 任一项近似的那张图，返回它的下标，找不到给 -1。
+
+    `hashes` 是这一批待判断的图片（按顺序），`known` 是已经见过的哈希。
+    返回的是 `known` 的下标，方便调用方报告"和第几张重复"。
+    """
+    for index, candidate in enumerate(known or []):
+        for value in hashes or []:
+            if hamming_distance(value, candidate) <= max(0, tolerance):
+                return index
+    return -1
+
+
+#: 上下文构成的统计范围：wire 键 → 说明它在"这一轮模型看到什么"里算什么。
+#: 只统计这几个键，因为它们才是**装配侧**真正按预算裁剪出来的量。
+CONTEXT_METRIC_SECTIONS: tuple[tuple[str, str], ...] = (
+    ('recentEntries', 'items'),
+    ('recalledHistory', 'items'),
+    ('memories', 'items'),
+    ('facts', 'items'),
+    ('overlaySnapshots', 'items'),
+    ('followUpCommitments', 'items'),
+    ('dueIntents', 'items'),
+    ('upcomingIntents', 'items'),
+    ('activeConsequences', 'items'),
+    ('workingDetails', 'items'),
+    ('participants', 'items'),
+    ('webContext', 'items'),
+    ('quotedMessages', 'items'),
+    ('automaticDeliverySummaries', 'items'),
+)
+
+
+def estimate_tokens(text: str) -> int:
+    """粗估 token 数：CJK 一字 ≈ 一 token，其余按 4 字符 ≈ 1 token。
+
+    只用来回答"这一轮大概喂了多少"，**不是账单**——真实用量在模型中心的用量账里。
+    不要拿它做预算判断，口径不同。
+    """
+    value = _str(text)
+    if not value:
+        return 0
+    cjk = len(re.findall(r'[\u3400-\u9fff\u3040-\u30ff\uff00-\uffef]', value))
+    rest = len(value) - cjk
+    return int(cjk + (rest + 3) // 4)
+
+
+def context_metrics(
+    request: dict[str, Any], elapsed_ms: float = 0.0, phase: str = '',
+    participant_id: str = '', now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """算出"这一轮上下文由什么组成"（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.4）。
+
+    纯函数：只读请求体，不碰数据库。写进 `story.state.extensions.last_context_metrics`，
+    控制台总览读它，用来回答"她为什么突然变笨 / 这一轮怎么这么贵"。
+    """
+    sections: dict[str, Any] = {}
+    total_items = 0
+    total_characters = 0
+    for key, _kind in CONTEXT_METRIC_SECTIONS:
+        value = request.get(key)
+        if value in (None, '', [], {}):
+            continue
+        if isinstance(value, list):
+            items = len(value)
+        elif isinstance(value, dict):
+            items = len(value)
+        else:
+            items = 1
+        characters = len(json.dumps(value, ensure_ascii=False, default=str))
+        sections[key] = {'items': items, 'characters': characters}
+        total_items += items
+        total_characters += characters
+    scene = request.get('sceneContext') if isinstance(request.get('sceneContext'), dict) else {}
+    scene_characters = len(json.dumps(scene, ensure_ascii=False, default=str)) if scene else 0
+    other_characters = len(json.dumps(request, ensure_ascii=False, default=str))
+    return {
+        'at': iso(now or utc_now()),
+        'phase': _str(phase),
+        'participant_id': _str(participant_id),
+        'assembly_ms': int(max(0.0, elapsed_ms)),
+        'sections': sections,
+        'items': total_items,
+        'characters': total_characters + scene_characters,
+        'payload_characters': other_characters,
+        'estimated_tokens': estimate_tokens(json.dumps(request, ensure_ascii=False, default=str)),
+    }
+
+
+#: 召回查询里"问法"的固定句式：这些词对"她记不记得"没有信息量，
+#: 但会稀释双字组重合率（`history_lexical_score` 是按查询键数取平均的）。
+RECALL_QUERY_PREFIXES = (
+    '你还记得', '你还记不记得', '你还记得吗', '你记不记得', '你记得',
+    '还记得', '记不记得', '你是否记得', '你知道', '你还知道',
+    '我之前跟你说的', '我之前说过的', '我上次跟你说的', '我上次说过的',
+    '上次说的那个', '上次那个', '之前说的那个', '之前那个',
+    '我问你', '我想问', '我问一下',
+)
+
+#: 问句里的语气与疑问成分（去掉之后剩下的才是要检索的词）。
+RECALL_QUERY_NOISE = (
+    # 单字语气词：不含「么」——它是「怎么 / 什么 / 这么」的一部分，
+    # 先剥单字会把它们打断（`怎么` → `怎`），所以那类词交给下面的停用词表。
+    '吗', '呢', '吧', '啊', '呀', '嘛', '哦', '噢', '哈',
+    '请问', '告诉我', '说一下', '讲讲', '是什么', '是什么来着', '来着',
+)
+
+#: 代词与虚词：双字组检索里它们几乎只制造噪声。
+RECALL_QUERY_STOPWORDS = (
+    '我们', '你们', '他们', '她们', '它们', '这个', '那个', '这些', '那些',
+    '什么', '怎么', '为什么', '是不是', '有没有',
+)
+
+
+def rewrite_recall_query(query: str) -> str:
+    """把"问法"压成检索用关键词（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.2）。
+
+    纯本地规则，不花模型调用：只剥掉固定句式、语气词与代词，**不做同义改写**——
+    改写错一个词就会把该想起来的事挤掉，代价比收益大。
+    结果太短（< 2 个字）或没有变化时返回原查询，让调用方按原样检索。
+    """
+    text = _str(query).strip()
+    if not text:
+        return ''
+    rewritten = text
+    for prefix in RECALL_QUERY_PREFIXES:
+        if rewritten.startswith(prefix):
+            rewritten = rewritten[len(prefix):]
+    for stopword in RECALL_QUERY_STOPWORDS:
+        rewritten = rewritten.replace(stopword, '')
+    for noise in RECALL_QUERY_NOISE:
+        rewritten = rewritten.replace(noise, '')
+    rewritten = re.sub(r'[\s\u3000，。！？、；：""' + "'" + r'（）《》【】,.!?;:()\[\]{}<>"\-—…~]+', '', rewritten)
+    if len(rewritten) < 2:
+        return text
+    return rewritten
+
+
+#: 排名融合的默认常数（`docs/MEMORY_MAINTENANCE.md` §5.2）。
+DEFAULT_RRF_K = 60
+
+
+def _rrf_weight(rank: Optional[int], k: float, raw: float = 1.0) -> float:
+    """单路的"排名 × 原始相关度"：第 1 名给满，之后按 1/(k+rank) 衰减。
+
+    为什么不能照抄纯 RRF：纯 RRF 的贡献是 `1/(k+rank)`，**与原始分无关**。
+    候选池只有两三百条时，最后一名的 `1/(62)` 只比第一名的 `1/(61)` 小 1.6%——
+    于是一条**毫无字面与语义重合**的事实照样能拿到接近满额的排名分，
+    重要度高的旧事实会把真正相关的那条顶掉（实测：0 重合那条反而排前面）。
+
+    所以这里把排名当**相关系数**用：原始分为 0 的路不贡献，
+    有重合的才按名次衰减。两路都把它排前面的事实因此被顶到前面（这才是融合的意义），
+    而量纲与上游给这一路的原始权重一致（`raw × [0,1]`），不引入新的调参维度。
+    """
+    if rank is None or raw <= 0:
+        return 0.0
+    top = 1.0 / (k + 1.0)
+    return raw * ((1.0 / (k + rank)) / top) if top else 0.0
+
+
+def _ranks(values: list[float]) -> list[Optional[int]]:
+    """按分数降序给出每一名（并列同分给同一个名次，与常见 RRF 实现一致）。"""
+    order = sorted(range(len(values)), key=lambda index: -values[index])
+    ranks: list[Optional[int]] = [None] * len(values)
+    previous: Optional[float] = None
+    current_rank = 0
+    for position, index in enumerate(order, start=1):
+        if previous is None or values[index] < previous:
+            current_rank = position
+            previous = values[index]
+        ranks[index] = current_rank
+    return ranks
+
+
+def fact_lane_scores(
+    facts: list[dict[str, Any]], config: dict[str, Any],
+    query_embedding: Optional[list[float]] = None, query: str = '',
+    rewrite: bool = True, rrf_k: float = DEFAULT_RRF_K,
+) -> list[dict[str, Any]]:
+    """算两条召回通道的原始分与排名（纯函数，便于断言与调参）。
+
+    返回与 `facts` 等长的列表，每项是 `{'id', 'lexical', 'semantic', 'lexicalRank',
+    'semanticRank', 'rewritten', 'lexicalScore'}`。
+    """
+    rewritten = rewrite_recall_query(query) if rewrite else _str(query)
+    query_embedding = query_embedding or []
+    lane: list[dict[str, Any]] = []
+    for fact in facts or []:
+        content = _str(fact.get('content')) if isinstance(fact, dict) else ''
+        lexical = history_lexical_score(query, content)
+        lexical_score = lexical
+        if rewritten and rewritten != _str(query):
+            # 改写后的查询与原查询取**较高**的一条：改写只允许帮忙，不允许帮倒忙。
+            lexical_score = max(lexical, history_lexical_score(rewritten, content))
+        similarity = cosine_similarity(query_embedding, fact.get('embedding') or []) \
+            if isinstance(fact, dict) else None
+        lane.append({
+            'id': fact.get('id') if isinstance(fact, dict) else None,
+            'lexical': lexical,
+            'lexicalScore': lexical_score,
+            'semantic': 0.0 if similarity is None else max(0.0, similarity),
+            'rewritten': rewritten,
+        })
+    lexical_ranks = _ranks([item['lexicalScore'] for item in lane])
+    semantic_ranks = _ranks([item['semantic'] for item in lane])
+    has_semantic = any(item['semantic'] > 0 for item in lane)
+    has_lexical = any(item['lexicalScore'] > 0 for item in lane)
+    for index, item in enumerate(lane):
+        item['lexicalRank'] = lexical_ranks[index] if has_lexical else None
+        item['semanticRank'] = semantic_ranks[index] if has_semantic else None
+        item['lexicalRrf'] = _rrf_weight(item['lexicalRank'], rrf_k, item['lexicalScore'])
+        item['semanticRrf'] = _rrf_weight(item['semanticRank'], rrf_k, item['semantic'])
+    return lane
+
+
+def fact_structural_score(fact: dict[str, Any], config: dict[str, Any]) -> float:
+    """事实的"结构性"分数：重要度 / 置信 / 新近 / 未结承诺。
+
+    与上游 `factScore` 的区别只有一条：这里**不含**词法与语义两项，
+    那两项在融合模式下改由排名贡献（见 `fact_hybrid_score`）。
+    """
+    last_seen = to_date(fact.get('lastSeenAt'))
+    age_days = max(0.0, (dt_ms(utc_now()) - dt_ms(last_seen)) / (24 * 60 * 60 * 1000)) if last_seen else 0.0
+    recency = math.exp(-age_days / 30)
+    return (
+        _number(fact.get('importance')) * _number(config_get(config, 'fact_importance_weight', 'factImportanceWeight'))
+        + _number(fact.get('confidence')) * _number(config_get(config, 'fact_confidence_weight', 'factConfidenceWeight'))
+        + recency * _number(config_get(config, 'fact_recency_weight', 'factRecencyWeight'))
+        + (1.0 if fact.get('scope') == 'promise' and fact.get('unresolved') else 0.0)
+        * _number(config_get(config, 'unresolved_weight', 'unresolvedWeight'))
+    )
+
+
+def fact_hybrid_score(
+    fact: dict[str, Any], config: dict[str, Any], lane: dict[str, Any],
+) -> float:
+    """融合后的相关度：结构分 + 两路的倒数排名（RRF）。
+
+    权重沿用上游给这两路的量级（词法 `max(1.0, semantic_weight)`、语义 `semantic_weight`），
+    所以"只有一路可用"时排序与上游接近；两路都命中同一条事实时它会被顶到前面——
+    这正是排名融合想要的效果（两路都同意 ⇒ 比单路第一名更可信）。
+    """
+    semantic_weight = _number(config_get(config, 'semantic_weight', 'semanticWeight'))
+    relevance = max(1.0, semantic_weight)
+    return (
+        fact_structural_score(fact, config)
+        + _number(lane.get('lexicalRrf')) * relevance
+        + _number(lane.get('semanticRrf')) * semantic_weight
     )
 
 

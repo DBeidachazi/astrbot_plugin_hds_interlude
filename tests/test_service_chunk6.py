@@ -49,6 +49,7 @@ from plugin.core.script.delivery_ledger import (
 from plugin.core.service import InterludeContext, NullTransport
 from plugin.core.service.base import ServiceBase, ServiceChunk0
 from plugin.core.service.chunk5 import ServiceChunk5
+from plugin.core.service.chunk12 import ServiceChunk12
 from plugin.core.service.chunk6 import ServiceChunk6, defer_retry_milliseconds
 from plugin.core.service.chunk7 import ServiceChunk7
 from plugin.core.service.chunk9 import ServiceChunk9
@@ -174,17 +175,28 @@ class _RecordingTransport(NullTransport):
 
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
+        self.status: list[tuple[dict[str, Any], bool]] = []
+        #: 亮灭与投递的**交错**顺序（"点亮→等待→发出→熄灭"按这个断言）。
+        self.events: list[tuple[str, str]] = []
         self.ok = True
         self.error = 'adapter exploded'
 
-    async def send_private(self, participant: Any, content: str, reply_to: Any = None) -> dict[str, Any]:
+    async def send_private(self, participant: Any, content: str, reply_to: Any = None,
+                           **kwargs: Any) -> dict[str, Any]:
         self.sent.append({'kind': 'private', 'participant': participant, 'content': content,
-                          'reply_to': reply_to})
+                          'reply_to': reply_to, **kwargs})
+        self.events.append(('send', content))
         return {'ok': self.ok, 'error': None if self.ok else self.error}
 
-    async def send_session(self, session: Any, content: str) -> dict[str, Any]:
-        self.sent.append({'kind': 'session', 'session': session, 'content': content})
+    async def send_session(self, session: Any, content: str, **kwargs: Any) -> dict[str, Any]:
+        self.sent.append({'kind': 'session', 'session': session, 'content': content, **kwargs})
+        self.events.append(('send', content))
         return {'ok': self.ok, 'error': None if self.ok else self.error}
+
+    async def set_input_status(self, target: Any, typing: bool) -> dict[str, Any]:
+        self.status.append((dict(target), typing))
+        self.events.append(('typing-on' if typing else 'typing-off', ''))
+        return {'ok': True, 'error': '', 'data': None}
 
 
 # =========================================================================== #
@@ -245,7 +257,7 @@ class _ConfirmOutgoingStub(ServiceChunk6):
             return
         raise AssertionError('本用例不应写入其它表：%s' % table)
 
-    def report_standalone(self, *args: Any) -> None:
+    def report_standalone(self, *args: Any, **_kwargs: Any) -> None:
         self.warnings.append(args)
 
     async def record_character_message(self, *_args: Any, **_kwargs: Any) -> None:
@@ -320,6 +332,39 @@ class DeliveryLedgerChunk6Tests(unittest.TestCase):
             else:
                 # 读失败时根本走不到写：M6.1 是观察性的，不影响确认与后续排期。
                 self.assertEqual(stub.ledger_patches, [], failure)
+
+    def test_marked_later_segments_schedule_voice_intents_in_order(self) -> None:
+        """`<sep/>` + `<tts/>`：每个分段各排一条意图，带标记的那几条写 `voice`。
+
+        分段是**延迟投递**的：语音意图必须随 payload 一起排期，否则等它到期时
+        已经无从知道那一段本来要用语音发（顺序仍然按分段顺序）。
+        """
+        commit = _commit_fixture()
+        event = find_outgoing_script_event(commit, 'alice')
+        stub = _ConfirmOutgoingStub('none', commit)
+        message = prepare_outgoing_delivery(
+            attach_message_event({'participant_id': 'alice', 'content': event['content']}, event, 42),
+            [{'content': '第一句', 'voice': False},
+             {'content': '第二句', 'voice': False},
+             {'content': '第三句', 'voice': True}],
+        )
+        asyncio.run(ServiceChunk6.confirm_outgoing_deliveries(stub, {'id': 'story:1'}, [message]))
+        self.assertEqual([item['payload']['content'] for item in stub.intents],
+                         ['第二句', '第三句'])
+        self.assertNotIn('voice', stub.intents[0]['payload'], '没写标记的分段不许凭空多一个键')
+        self.assertIs(stub.intents[1]['payload']['voice'], True)
+
+    def test_unmarked_segments_never_write_a_voice_key(self) -> None:
+        commit = _commit_fixture()
+        event = find_outgoing_script_event(commit, 'alice')
+        stub = _ConfirmOutgoingStub('none', commit)
+        message = prepare_outgoing_delivery(
+            attach_message_event({'participant_id': 'alice', 'content': event['content']}, event, 42),
+            [{'content': '第一句', 'voice': False}, {'content': '第二句', 'voice': False}],
+        )
+        asyncio.run(ServiceChunk6.confirm_outgoing_deliveries(stub, {'id': 'story:1'}, [message]))
+        self.assertEqual(len(stub.intents), 1)
+        self.assertNotIn('voice', stub.intents[0]['payload'])
 
 
 # =========================================================================== #
@@ -971,6 +1016,14 @@ class _SendStub(ServiceChunk6, ServiceChunk0):
         self.reports.append((level, message % args if args else message))
 
 
+class _TypingSendStub(_SendStub, ServiceChunk12):
+    """`_SendStub` + **真实的**输入状态引擎（chunk12）。"""
+
+    def report_standalone(self, level: str, message: str, *args: Any, **_kwargs: Any) -> None:
+        # 极简桩不建日志管道：输入状态的失败日志收在这里就够（断言它只留 debug）。
+        self.reports.append((level, message % args if args else message))
+
+
 class SendOutgoingMessagesTests(unittest.IsolatedAsyncioTestCase):
     """上游 `sendOutgoingMessages`（`:5107`）：出站路由 + 失败记账 + 打断闸门。"""
 
@@ -998,12 +1051,103 @@ class SendOutgoingMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(transport.sent[0]['reply_to'])
         self.assertEqual(stub.failures, [])
 
+    async def test_a_marked_segment_reaches_the_transport_as_voice(self) -> None:
+        """正文 `<tts/>` 的意图最终就是 `voice=True` 这个出站参数（投递层照办）。"""
+        transport = _RecordingTransport()
+        stub = _SendStub([dict(self.PARTICIPANT)])
+        stub.transport = transport
+        delivered = await ServiceChunk6.send_outgoing_messages(
+            stub, self.STORY, [self._message('晚安', voice=True)],
+        )
+        self.assertEqual(delivered, [self._message('晚安', voice=True)])
+        self.assertIs(transport.sent[0]['voice'], True)
+
+    async def test_unmarked_messages_keep_the_historical_call_shape(self) -> None:
+        """没有语音意图时**不许**多传这个关键字：老实现 / 极简测试桩的签名里没有它。"""
+        transport = _RecordingTransport()
+        stub = _SendStub([dict(self.PARTICIPANT)])
+        stub.transport = transport
+        await ServiceChunk6.send_outgoing_messages(stub, self.STORY, [self._message('你好')])
+        self.assertNotIn('voice', transport.sent[0])
+
     async def test_empty_message_list_short_circuits(self) -> None:
         transport = _RecordingTransport()
         stub = _SendStub([dict(self.PARTICIPANT)])
         stub.transport = transport
         self.assertEqual(await ServiceChunk6.send_outgoing_messages(stub, self.STORY, []), [])
         self.assertEqual(transport.sent, [])
+
+    def _typing_stub(self, transport: _RecordingTransport) -> _SendStub:
+        # 输入状态引擎在 chunk12；这里把真实实现接进来（不另写一套桩，免得测了个假的）。
+        stub = _TypingSendStub([dict(self.PARTICIPANT)])
+        stub.transport = transport
+        stub.config = _make_config(runtime={'input_status': {
+            'enabled': True, 'min_visible_ms': 0, 'beat_chance': 0,
+        }})
+        stub.typing_delay_milliseconds = lambda _content: 1  # type: ignore[assignment]
+        return stub
+
+    async def test_each_bubble_lights_waits_sends_and_darkens_on_its_own(self) -> None:
+        """**新用例（用户点名）**：两条气泡 = 两次亮灭，且顺序必须是
+        「点亮 → 发出 → 熄灭 → 点亮 → 发出 → 熄灭」——不许合并、不许跨气泡。"""
+        transport = _RecordingTransport()
+        stub = self._typing_stub(transport)
+        messages = [self._message('第一条'), self._message('第二条')]
+        delivered = await ServiceChunk6.send_outgoing_messages(
+            stub, self.STORY, messages, dict(self.PARTICIPANT), None,
+            request_started_at=NOW, typing_window=True,
+        )
+        self.assertEqual(len(delivered), 2, '投递不受输入状态影响')
+        self.assertEqual([typing for _t, typing in transport.status], [True, False, True, False])
+        self.assertEqual([content for kind, content in transport.events if kind == 'send'],
+                         ['第一条', '第二条'])
+        self.assertEqual(transport.events, [
+            ('typing-on', ''), ('send', '第一条'), ('typing-off', ''),
+            ('typing-on', ''), ('send', '第二条'), ('typing-off', ''),
+        ])
+
+    async def test_group_conversations_get_no_typing_calls_at_all(self) -> None:
+        """**新用例（用户点名）**：群聊不点亮、不熄灭、不调用——但**投递照旧**。"""
+        transport = _RecordingTransport()
+        stub = self._typing_stub(transport)
+        participant = dict(self.PARTICIPANT, groupId='7788', channelId='7788')
+        messages = [self._message('群里的第一条'), self._message('群里的第二条')]
+        delivered = await ServiceChunk6.send_outgoing_messages(
+            stub, self.STORY, messages, participant, None,
+            request_started_at=NOW, typing_window=True,
+        )
+        self.assertEqual(len(delivered), 2)
+        self.assertEqual(transport.status, [], '群聊一个输入状态调用都不许发')
+
+    async def test_typing_window_off_keeps_the_floor_sleep_and_no_status_calls(self) -> None:
+        """没开逐条窗口的调用方（定时消息 / 分段投递 / 命令投递）：行为与历史一致
+        ——不调用输入状态，下限等待照旧。"""
+        transport = _RecordingTransport()
+        stub = self._typing_stub(transport)
+        delivered = await ServiceChunk6.send_outgoing_messages(
+            stub, self.STORY, [self._message('你好')], dict(self.PARTICIPANT), None,
+            request_started_at=NOW,
+        )
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(transport.status, [])
+
+    async def test_a_failing_typing_indicator_never_changes_what_is_delivered(self) -> None:
+        """输入状态失败**绝不**影响投递：内容、数量、顺序一个字都不变。"""
+
+        class _BrokenTyping(_RecordingTransport):
+            async def set_input_status(self, target: Any, typing: bool) -> dict[str, Any]:
+                raise RuntimeError('输入状态炸了')
+
+        transport = _BrokenTyping()
+        stub = self._typing_stub(transport)
+        messages = [self._message('第一'), self._message('第二')]
+        delivered = await ServiceChunk6.send_outgoing_messages(
+            stub, self.STORY, messages, dict(self.PARTICIPANT), None,
+            request_started_at=NOW, typing_window=True,
+        )
+        self.assertEqual([item['content'] for item in delivered], ['第一', '第二'])
+        self.assertEqual(transport.sent[0]['content'], '第一')
+        self.assertEqual(transport.sent[1]['content'], '第二')
 
     async def test_transport_failure_is_recorded_and_not_delivered(self) -> None:
         transport = _RecordingTransport()
@@ -1372,7 +1516,9 @@ class CancelPendingOutgoingMessagesTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self) -> None:
                 self.config = _make_config()
 
-            async def send_outgoing_messages(self, story: Any, messages: Any, *args: Any) -> list[Any]:
+            async def send_outgoing_messages(
+                self, story: Any, messages: Any, *args: Any, **_kwargs: Any,
+            ) -> list[Any]:
                 calls.append(('send', messages))
                 return messages
 

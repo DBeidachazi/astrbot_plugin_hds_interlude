@@ -282,9 +282,13 @@ class ServiceChunk9(ServiceBase):
             output = '[%s] %s\n事件：%s%s' % (phase_label(phase), protagonist, rendered, story_detail)
         self.emit_log(level, output)
 
-    def report_standalone(self, level: str, message: str, *args: Any) -> None:
-        """上游 `reportStandalone(level, message, ...args)`（`:6757`）。"""
-        self.write_standalone(level, message, args)
+    def report_standalone(self, level: str, message: str, *args: Any, category: str = '') -> None:
+        """上游 `reportStandalone(level, message, ...args)`（`:6757`）。
+
+        `category` 是本移植版的可选扩展：知道**真实会话类型**的调用方用它直接给日志
+        标签，免得被正文里的"群聊"两个字带偏（见 `chunk12._set_input_status`）。
+        """
+        self.write_standalone(level, message, args, category=category)
 
     def report_token_usage(self, record: Any) -> None:
         """上游 `reportTokenUsage(record)`（`:6763`）。
@@ -294,12 +298,42 @@ class ServiceChunk9(ServiceBase):
         """
         if self.desktop_event_sink is not None:
             self.desktop_event_sink('token', record)
+        # Token 账本（本移植版新增）：控制台「Token 统计」页要跨重启查历史，
+        # 所以在同一个收口点落库。**不 await**：这是旁路记账，绝不让它拖慢或
+        # 阻断模型调用链（写入侧自己串行 + 失败只 warn）。
+        recorder = getattr(self, 'record_token_usage', None)
+        if callable(recorder):
+            try:
+                asyncio.ensure_future(recorder(record, pick(record, 'storyId', 'story_id') or ''))
+            except RuntimeError:  # pragma: no cover - 没有事件循环时直接放弃记账
+                pass
+        # 健康指标（rc28）：输入/缓存 token 在同一个收口点累计，缓存命中率由此得出。
+        health = getattr(self, 'health', None)
+        story_id = pick(record, 'storyId', 'story_id')
+        if health is not None and story_id:
+            health.record_tokens(
+                story_id, pick(record, 'inputTokens', 'input_tokens') or 0,
+                pick(record, 'cachedTokens', 'cached_tokens') or 0,
+            )
         line = _format_token_usage_line(record)
         if not line:
             return
         self.report_standalone(
             'info', 'Token 用量[%s] 模型=%s %s', pick(record, 'task'), pick(record, 'model'), line,
         )
+
+    def health_snapshot(self, story_id: str = '') -> dict[str, Any]:
+        """上游 `HealthMonitor.snapshot(storyId)` / `all()`：控制台面板的数据源。
+
+        `story_id` 为空时返回全部故事的快照表；给了就只返回那一个。没有任何样本时
+        返回零值快照（面板显示 0 而不是 500 —— 与 §29 的控制台取数约定一致）。
+        """
+        monitor = getattr(self, 'health', None)
+        if monitor is None:
+            return {} if not story_id else {}
+        if story_id:
+            return monitor.snapshot(story_id)
+        return monitor.all()
 
     def report_standalone_operation(
         self,
@@ -313,8 +347,13 @@ class ServiceChunk9(ServiceBase):
             return
         self.write_standalone(level, message, args)
 
-    def write_standalone(self, level: str, message: str, args: Any = None) -> None:
-        """上游 `writeStandalone(level, message, args)`（`:6775`）逐条移植。"""
+    def write_standalone(
+        self, level: str, message: str, args: Any = None, category: str = '',
+    ) -> None:
+        """上游 `writeStandalone(level, message, args)`（`:6775`）逐条移植。
+
+        `category` 见 `report_standalone`（可选，不传就按文案推断标签）。
+        """
         if self.blind_mode_config.get('enabled'):
             if level in ('error', 'warn'):
                 self.blind_mode_health_issue = True
@@ -332,6 +371,7 @@ class ServiceChunk9(ServiceBase):
                 'colors': logging_config.get('colors') is not False,
                 'color_theme': logging_config.get('colorTheme') or 'dark',
                 'kaomoji': logging_config.get('kaomoji') is not False,
+                **({'category': category} if category else {}),
             })
         else:
             output = '[系统] %s' % render_log_message(message, args)

@@ -12,8 +12,9 @@ HDS Interlude 是一个给 **AstrBot** 用的持续叙事聊天插件（上游 K
 | 版本 | `v1.3.7` |
 | AstrBot | `>=4.16,<5` |
 | 依赖 | `httpx`、`pyyaml` |
-| 上游 | [HDS Interlude（Koishi）](https://gitee.com/MomoiCore/hds-interlude) |
+| 上游 | [HDS Interlude（Koishi）](https://gitee.com/MomoiCore/hds-interlude)；公开稳定线 [YesWeAreBot/HDSI-AthenaBrain](https://github.com/YesWeAreBot/HDSI-AthenaBrain)（见「上游仓库与同步说明」） |
 | 发布 | [KelaLeaf/astrbot_plugin_hds_interlude](https://github.com/KelaLeaf/astrbot_plugin_hds_interlude) |
+| 本仓库 | [DBeidachazi/astrbot_plugin_hds_interlude](https://github.com/DBeidachazi/astrbot_plugin_hds_interlude)（KelaLeaf 移植版的 fork，带本地扩展） |
 | 许可 | AGPL-3.0 |
 
 ## 它和普通角色扮演插件有什么不同
@@ -251,6 +252,26 @@ AstrBot 的命令名不能带点，所以上游的 `interlude.memory.facts` 在�
 几个已知的、刻意的行为差异：网页观察落库前不传 `id`（自增主键不会被 `0` 占住）；范围查询退化成"取足够行 + Python 侧过滤"，遇到不支持的算子**显式抛错**而不是静默返回偏窄结果；`interlude_schedule_preplan` 换主键是 no-op（只能删旧行插新行）；群规则 `enabled` 缺省视为启用。
 
 > 上游 README 里提到的 npm 安装、Koishi Console、Puppeteer、`interlude.*` 命令名都不适用于本移植版；上面这张表就是换算关系。
+
+## 上游仓库与同步说明
+
+| 仓库 | 角色 | 说明 |
+| --- | --- | --- |
+| [MomoiCore/hds-interlude](https://gitee.com/MomoiCore/hds-interlude)（Gitee） | Koishi 原版 | 本移植版对应其 `1.0.1-beta6-rebuild` |
+| [YesWeAreBot/HDSI-AthenaBrain](https://github.com/YesWeAreBot/HDSI-AthenaBrain)（GitHub） | Koishi 原版的公开稳定线 | `koishi-plugin-hds-interlude` `0.1.3`，最后更新 2026-08-27 |
+| [KelaLeaf/astrbot_plugin_hds_interlude](https://github.com/KelaLeaf/astrbot_plugin_hds_interlude) | AstrBot 移植版发布仓库 | 本仓库 `main` 的来源（`87ca083`，v1.3.7） |
+| [DBeidachazi/astrbot_plugin_hds_interlude](https://github.com/DBeidachazi/astrbot_plugin_hds_interlude) | 本仓库 | KelaLeaf 移植版 + 下面列出的本地扩展 |
+
+**HDSI-AthenaBrain 与本移植版的关系（2026-10-02 核对）。** AthenaBrain 是 `0.1.3` 稳定线（`blindMode` 失明模式、每提供商官方预设与 `zhipu-official`、群聊算法 willingness、Agency Window、Perspective、绑定式承诺回访、SnowLuma 语音转写、`groupReply` 兼容与缺失回复重写等）。这些功能**本移植版全部已有**；反过来，本移植版跟随的 `1.0.1-beta6-rebuild` 线还有 AthenaBrain 没有的 script-first `<say>` 传输、Timeline Director、Schedule Preplan、Urge、Scene Frame / Dialogue Burst、Development Tendencies、表情包目录等。AthenaBrain 的提交记录全部是「Add files via upload」，没有 release / tag，变更内容以其 `docs/CHANGELOG.md` 为准。结论：**目前没有需要从 AthenaBrain 合并的新功能**；以后同步时先比对其 `docs/CHANGELOG.md` 的新版本段落。
+
+**本仓库的本地扩展（相对 KelaLeaf `main`）。**
+
+- 本地补丁 0001–0004：gemini-flash 结构遵从性加固、`<say>` / `groupReply` 引用修复。
+- 现实日历（`core/real_calendar.py`）：中国法定节假日与调休、高中校历、年级与高考倒计时，驱动 Schedule Preplan 与 `interval.realCalendar`。
+- 漏写 `<say>` 的裸气泡兜底；群聊 `interaction.reply=none` 时的投递修复。
+- 生活活力（`core/vitality.py` / `core/life_hooks.py` / `core/story_arcs.py`）：作息降级为默认安排、聊天转计划、防停滞提示、睡眠合并推进、生活钩子、长线剧情、夜间群消息免打扰。
+- 修复主叙事请求 camelCase / snake_case 键名不一致：此前 Alter、Agency、群聊 `groupReply` 传输说明、重写纠错等提示词段落从未注入。
+- 测试：`tests_local/`（本地扩展）；上游 `tests/` 通过 `tests/conftest.py` 关闭本地扩展后运行。已知：开启现实日历时，`main_payload_order=cache-first` 的可缓存前缀比例会下降（`interval.realCalendar` 位于不可缓存尾部），默认的 `legacy` 顺序不受影响。
 
 ## 常见问题
 

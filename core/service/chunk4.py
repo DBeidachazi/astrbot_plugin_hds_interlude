@@ -1554,6 +1554,25 @@ class ServiceChunk4(ServiceBase):
             await self.narrator.decide(request), False, separator,
         ))
 
+    async def _expression_guard(self, story: Any, phase: str, decision: Any) -> None:
+        """本地扩展：颜文字频控硬兜底（只删句尾 / 独立颜文字，并同步剧本原文）。
+
+        可选能力，任何异常（包括宿主没有 recent_entries）都只跳过，绝不让主叙事回合失败。
+        """
+        reader = getattr(self, 'recent_entries', None)
+        if not callable(reader) or not isinstance(decision, dict):
+            return
+        try:
+            messages = expression.her_messages(await reader(story['id'], 40))
+            lines = expression.guard_decision(
+                decision, messages, decode_story_state(story.get('state')),
+                str(_cfg(self.runtime_config, 'messageSeparator', '<sep/>')),
+            )
+        except Exception:  # noqa: BLE001
+            return
+        for line in lines:
+            self.report_operation('standard', 'info', story, phase, '%s', line)
+
     async def _merged_world_rows(self, story: Any) -> list[dict[str, Any]]:
         """合并模式下交给生活钩子的世界事件行（播种器没开或未合并时为空）。"""
         if not vitality.seeder_merge_enabled():
@@ -2056,14 +2075,7 @@ class ServiceChunk4(ServiceBase):
             if main_available and not has_required_narrative_script(decision):
                 raise ValueError('Narrative provider returned no usable script.')
             if not early_reply_committed:
-                # 本地扩展：颜文字频控硬兜底（只删句尾 / 独立颜文字，并同步剧本原文）。
-                for line in expression.guard_decision(
-                    decision,
-                    expression.her_messages(await self.recent_entries(story['id'], 40)),
-                    decode_story_state(story.get('state')),
-                    str(_cfg(self.runtime_config, 'messageSeparator', '<sep/>')),
-                ):
-                    self.report_operation('standard', 'info', story, phase, '%s', line)
+                await self._expression_guard(story, phase, decision)
             result = {
                 'decision': decision,
                 'succeeded': True,

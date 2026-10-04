@@ -1354,6 +1354,11 @@ class SessionViewTests(unittest.TestCase):
         content, elements, quote = serialize_message_chain(event.get_messages())
         self.assertIn('看图', content)
         self.assertIn('<at id="10001"/>', content)
+
+    def test_at_keeps_display_name(self):
+        # 本地修复：显示名写进 at 标签，下游才能渲染成「@名字」而不是猜 QQ 号。
+        content, elements, _quote = serialize_message_chain([At(qq='458593826', name='好小狗')])
+        self.assertIn('<at id="458593826" name="好小狗"/>', content)
         self.assertIn('<img src="https://example.com/a.png"/>', content)
         self.assertIn('<face id="14"/>', content)
         self.assertIn('<audio file="voice.silk" url="https://example.com/v.silk"/>', content)

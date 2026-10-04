@@ -52,6 +52,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # （只剪开头那串问号，正文不动），并同步剧本原文，打断上下文里的自我模仿。
         'hard_guard': True,
     },
+    'closer': {
+        # 结尾口癖（2026-10-04：最近 20 条里 16 条以「哈哈哈」收尾，「啦哈哈哈」6 次）——
+        # 压住开头问号之后，同一股惯性挪到了句尾。规则与 opener 对称：
+        # 上一条已经笑着收尾，或窗口内笑着收尾达到上限时，发出前剪掉句尾那串笑声，并同步剧本。
+        'enabled': True,
+        'window': 10,
+        'max_in_window': 3,
+        'hard_guard': True,
+    },
+    # 她的消息里出现裸 QQ 号（如「@269502169」）时去掉：不认识对方名字时模型会照抄账号。
+    'raw_mention_guard': True,
     'exclamation': {
         # 感叹号只做软反馈（不硬删：删感叹号会改变句子语气），默认关。
         'enabled': False,
@@ -269,6 +280,84 @@ def opener_hint(messages: list[str], cfg: Optional[dict[str, Any]] = None) -> Op
     return 'vary' if count >= int(cfg.get('max_in_window', 4) or 0) else None
 
 
+# ---------------------------------------------------------------------------- 结尾口癖
+
+# 句尾笑声：哈哈 / 哈哈哈… / hhh / 233 / 笑死（我了），可连写、可夹标点（「哈哈哈哈，笑死」）。
+_LAUGH_UNIT = r'(?:哈{2,}|[hH]{3,}|2333*|笑死(?:我了)?|嘿嘿+|嘻嘻+)'
+_TRAILING_LAUGH = re.compile(r'[\s，,、~～]*(?:' + _LAUGH_UNIT + r'[\s，,。.~～!！…]*)+$')
+_ENDING = re.compile(r'(?:好不好|是不是|对不对|是吧|对吧|好吧|行吧)?[啦呀嘛呢吧了啊哇]?(?:' + _LAUGH_UNIT + r')?$')
+
+
+def _closer_base(text: str) -> str:
+    """判断结尾时看的那一段：最后一个气泡，去掉句尾颜文字与收尾标点。"""
+    last = str(text or '').split('<sep/>')[-1]
+    return strip_trailing_kaomoji(last).rstrip(' \t！!？?~～。.…')
+
+
+def ends_with_laugh(text: str) -> bool:
+    base = _closer_base(text)
+    return bool(base) and bool(_TRAILING_LAUGH.search(base))
+
+
+def strip_trailing_laugh(bubble: str) -> str:
+    """剪掉气泡句尾那串笑声（「我哪知道啦哈哈哈」→「我哪知道啦」）；句尾颜文字保留在原位。"""
+    text = str(bubble or '').strip()
+    base = strip_trailing_kaomoji(text)
+    tail = text[len(base):] if base and text.startswith(base) else ''
+    match = _TRAILING_LAUGH.search(base)
+    if not match:
+        return text
+    stripped = base[:match.start()].rstrip(' \t，,、')
+    if stripped:  # 笑声后面的「！」「？」「~」留给前面的句子：「这个哈哈哈！」→「这个！」
+        stripped += ''.join(re.findall(r'[!！?？~～]', match.group(0)))[-1:]
+    return (stripped + tail).strip() if stripped else ''
+
+
+def ending_key(text: str) -> str:
+    """把结尾归一成可比较的「口癖」：啦哈哈哈哈 → 啦哈哈哈，好不好啦 → 好不好啦；太短的不算。"""
+    base = _closer_base(text)
+    match = _ENDING.search(base)
+    key = match.group(0) if match else ''
+    key = re.sub(r'哈{2,}', '哈哈哈', key)
+    key = re.sub(r'[hH]{3,}', 'hhh', key)
+    key = re.sub(r'2333+', '233', key)
+    return key if len(key) >= 2 else ''
+
+
+def closer_hint(messages: list[str], cfg: Optional[dict[str, Any]] = None) -> tuple[Optional[str], list[str]]:
+    """结尾软反馈：('vary' | None, 最近重复的结尾)。"""
+    cfg = (cfg or load_config()).get('closer') or {}
+    if not cfg.get('enabled', True):
+        return None, []
+    recent = messages[-max(1, int(cfg.get('window', 10) or 10)):]
+    laughs = sum(1 for text in recent if ends_with_laugh(text))
+    counts: dict[str, int] = {}
+    for text in recent:
+        key = ending_key(text)
+        if key:
+            counts[key] = counts.get(key, 0) + 1
+    repeated = [key for key, n in sorted(counts.items(), key=lambda item: -item[1]) if n >= 2][:3]
+    vary = laughs >= int(cfg.get('max_in_window', 3) or 0) or bool(recent and ends_with_laugh(recent[-1]))
+    return ('vary' if vary else None), repeated
+
+
+def _closer_should_strip(history: list[str], ccfg: dict[str, Any]) -> tuple[bool, str, int]:
+    recent = history[-max(1, int(ccfg.get('window', 10) or 10)):]
+    count = sum(1 for text in recent if ends_with_laugh(text))
+    if history and ends_with_laugh(history[-1]):
+        return True, 'consecutive', count
+    if count >= int(ccfg.get('max_in_window', 3) or 0):
+        return True, 'over-cap', count
+    return False, '', count
+
+
+_RAW_MENTION = re.compile(r'@\s?\d{5,12}(?!\d)\s*')
+
+
+def strip_raw_mentions(bubble: str) -> str:
+    return _RAW_MENTION.sub('', str(bubble or '')).strip()
+
+
 def prompt_budget(messages: list[str], story_state: Any = None,
                   cfg: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
     """发给模型的 `interval.expressionBudget`；功能关闭时 None。"""
@@ -288,6 +377,11 @@ def prompt_budget(messages: list[str], story_state: Any = None,
     opener = opener_hint(messages, cfg)
     if opener:
         result['opener'] = opener
+    closer, endings = closer_hint(messages, cfg)
+    if closer:
+        result['closer'] = closer
+    if endings:
+        result['avoidEndings'] = endings
     return result
 
 
@@ -398,9 +492,12 @@ def guard_decision(decision: Any, messages: list[str], story_state: Any = None,
         return []
     kcfg = cfg.get('kaomoji') or {}
     ocfg = cfg.get('opener') or {}
+    ccfg = cfg.get('closer') or {}
     kaomoji_on = bool(kcfg.get('hard_guard', True))
     opener_on = bool(ocfg.get('enabled', True) and ocfg.get('hard_guard', True))
-    if not (kaomoji_on or opener_on):
+    closer_on = bool(ccfg.get('enabled', True) and ccfg.get('hard_guard', True))
+    mention_on = bool(cfg.get('raw_mention_guard', True))
+    if not (kaomoji_on or opener_on or closer_on or mention_on):
         return []
     prefixes = tuple(str(p) for p in (ocfg.get('prefixes') or ['？', '?']) if str(p))
     groups: dict[str, list[tuple[dict[str, Any], str]]] = {}
@@ -428,13 +525,26 @@ def guard_decision(decision: Any, messages: list[str], story_state: Any = None,
             if strip_opener:
                 logs.append('表达频控：剪掉开头问号 原因=%s 窗口=%d/%d 原文=%s' % (
                     reason, count, int(ocfg.get('max_in_window', 4) or 0), original[:60]))
+        strip_closer = False
+        if closer_on and any(ends_with_laugh(bubble) for bubble in bubbles):
+            strip_closer, reason, count = _closer_should_strip(history, ccfg)
+            if strip_closer:
+                logs.append('表达频控：剪掉句尾笑声 原因=%s 窗口=%d/%d 原文=%s' % (
+                    reason, count, int(ccfg.get('max_in_window', 3) or 0), original[:60]))
+        strip_mention = mention_on and bool(_RAW_MENTION.search(original))
+        if strip_mention:
+            logs.append('表达频控：去掉裸 QQ 号 原文=%s' % original[:60])
         final = original
-        if strip_kaomoji or strip_opener:
+        if strip_kaomoji or strip_opener or strip_closer or strip_mention:
             transformed = []
             for bubble in bubbles:
                 new = strip_trailing_kaomoji(bubble) if strip_kaomoji else bubble.strip()
+                if strip_mention:
+                    new = strip_raw_mentions(new)
                 if strip_opener and starts_with_question(new, prefixes):
                     new = strip_leading_questions(new)
+                if strip_closer and ends_with_laugh(new):
+                    new = strip_trailing_laugh(new)
                 transformed.append((bubble.strip(), new))
             kept = [new for _old, new in transformed if new]
             if kept:  # 全部剪空（例如整条只有「？？？」）时保留原文，绝不发空消息

@@ -17,6 +17,9 @@ import re
 from typing import Any, Iterable, Optional
 
 _AT = re.compile(r'<at\b[^>]*?\bid\s*=\s*["\']?([^"\'\s/>]+)["\']?[^>]*?/?>(?:\s*</at>)?', re.IGNORECASE)
+_AT_NAME = re.compile(r'\bname\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE)
+_TAG = re.compile(r'<[^>]+>')
+_PLACEHOLDER = re.compile(r'^\s*(\[[^\]]{1,12}\]\s*)*$')   # [图片] [动画表情] [语音] …
 _SNIPPET = 40
 
 
@@ -42,6 +45,10 @@ def name_map(messages: Iterable[Any]) -> dict[str, str]:
         q_name = str(_get(quote, 'senderName', 'sender_name') or '').strip()
         if q_sender and q_name and q_name != q_sender:
             names.setdefault(q_sender, q_name)
+        for match in _AT.finditer(str(_get(message, 'content') or '')):
+            tag_name = _AT_NAME.search(match.group(0))
+            if tag_name and tag_name.group(1).strip():
+                names.setdefault(match.group(1).strip(), tag_name.group(1).strip())
     return names
 
 
@@ -56,7 +63,10 @@ def render_mentions(text: Any, names: dict[str, str], self_ids: Iterable[str], c
         elif target.lower() == 'all':
             label = '全体成员'
         else:
-            label = names.get(target) or '群友'
+            # 标签自带的显示名（适配层写入）优先；都不认识时用「其他群友」——
+            # 原来的「@群友」会让模型以为是在叫自己（2026-10-04「主播」误认）。
+            tag_name = _AT_NAME.search(match.group(0))
+            label = names.get(target) or (tag_name.group(1).strip() if tag_name else '') or '其他群友'
         return '@%s ' % label
 
     rendered = _AT.sub(repl, str(text or ''))
@@ -115,3 +125,81 @@ def batch_digest(batch: list[Any], self_ids: Iterable[str], character_name: str,
     lines.append('不同的人在说不同的事：分开回应（分气泡、开头带「@名字」，或引用对方那条），'
                  '不要揉成一句；别人明确提出的请求要正面回应，不能只挑个错字就算回过了。')
     return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------- 对象识别（2026-10-04）
+# 现场：群友 A 发「@好小狗 主播主播有空可以买个星战前线2玩玩」+「全是梗」，她以为「主播」在叫自己，
+# 接了一句「哪有主播啦」。原因：at 标签只有 id（显示名被适配层丢了）→ 渲染成「@群友」；
+# 提示词里也没有「这条在对别人说」的信息，always 模式下意愿 0.924 照常触发。
+
+def _targets(message: Any) -> list[str]:
+    return [match.group(1).strip() for match in _AT.finditer(str(_get(message, 'content') or ''))]
+
+
+def _is_placeholder(message: Any) -> bool:
+    """只有图片 / 表情 / 语音等占位、没有文字的消息：不参与对象判断。"""
+    text = _TAG.sub('', str(_get(message, 'content') or ''))
+    return bool(_PLACEHOLDER.match(text))
+
+
+def _calls_her(message: Any, self_ids: set[str], aliases: Iterable[str]) -> bool:
+    if any(target in self_ids for target in _targets(message)):
+        return True
+    if str(_get(_get(message, 'quote'), 'senderId', 'sender_id') or '') in self_ids:
+        return True
+    text = _TAG.sub('', str(_get(message, 'content') or ''))
+    return any(alias and alias in text for alias in aliases)
+
+
+def message_audiences(batch: list[Any], self_ids: Iterable[str], aliases: Iterable[str] = (),
+                      prior: Iterable[Any] = ()) -> list[Optional[str]]:
+    """逐条判断「这条在对谁说」：'her' / 'other:<id>' / None（对群里所有人，没有明确对象）。
+
+    同一个人紧接着发的、不带 @ 的补充（如「全是梗」）沿用他上一条的对象；
+    `prior`（批次之前的群上下文）用来延续跨批次的对象。占位消息（只有图片等）沿用不改写。
+    """
+    own = {str(item) for item in self_ids if str(item or '').strip()}
+    aliases = [str(item) for item in aliases if str(item or '').strip()]
+    last: dict[str, Optional[str]] = {}
+
+    def classify(message: Any) -> Optional[str]:
+        sender = str(_get(message, 'senderId', 'sender_id') or '').strip()
+        if _calls_her(message, own, aliases):
+            result: Optional[str] = 'her'
+        else:
+            others = [target for target in _targets(message) if target not in own and target.lower() != 'all']
+            quoted = str(_get(_get(message, 'quote'), 'senderId', 'sender_id') or '').strip()
+            if others:
+                result = 'other:' + others[0]
+            elif quoted and quoted != sender:
+                result = 'other:' + quoted
+            elif _targets(message) or _is_placeholder(message):
+                result = None if _targets(message) else last.get(sender)
+            else:
+                result = last.get(sender)
+        if sender:
+            last[sender] = result
+        return result
+
+    for message in prior or []:
+        if str(_get(message, 'senderId', 'sender_id') or '') not in own:
+            classify(message)
+    return [classify(message) for message in batch or []]
+
+
+def audience_note(audience: Optional[str], names: dict[str, str]) -> str:
+    """附在批次每条消息后面的一行说明；对象不明确时不加。"""
+    if audience == 'her':
+        return '（↑ 这条是在找你）'
+    if audience and audience.startswith('other:'):
+        target = audience[len('other:'):]
+        return '（↑ 这条是对 @%s 说的，不是对你；里面的称呼都指对方）' % (names.get(target) or '其他群友')
+    return ''
+
+
+def addressed_elsewhere_only(batch: list[Any], self_ids: Iterable[str], aliases: Iterable[str] = (),
+                             prior: Iterable[Any] = ()) -> bool:
+    """整批有文字的消息全都在对别人说（没有一条找她、也没有一条泛泛对全群）→ True。"""
+    audiences = message_audiences(batch, self_ids, aliases, prior)
+    texts = [audience for message, audience in zip(batch or [], audiences) if not _is_placeholder(message)]
+    return bool(texts) and all(audience and audience.startswith('other:') for audience in texts)

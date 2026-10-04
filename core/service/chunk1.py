@@ -302,6 +302,18 @@ def _message_characters(runtime: Any) -> int:
     return int(raw)
 
 
+def _addressing_aliases(story: Any, rule: Any) -> list[str]:
+    """群友怎么叫她：角色全名、去姓的名字（林小满 → 小满）、群意愿配置里的关键词。"""
+    name = str(pick(pick(pick(story, 'setting') or {}, 'character') or {}, 'name') or '').strip()
+    aliases = [name] if name else []
+    if 3 <= len(name) <= 4:
+        aliases.append(name[1:])
+    keywords = pick(pick(rule, 'willingness') or {}, 'keywords') or []
+    if isinstance(keywords, (list, tuple)):
+        aliases.extend(str(item).strip() for item in keywords if str(item or '').strip())
+    return list(dict.fromkeys(aliases))
+
+
 def _group_context_messages(messages: Any) -> list[dict[str, Any]]:
     """把 `groupMessages()` 的输出归一成上游 `GroupMessageContext` 的 wire 形状（camelCase）。
 
@@ -1547,6 +1559,20 @@ class ServiceChunk1(ServiceBase):
                 if not turn.get('messages') and not turn.get('timer'):
                     self.buffered_group_turns.pop(key, None)
                 return
+        # 本地扩展：整批都在对别的群友说（@ 了别人 / 引用别人，没有一条找她）→ 不插嘴。
+        # 2026-10-04 现场：「@好小狗 主播主播…」+「全是梗」在 always 模式意愿 0.924 下触发，
+        # 她把「主播」当成在叫自己。被 @ / 引用她、或提到她名字时照常进入主叙事。
+        audience_self_ids = {normalize_account_id(_session_read(turn.get('latest_session'), 'selfId', 'self_id'))}
+        audience_aliases = _addressing_aliases(story, rule)
+        if not addressed and group_digest.addressed_elsewhere_only(batch, audience_self_ids, audience_aliases):
+            self.report_operation(
+                'standard', 'info', story, 'user-message',
+                '群聊这一批都在对别的群友说，她不插嘴 群=%s 本批=%d', group_id, len(batch),
+            )
+            self.note_group_skip_reason(group_id, '这一批消息都 @ / 引用了别的群友，不是在找她')
+            if not turn.get('messages') and not turn.get('timer'):
+                self.buffered_group_turns.pop(key, None)
+            return
         self.report_operation(
             'standard', 'info', story, 'user-message',
             '群聊消息准备进入主叙事 群=%s 模式=%s 意愿=%s', group_id,
@@ -1591,11 +1617,15 @@ class ServiceChunk1(ServiceBase):
             for item in context_messages:
                 item['content'] = group_digest.render_mentions(item.get('content'), names, self_ids, character_name)
             digest = group_digest.batch_digest(batch, self_ids, character_name, names)
+            audiences = group_digest.message_audiences(
+                batch, self_ids, _addressing_aliases(snapshot['story'], rule), snapshot['contextMessages'],
+            )
             user_message = '\n\n'.join(
                 ([digest] if digest else [])
-                + ['[群聊连续消息 %d｜%s]\n%s' % (
+                + ['[群聊连续消息 %d｜%s]\n%s%s' % (
                     index + 1, pick(item, 'speaker'),
                     group_digest.render_mentions(pick(item, 'content'), names, self_ids, character_name),
+                    ('\n' + note) if (note := group_digest.audience_note(audiences[index], names)) else '',
                 ) for index, item in enumerate(batch)]
             )
             if self.semantic_turn_embedding_enabled():

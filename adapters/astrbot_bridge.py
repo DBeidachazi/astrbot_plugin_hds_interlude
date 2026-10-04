@@ -845,7 +845,10 @@ def serialize_component(
         name = _attr(component, 'name')
         if name:
             attrs['name'] = _text(name)
-        return '<at id="%s"/>' % _escape_attr(attrs['id']), {'type': 'at', 'attrs': attrs, 'children': []}, None
+        # 本地修复：把平台给的显示名也写进标签。之前读到了 name 却只写 id，下游只能把不认识的
+        # QQ 号渲染成「@群友」，模型因此把别人对第三方的呼叫当成在叫自己（2026-10-04 实测）。
+        tag = ' '.join('%s="%s"' % (key, _escape_attr(value)) for key, value in attrs.items() if value != '')
+        return '<at %s/>' % tag, {'type': 'at', 'attrs': attrs, 'children': []}, None
 
     if kind == 'face':
         face_id = _attr(component, 'id', 'face_id', 'faceIndex')

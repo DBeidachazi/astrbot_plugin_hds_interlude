@@ -302,6 +302,14 @@ def _message_characters(runtime: Any) -> int:
     return int(raw)
 
 
+def _respond_to_mentions(rule: Any) -> bool:
+    """群规则 `respond_to_mentions`（缺省 true）：false 时 @ / 引用 / 叫名字不再强制唤醒她。"""
+    value = pick(rule, 'respondToMentions', 'respond_to_mentions')
+    if isinstance(value, str):
+        return value.strip().lower() not in ('false', '0', 'no', 'off')
+    return value is not False
+
+
 def _addressing_aliases(story: Any, rule: Any) -> list[str]:
     """群友怎么叫她：角色全名、去姓的名字（林小满 → 小满）、群意愿配置里的关键词。"""
     name = str(pick(pick(pick(story, 'setting') or {}, 'character') or {}, 'name') or '').strip()
@@ -1479,23 +1487,30 @@ class ServiceChunk1(ServiceBase):
         group_id = turn.get('group_id')
         # 上游 1.0.1-rc23：走档位解析层（五档 / auto 按生活状态 / 旧数值门按 custom）。
         life_status = decode_story_state(pick(story, 'state')).get('life_status')
+        # 本地扩展：群级开关 respond_to_mentions=false（2026-10-04 用户要求给 992726871 加）——
+        # 在这个群里 @ / 引用 / 叫名字都不再强制唤醒、也不额外加意愿，只当一条普通消息累积；
+        # 她只在自己想说话（意愿自然攒到阈值）时开口。未配置时为 true，行为与之前一致。
+        respond_to_mentions = _respond_to_mentions(rule)
+        legacy_willingness = pick(rule, 'willingness')
+        if not respond_to_mentions and isinstance(legacy_willingness, dict):
+            legacy_willingness = {**legacy_willingness, 'keywords': []}
         willingness = evaluate_willingness_gate(
             self.group_willingness.get(key),
             pick(rule, 'willingnessPreset', 'willingness_preset'),
             pick(rule, 'willingnessAuto', 'willingness_auto'),
             life_status,
-            pick(rule, 'willingness'),
+            legacy_willingness,
             {
                 'now': self.now_ms(),
                 'message_count': len(batch),
                 'content': '\n'.join(str(pick(item, 'content') or '') for item in batch),
-                'mentioned_bot': bool(turn.get('mentioned_bot')),
-                'quoted_bot': bool(turn.get('quoted_bot')),
+                'mentioned_bot': respond_to_mentions and bool(turn.get('mentioned_bot')),
+                'quoted_bot': respond_to_mentions and bool(turn.get('quoted_bot')),
             },
             rng=self.rng,
         )
         self.group_willingness[key] = willingness['state']
-        addressed = bool(turn.get('mentioned_bot')) or bool(turn.get('quoted_bot'))
+        addressed = respond_to_mentions and (bool(turn.get('mentioned_bot')) or bool(turn.get('quoted_bot')))
         turn['mentioned_bot'] = False
         turn['quoted_bot'] = False
         if not willingness['should_call']:

@@ -555,6 +555,8 @@ class GroupChatRule(TypedDict, total=False):
     context_limit: int
     debounce_seconds: int
     cooldown_seconds: int
+    #: 本地扩展：false 时 @ / 引用 / 叫名字不再强制唤醒（缺省 true）。
+    respond_to_mentions: bool
     #: 上游 `Partial<GroupWillingnessConfig>`；本移植版 `GroupWillingnessConfig`
     #: 的键是 snake_case，读取方 `resolve_group_willingness()` 两种拼写都认。
     willingness: Any

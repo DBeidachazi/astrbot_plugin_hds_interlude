@@ -186,6 +186,73 @@ svc = run(SCENE, mentioned=True)
 check(svc.captured is not None, '被 @（mentioned_bot）时不跳过')
 print('T3 群回合 ✓')
 
+# ============================================================ T3b 群级开关 respond_to_mentions（992726871 不再响应 @）
+check(chunk1._respond_to_mentions({}) is True and chunk1._respond_to_mentions({'respond_to_mentions': True}) is True,
+      '缺省 / true：照常响应')
+check(chunk1._respond_to_mentions({'respond_to_mentions': False}) is False
+      and chunk1._respond_to_mentions({'respondToMentions': 'false'}) is False, 'false（两种拼写）')
+
+real_gate = importlib.import_module(f'{PKG}.core.group_willingness').evaluate_willingness_gate
+seen = []
+
+
+def spy_gate(previous, preset, auto_map, life_status, legacy, payload, rng=None):
+    seen.append((legacy, payload))
+    return real_gate(previous, preset, auto_map, life_status, legacy, {**payload, 'random': 0.99}, rng=rng)
+
+
+chunk1.evaluate_willingness_gate = spy_gate
+AT_HER = [{'senderId': '5005', 'senderName': '群友', 'speaker': '群成员「群友」', 'content': '<at id="%s"/>小满在吗' % BOT}]
+
+
+def run_rule(messages, rule_extra, mentioned=True):
+    svc = FakeService()
+    rule = {'responseMode': 'always', 'willingness': {'enabled': True, 'threshold': 0.2, 'base_gain': 0.16,
+                                                     'quote_gain': 0.12, 'keyword_gain': 1.0, 'keywords': ['小满', '林小满']}}
+    rule.update(rule_extra)
+    svc.rule_seen = rule
+    svc.buffered_group_turns['k'] = {
+        'revision': 1, 'story_id': 'st', 'group_id': 'g', 'rule': rule,
+        'messages': [dict(m) for m in messages], 'mentioned_bot': mentioned, 'quoted_bot': mentioned, 'timer': None,
+        'latest_session': Session(selfId=BOT, platform='onebot'), 'channel_id': 'g',
+    }
+    try:
+        asyncio.run(svc.flush_group_turn('k', 1))
+    except Stop:
+        pass
+    return svc
+
+
+seen.clear()
+svc = run_rule(AT_HER, {})                       # 885063277：原样
+check(svc.captured is not None and seen[-1][1]['mentioned_bot'] is True, '主群：@ 照常强制唤醒')
+seen.clear()
+svc = run_rule(AT_HER, {'respond_to_mentions': False})   # 992726871
+legacy, payload = seen[-1]
+check(svc.captured is None, '992726871：@ 她、意愿冷启动时不开口: %s' % svc.skips)
+check(payload['mentioned_bot'] is False and payload['quoted_bot'] is False and legacy['keywords'] == [],
+      '@ / 引用 / 叫名字都不再加权')
+check(any('意愿' in x for x in svc.skips), '跳过原因是意愿没到: %s' % svc.skips)
+check(svc.rule_seen['willingness']['keywords'] == ['小满', '林小满'], '不改动原配置')
+# 意愿自然攒满时照样会开口（「自己想说话的时候说话」）
+svc = FakeService()
+svc.group_willingness['k'] = {'score': 1.0, 'updated_at': svc.now_ms()}
+rule = {'responseMode': 'always', 'respond_to_mentions': False,
+        'willingness': {'enabled': True, 'threshold': 0.2, 'probability_amplifier': 1.3, 'keywords': ['小满']}}
+svc.buffered_group_turns['k'] = {
+    'revision': 1, 'story_id': 'st', 'group_id': 'g', 'rule': rule,
+    'messages': [{'senderId': '5005', 'speaker': '群友', 'content': '今天好热'}], 'mentioned_bot': False, 'quoted_bot': False,
+    'timer': None, 'latest_session': Session(selfId=BOT, platform='onebot'), 'channel_id': 'g',
+}
+chunk1.evaluate_willingness_gate = lambda prev, *a, **k: real_gate(prev, *a[:4], {**a[4], 'random': 0.0}, **k)
+try:
+    asyncio.run(svc.flush_group_turn('k', 1))
+except Stop:
+    pass
+check(svc.captured is not None, '意愿到了：照常开口')
+chunk1.evaluate_willingness_gate = real_gate
+print('T3b respond_to_mentions ✓')
+
 # ============================================================ T4 结尾识别与剪除
 
 

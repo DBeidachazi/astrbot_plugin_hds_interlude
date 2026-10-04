@@ -887,6 +887,12 @@
             ],
             "hint": "mention-only 仅被 @ 时触发；always 处理所有群消息"
           },
+          "respond_to_mentions": {
+            "type": "bool",
+            "description": "被 @ / 引用 / 叫名字时必回",
+            "default": true,
+            "hint": "关掉后，这个群里 @ 她只算一条普通消息，不强制唤醒、不额外加意愿；她只在自己想说话时开口（需要 response_mode=always 且开启意愿）"
+          },
           "context_limit": {
             "type": "int",
             "description": "附带最近群消息条数",

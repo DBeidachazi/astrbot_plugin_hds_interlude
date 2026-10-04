@@ -108,7 +108,7 @@ from ..story_state import (
 from ..time import dt_ms, format_log_time, iso, parse_dt, utc_now
 from ..turn_persistence import script_entry_draft_for_commit
 from ..urge import commit_urge, normalize_urge_state, urge_burst_active
-from .. import vitality
+from .. import expression, vitality
 from .base import ServiceBase, pick
 from .config import (
     TIMELINE_DIRECTOR_FUSE,
@@ -2055,6 +2055,15 @@ class ServiceChunk4(ServiceBase):
             # 后台回合则为下一次尝试保留时间。兜底刻意是无网络的冒烟模式。
             if main_available and not has_required_narrative_script(decision):
                 raise ValueError('Narrative provider returned no usable script.')
+            if not early_reply_committed:
+                # 本地扩展：颜文字频控硬兜底（只删句尾 / 独立颜文字，并同步剧本原文）。
+                for line in expression.guard_decision(
+                    decision,
+                    expression.her_messages(await self.recent_entries(story['id'], 40)),
+                    decode_story_state(story.get('state')),
+                    str(_cfg(self.runtime_config, 'messageSeparator', '<sep/>')),
+                ):
+                    self.report_operation('standard', 'info', story, phase, '%s', line)
             result = {
                 'decision': decision,
                 'succeeded': True,

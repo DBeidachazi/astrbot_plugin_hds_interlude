@@ -14,7 +14,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from . import life_hooks, life_seeds, story_arcs
+from . import expression, life_hooks, life_seeds, story_arcs
 
 #: 这些阶段会注入钩子（自主生活回合）；回复回合不被打断。
 HOOK_PHASES = ('advance', 'conversation-follow-up')
@@ -346,6 +346,9 @@ def request_context(story: Any, story_state: Any, phase: str, now: datetime,
         if hooks:
             result['lifeHooks'] = life_hooks.prompt_hooks(hooks)
         result.update(story_arcs.context(_vitality_state(story_state).get('arcs'), local_day))
+        budget = expression.prompt_budget(expression.her_messages(entries), story_state)
+        if budget:
+            result['expressionBudget'] = budget
         if phase in HOOK_PHASES:
             overnight = overnight_context(_vitality_state(story_state), entries, now, tz)
             if overnight:

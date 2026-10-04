@@ -48,6 +48,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         'window': 10,
         'max_in_window': 4,
         'prefixes': ['？', '?'],
+        # 硬兜底：上一条已经以问号开头，或窗口内问号开头达到上限时，发出前剪掉开头的问号
+        # （只剪开头那串问号，正文不动），并同步剧本原文，打断上下文里的自我模仿。
+        'hard_guard': True,
     },
     'exclamation': {
         # 感叹号只做软反馈（不硬删：删感叹号会改变句子语气），默认关。
@@ -359,17 +362,47 @@ def _sync_script(decision: dict[str, Any], replacements: list[tuple[str, str]], 
                                   **({'start': start, 'end': start + len(content)} if start >= 0 else {})}
 
 
+_LEADING_QUESTION = re.compile(r'^\s*[？?][？?！!]*\s*')
+
+
+def starts_with_question(text: str, prefixes: tuple[str, ...] = ('？', '?')) -> bool:
+    return str(text or '').lstrip().startswith(prefixes)
+
+
+def strip_leading_questions(bubble: str) -> str:
+    """剪掉气泡开头那串问号（含紧跟的「！」），正文保留。"""
+    return _LEADING_QUESTION.sub('', str(bubble or ''), count=1).strip()
+
+
+def _opener_should_strip(history: list[str], ocfg: dict[str, Any]) -> tuple[bool, str, int]:
+    prefixes = tuple(str(p) for p in (ocfg.get('prefixes') or ['？', '?']) if str(p))
+    recent = history[-max(1, int(ocfg.get('window', 10) or 10)):]
+    count = sum(1 for text in recent if starts_with_question(text, prefixes))
+    if history and starts_with_question(history[-1], prefixes):
+        return True, 'consecutive', count
+    if count >= int(ocfg.get('max_in_window', 4) or 0):
+        return True, 'over-cap', count
+    return False, '', count
+
+
 def guard_decision(decision: Any, messages: list[str], story_state: Any = None,
                    separator: str = '<sep/>', cfg: Optional[dict[str, Any]] = None) -> list[str]:
     """硬兜底：按额度处理本回合要发出的每条消息，原地修改 decision。返回日志行。
 
+    两个维度逐气泡处理：颜文字（句尾 / 独立颜文字）与开头问号（「？？？好家伙」→「好家伙」）。
     同一条回复可能以两种拼写各存一份（`groupReply` / `group_reply`），按原文分组，
-    每条不同的消息只判定一次，结果写回所有副本。
+    每条不同的消息只判定一次，结果写回所有副本；剧本原文与 authored_actions 同步修改。
     """
     cfg = cfg or load_config()
-    kcfg = cfg.get('kaomoji') or {}
-    if not isinstance(decision, dict) or not cfg.get('enabled', True) or not kcfg.get('hard_guard', True):
+    if not isinstance(decision, dict) or not cfg.get('enabled', True):
         return []
+    kcfg = cfg.get('kaomoji') or {}
+    ocfg = cfg.get('opener') or {}
+    kaomoji_on = bool(kcfg.get('hard_guard', True))
+    opener_on = bool(ocfg.get('enabled', True) and ocfg.get('hard_guard', True))
+    if not (kaomoji_on or opener_on):
+        return []
+    prefixes = tuple(str(p) for p in (ocfg.get('prefixes') or ['？', '?']) if str(p))
     groups: dict[str, list[tuple[dict[str, Any], str]]] = {}
     for holder, key in _outgoing_slots(decision):
         groups.setdefault(holder[key], []).append((holder, key))
@@ -377,25 +410,36 @@ def guard_decision(decision: Any, messages: list[str], story_state: Any = None,
     logs: list[str] = []
     replacements: list[tuple[str, str]] = []
     for original, holders in groups.items():
-        final = original
-        found = find_kaomoji(original)
-        if found:
+        bubbles = original.split(separator) if separator and separator in original else [original]
+        strip_kaomoji = False
+        if kaomoji_on and find_kaomoji(original):
             budget = kaomoji_budget(history, story_state, cfg)
-            repeat = bool(kcfg.get('avoid_repeat', True)) and any(face in budget['last_faces'] for _s, _e, face in found)
+            repeat = bool(kcfg.get('avoid_repeat', True)) and any(
+                face in budget['last_faces'] for _s, _e, face in find_kaomoji(original))
             over = budget['count'] + 1 > budget['cap']
             if budget['state'] == 'rest' or over or repeat:
-                regulated = regulate_message(original, separator)
-                if regulated != original:
-                    final = regulated
-                    reason = 'rest' if budget['state'] == 'rest' else ('over-cap' if over else 'repeat')
-                    logs.append('表达频控：去掉颜文字 原因=%s 窗口=%d/%d 原文=%s' % (
-                        reason, budget['count'], budget['cap'], original[:60]))
-                    bubbles = original.split(separator) if separator and separator in original else [original]
-                    for bubble in bubbles:
-                        old = bubble.strip()
-                        new = strip_trailing_kaomoji(bubble)
-                        if old != new:
-                            replacements.append((old, new))
+                strip_kaomoji = True
+                reason = 'rest' if budget['state'] == 'rest' else ('over-cap' if over else 'repeat')
+                logs.append('表达频控：去掉颜文字 原因=%s 窗口=%d/%d 原文=%s' % (
+                    reason, budget['count'], budget['cap'], original[:60]))
+        strip_opener = False
+        if opener_on and any(starts_with_question(bubble, prefixes) for bubble in bubbles):
+            strip_opener, reason, count = _opener_should_strip(history, ocfg)
+            if strip_opener:
+                logs.append('表达频控：剪掉开头问号 原因=%s 窗口=%d/%d 原文=%s' % (
+                    reason, count, int(ocfg.get('max_in_window', 4) or 0), original[:60]))
+        final = original
+        if strip_kaomoji or strip_opener:
+            transformed = []
+            for bubble in bubbles:
+                new = strip_trailing_kaomoji(bubble) if strip_kaomoji else bubble.strip()
+                if strip_opener and starts_with_question(new, prefixes):
+                    new = strip_leading_questions(new)
+                transformed.append((bubble.strip(), new))
+            kept = [new for _old, new in transformed if new]
+            if kept:  # 全部剪空（例如整条只有「？？？」）时保留原文，绝不发空消息
+                final = separator.join(kept) if len(bubbles) > 1 else kept[0]
+                replacements += [(old, new) for old, new in transformed if old != new]
         for holder, key in holders:
             holder[key] = final
         history.append(final)

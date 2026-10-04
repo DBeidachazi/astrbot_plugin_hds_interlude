@@ -42,6 +42,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # 硬兜底开关；关掉只剩软反馈。
         'hard_guard': True,
     },
+    'opener': {
+        # 开场白口癖：最近窗口里以「？」开头的消息达到上限时，软提示换个开法（不硬删）。
+        'enabled': True,
+        'window': 10,
+        'max_in_window': 4,
+        'prefixes': ['？', '?'],
+    },
     'exclamation': {
         # 感叹号只做软反馈（不硬删：删感叹号会改变句子语气），默认关。
         'enabled': False,
@@ -248,6 +255,17 @@ def exclamation_hint(messages: list[str], cfg: Optional[dict[str, Any]] = None) 
     return 'sparing' if count >= int(cfg.get('max_in_window', 6) or 0) else None
 
 
+def opener_hint(messages: list[str], cfg: Optional[dict[str, Any]] = None) -> Optional[str]:
+    """开场白软反馈：最近窗口里以「？」等开头的消息太多时返回 'vary'，否则 None。"""
+    cfg = (cfg or load_config()).get('opener') or {}
+    if not cfg.get('enabled', True):
+        return None
+    prefixes = tuple(str(p) for p in (cfg.get('prefixes') or ['？', '?']) if str(p))
+    recent = messages[-max(1, int(cfg.get('window', 10) or 10)):]
+    count = sum(1 for text in recent if text.lstrip().startswith(prefixes))
+    return 'vary' if count >= int(cfg.get('max_in_window', 4) or 0) else None
+
+
 def prompt_budget(messages: list[str], story_state: Any = None,
                   cfg: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
     """发给模型的 `interval.expressionBudget`；功能关闭时 None。"""
@@ -264,6 +282,9 @@ def prompt_budget(messages: list[str], story_state: Any = None,
     exclamation = exclamation_hint(messages, cfg)
     if exclamation:
         result['exclamation'] = exclamation
+    opener = opener_hint(messages, cfg)
+    if opener:
+        result['opener'] = opener
     return result
 
 

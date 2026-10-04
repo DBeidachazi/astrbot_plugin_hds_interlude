@@ -66,7 +66,7 @@ from ..script.commit_builder import find_group_script_event
 from ..script.contract import message_event_reference
 from ..script.delivery_ledger import platform_action_reference
 from ..story_state import decode_story_state, encode_story_state
-from .. import vitality
+from .. import group_digest, vitality
 from ..types import empty_participant_state, empty_story_state
 from .base import (
     GROUP_SKIP_NOTE_INTERVAL_MS,
@@ -1584,9 +1584,19 @@ class ServiceChunk1(ServiceBase):
             chat_capabilities = _chat_capabilities_wire(
                 self.group_chat_capabilities(turn.get('latest_session'), context_messages),
             )
+            # 本地扩展：@ 渲染成「@林小满」/「@群友名」（只改发给模型的这一份），多人同批时加摘要。
+            self_ids = {normalize_account_id(_session_read(turn.get('latest_session'), 'selfId', 'self_id'))}
+            character_name = str(pick(pick(pick(snapshot['story'], 'setting') or {}, 'character') or {}, 'name') or '')
+            names = group_digest.name_map([*context_messages, *batch])
+            for item in context_messages:
+                item['content'] = group_digest.render_mentions(item.get('content'), names, self_ids, character_name)
+            digest = group_digest.batch_digest(batch, self_ids, character_name, names)
             user_message = '\n\n'.join(
-                '[群聊连续消息 %d｜%s]\n%s' % (index + 1, pick(item, 'speaker'), pick(item, 'content'))
-                for index, item in enumerate(batch)
+                ([digest] if digest else [])
+                + ['[群聊连续消息 %d｜%s]\n%s' % (
+                    index + 1, pick(item, 'speaker'),
+                    group_digest.render_mentions(pick(item, 'content'), names, self_ids, character_name),
+                ) for index, item in enumerate(batch)]
             )
             if self.semantic_turn_embedding_enabled():
                 embedding_config = _config_section(_config_section(self.config, 'model'), 'embedding')

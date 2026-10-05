@@ -1487,7 +1487,7 @@ class ServiceChunk1(ServiceBase):
         group_id = turn.get('group_id')
         # 上游 1.0.1-rc23：走档位解析层（五档 / auto 按生活状态 / 旧数值门按 custom）。
         life_status = decode_story_state(pick(story, 'state')).get('life_status')
-        # 本地扩展：群级开关 respond_to_mentions=false（2026-10-04 用户要求给 992726871 加）——
+        # 本地扩展：群级开关 respond_to_mentions=false（2026-10-04 加入；目前没有群启用，全部照常响应 @）——
         # 在这个群里 @ / 引用 / 叫名字都不再强制唤醒、也不额外加意愿，只当一条普通消息累积；
         # 她只在自己想说话（意愿自然攒到阈值）时开口。未配置时为 true，行为与之前一致。
         respond_to_mentions = _respond_to_mentions(rule)

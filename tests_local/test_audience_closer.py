@@ -186,7 +186,7 @@ svc = run(SCENE, mentioned=True)
 check(svc.captured is not None, '被 @（mentioned_bot）时不跳过')
 print('T3 群回合 ✓')
 
-# ============================================================ T3b 群级开关 respond_to_mentions（992726871 不再响应 @）
+# ============================================================ T3b 群级开关 respond_to_mentions（配了 false 的群不再被 @ 强制唤醒）
 check(chunk1._respond_to_mentions({}) is True and chunk1._respond_to_mentions({'respond_to_mentions': True}) is True,
       '缺省 / true：照常响应')
 check(chunk1._respond_to_mentions({'respond_to_mentions': False}) is False
@@ -224,12 +224,16 @@ def run_rule(messages, rule_extra, mentioned=True):
 
 
 seen.clear()
-svc = run_rule(AT_HER, {})                       # 885063277：原样
-check(svc.captured is not None and seen[-1][1]['mentioned_bot'] is True, '主群：@ 照常强制唤醒')
+svc = run_rule(AT_HER, {})                       # 缺省：原样
+check(svc.captured is not None and seen[-1][1]['mentioned_bot'] is True, '缺省：@ 照常强制唤醒')
 seen.clear()
-svc = run_rule(AT_HER, {'respond_to_mentions': False})   # 992726871
+svc = run_rule(AT_HER, {'respond_to_mentions': True})    # 显式 true（2026-10-05 992726871 恢复后的配置）
+check(svc.captured is not None and seen[-1][1]['mentioned_bot'] is True and seen[-1][0]['keywords'] == ['小满', '林小满'],
+      '显式 true：与缺省一致，@ 照常唤醒、关键词保留')
+seen.clear()
+svc = run_rule(AT_HER, {'respond_to_mentions': False})   # 配了 false 的群
 legacy, payload = seen[-1]
-check(svc.captured is None, '992726871：@ 她、意愿冷启动时不开口: %s' % svc.skips)
+check(svc.captured is None, 'respond_to_mentions=false：@ 她、意愿冷启动时不开口: %s' % svc.skips)
 check(payload['mentioned_bot'] is False and payload['quoted_bot'] is False and legacy['keywords'] == [],
       '@ / 引用 / 叫名字都不再加权')
 check(any('意愿' in x for x in svc.skips), '跳过原因是意愿没到: %s' % svc.skips)

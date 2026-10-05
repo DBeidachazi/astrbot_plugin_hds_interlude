@@ -332,7 +332,7 @@ def turn_hooks(story: Any, story_state: Any, phase: str, now: datetime,
 
 
 def request_context(story: Any, story_state: Any, phase: str, now: datetime,
-                    entries: Any, world_rows: Any = None) -> dict[str, Any]:
+                    entries: Any, world_rows: Any = None, her_messages: Any = None) -> dict[str, Any]:
     """主叙事请求里 `interval` 要加的字段。"""
     try:
         tz = _story_tz(story)
@@ -346,7 +346,8 @@ def request_context(story: Any, story_state: Any, phase: str, now: datetime,
         if hooks:
             result['lifeHooks'] = life_hooks.prompt_hooks(hooks)
         result.update(story_arcs.context(_vitality_state(story_state).get('arcs'), local_day))
-        budget = expression.prompt_budget(expression.her_messages(entries), story_state)
+        own = list(her_messages) if isinstance(her_messages, list) else expression.her_messages(entries)
+        budget = expression.prompt_budget(own, story_state)
         if budget:
             result['expressionBudget'] = budget
         if phase in HOOK_PHASES:

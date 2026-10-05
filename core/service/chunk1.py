@@ -1579,7 +1579,10 @@ class ServiceChunk1(ServiceBase):
         # 她把「主播」当成在叫自己。被 @ / 引用她、或提到她名字时照常进入主叙事。
         audience_self_ids = {normalize_account_id(_session_read(turn.get('latest_session'), 'selfId', 'self_id'))}
         audience_aliases = _addressing_aliases(story, rule)
-        if not addressed and group_digest.addressed_elsewhere_only(batch, audience_self_ids, audience_aliases):
+        nicknames = group_digest.parse_nicknames(pick(rule, 'memberNicknames', 'member_nicknames'))
+        if not addressed and group_digest.addressed_elsewhere_only(
+            batch, audience_self_ids, audience_aliases, (), nicknames,
+        ):
             self.report_operation(
                 'standard', 'info', story, 'user-message',
                 '群聊这一批都在对别的群友说，她不插嘴 群=%s 本批=%d', group_id, len(batch),
@@ -1633,14 +1636,17 @@ class ServiceChunk1(ServiceBase):
                 item['content'] = group_digest.render_mentions(item.get('content'), names, self_ids, character_name)
             digest = group_digest.batch_digest(batch, self_ids, character_name, names)
             audiences = group_digest.message_audiences(
-                batch, self_ids, _addressing_aliases(snapshot['story'], rule), snapshot['contextMessages'],
+                batch, self_ids, _addressing_aliases(snapshot['story'], rule), snapshot['contextMessages'], nicknames,
             )
+            preamble = group_digest.nickname_preamble(nicknames, character_name)
             user_message = '\n\n'.join(
-                ([digest] if digest else [])
+                ([preamble] if preamble else [])
+                + ([digest] if digest else [])
                 + ['[群聊连续消息 %d｜%s]\n%s%s' % (
                     index + 1, pick(item, 'speaker'),
                     group_digest.render_mentions(pick(item, 'content'), names, self_ids, character_name),
-                    ('\n' + note) if (note := group_digest.audience_note(audiences[index], names)) else '',
+                    ('\n' + note) if (note := group_digest.audience_note(
+                        audiences[index], names, pick(item, 'content'), nicknames)) else '',
                 ) for index, item in enumerate(batch)]
             )
             if self.semantic_turn_embedding_enabled():

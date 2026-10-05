@@ -151,8 +151,56 @@ def _calls_her(message: Any, self_ids: set[str], aliases: Iterable[str]) -> bool
     return any(alias and alias in text for alias in aliases)
 
 
+# ---------------------------------------------------------------- 群内称呼（2026-10-05）
+# 现场：992726871 里「主播」是大家对 好小狗-放映手机 的称呼（「主播现在不应该是凌晨三点吗」
+# 「放已开始健康作息生活」）。群友发了一句不带 @ 的「我都睡醒了主播怎么还在」，她又以为在叫自己，
+# @ 对方回「谁是主播啦」——前一天同一个误会已经写进了记忆摘要，模型把「主播」当成了她的外号。
+
+# 指第三方的称谓：不带 @、也没叫她名字时，这些词默认在说别人。
+THIRD_PARTY_TITLES = ('主播', '群主', '管理', '楼主', '楼上', 'up主', 'UP主', '博主', '老哥', '大佬', '老板',
+                      '这家伙', '那家伙', '某人')
+
+
+def parse_nicknames(raw: Any) -> list[dict[str, str]]:
+    """群规则 `member_nicknames`：每行「称呼=指谁」，可写 QQ 号「主播=好小狗-放映手机(458593826)」；
+    也接受 [{nickname, member, qq}] 列表。返回 [{'nickname', 'member', 'qq'}]。"""
+    items: list[dict[str, str]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and str(item.get('nickname') or '').strip():
+                items.append({'nickname': str(item['nickname']).strip(),
+                              'member': str(item.get('member') or '').strip(),
+                              'qq': str(item.get('qq') or '').strip()})
+        return items
+    for line in re.split(r'[\n；;]+', str(raw or '')):
+        if '=' not in line and '＝' not in line:
+            continue
+        nick, _sep, target = re.split(r'([=＝])', line, maxsplit=1)
+        nick, target = nick.strip(), target.strip()
+        match = re.search(r'[（(]\s*(\d{5,12})\s*[)）]\s*$', target)
+        qq = match.group(1) if match else ''
+        member = target[:match.start()].strip() if match else target
+        for one in re.split(r'[/、,，]', nick):
+            if one.strip() and (member or qq):
+                items.append({'nickname': one.strip(), 'member': member, 'qq': qq})
+    return items
+
+
+def nickname_hits(text: str, nicknames: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [item for item in nicknames or [] if item['nickname'] and item['nickname'] in text]
+
+
+def nickname_preamble(nicknames: list[dict[str, str]], character_name: str) -> Optional[str]:
+    """批次开头的一行「群内称呼」说明；没有配置时 None。"""
+    if not nicknames:
+        return None
+    parts = ['「%s」= %s' % (item['nickname'], item['member'] or ('QQ ' + item['qq'])) for item in nicknames]
+    return '[群内称呼] %s。这些是群友之间的叫法，都不是在叫%s。' % ('；'.join(parts), character_name or '你')
+
+
 def message_audiences(batch: list[Any], self_ids: Iterable[str], aliases: Iterable[str] = (),
-                      prior: Iterable[Any] = ()) -> list[Optional[str]]:
+                      prior: Iterable[Any] = (), nicknames: Optional[list[dict[str, str]]] = None
+                      ) -> list[Optional[str]]:
     """逐条判断「这条在对谁说」：'her' / 'other:<id>' / None（对群里所有人，没有明确对象）。
 
     同一个人紧接着发的、不带 @ 的补充（如「全是梗」）沿用他上一条的对象；
@@ -169,10 +217,13 @@ def message_audiences(batch: list[Any], self_ids: Iterable[str], aliases: Iterab
         else:
             others = [target for target in _targets(message) if target not in own and target.lower() != 'all']
             quoted = str(_get(_get(message, 'quote'), 'senderId', 'sender_id') or '').strip()
+            hits = nickname_hits(_TAG.sub('', str(_get(message, 'content') or '')), nicknames or [])
             if others:
                 result = 'other:' + others[0]
             elif quoted and quoted != sender:
                 result = 'other:' + quoted
+            elif hits:  # 不带 @ 但用了某位群友的称呼（「主播怎么还在」）：在说那位群友
+                result = 'other:' + (hits[0]['qq'] or hits[0]['member'])
             elif _targets(message) or _is_placeholder(message):
                 result = None if _targets(message) else last.get(sender)
             else:
@@ -187,19 +238,30 @@ def message_audiences(batch: list[Any], self_ids: Iterable[str], aliases: Iterab
     return [classify(message) for message in batch or []]
 
 
-def audience_note(audience: Optional[str], names: dict[str, str]) -> str:
-    """附在批次每条消息后面的一行说明；对象不明确时不加。"""
+def audience_note(audience: Optional[str], names: dict[str, str], text: str = '',
+                  nicknames: Optional[list[dict[str, str]]] = None) -> str:
+    """附在批次每条消息后面的一行说明；对象不明确、也没有称谓时不加。"""
     if audience == 'her':
         return '（↑ 这条是在找你）'
+    plain = _TAG.sub('', str(text or ''))
+    hits = nickname_hits(plain, nicknames or [])
+    if hits:
+        item = hits[0]
+        return '（↑ 「%s」在这个群里指 %s，不是你；这条不是在跟你说话）' % (
+            item['nickname'], item['member'] or names.get(item['qq']) or '另一位群友')
     if audience and audience.startswith('other:'):
         target = audience[len('other:'):]
-        return '（↑ 这条是对 @%s 说的，不是对你；里面的称呼都指对方）' % (names.get(target) or '其他群友')
+        label = names.get(target) or (target if not target.isdigit() else '其他群友')
+        return '（↑ 这条是对 @%s 说的，不是对你；里面的称呼都指对方）' % label
+    titles = [title for title in THIRD_PARTY_TITLES if title in plain]
+    if titles:
+        return '（↑ 这条没有 @ 谁，也没叫你的名字：里面的「%s」说的是别人，不是你）' % titles[0]
     return ''
 
 
 def addressed_elsewhere_only(batch: list[Any], self_ids: Iterable[str], aliases: Iterable[str] = (),
-                             prior: Iterable[Any] = ()) -> bool:
+                             prior: Iterable[Any] = (), nicknames: Optional[list[dict[str, str]]] = None) -> bool:
     """整批有文字的消息全都在对别人说（没有一条找她、也没有一条泛泛对全群）→ True。"""
-    audiences = message_audiences(batch, self_ids, aliases, prior)
+    audiences = message_audiences(batch, self_ids, aliases, prior, nicknames)
     texts = [audience for message, audience in zip(batch or [], audiences) if not _is_placeholder(message)]
     return bool(texts) and all(audience and audience.startswith('other:') for audience in texts)

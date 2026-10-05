@@ -1531,9 +1531,13 @@ class ServiceChunk4(ServiceBase):
             request['stickerGroupCatalog'] = sticker_groups
         # 本地扩展：生活活力（防停滞 / 生活钩子 / 长线剧情）。停滞判定要看几个小时，
         # 不能用按 60 分钟时间窗裁过的 recent_entries，单独取最近 40 条。
+        try:
+            her_recent = await self._her_recent_messages(story['id'])
+        except Exception:  # noqa: BLE001 - 读不到就让 vitality 按条目自己算
+            her_recent = None
         vitality_context = vitality.request_context(
             story, decoded_state, phase, now, await self.recent_entries(story['id'], 40),
-            await self._merged_world_rows(story),
+            await self._merged_world_rows(story), her_recent,
         )
         if vitality_context:
             request['vitality'] = vitality_context
@@ -1554,16 +1558,36 @@ class ServiceChunk4(ServiceBase):
             await self.narrator.decide(request), False, separator,
         ))
 
+    async def _her_recent_messages(self, story_id: Any, limit: int = 20) -> Optional[list[str]]:
+        """她最近发出的消息（时间顺序）。直接按 kind 取：热闹的群里「最近 40 条全部条目」只含她
+        四五条消息，频控窗口名义 10 条、实际只看得到一半（2026-10-05 句尾笑声漏剪的原因）。
+        宿主没有数据库访问时退回 recent_entries；都没有时 None。"""
+        getter = getattr(self, 'db_get', None)
+        if callable(getter) and getattr(self, 'db', None) is not None:
+            try:
+                rows: list[Any] = []
+                for kind in ('character-message', 'character-group-message'):
+                    rows += await getter('interlude_script_entry', {'storyId': story_id, 'kind': kind},
+                                         {'limit': limit, 'sort': {'occurredAt': 'DESC'}})
+                return expression.her_messages(rows)[-limit:]
+            except Exception:  # noqa: BLE001 - 退回下面的通用读取
+                pass
+        reader = getattr(self, 'recent_entries', None)
+        if not callable(reader):
+            return None
+        return expression.her_messages(await reader(story_id, 200))[-limit:]
+
     async def _expression_guard(self, story: Any, phase: str, decision: Any) -> None:
         """本地扩展：颜文字频控硬兜底（只删句尾 / 独立颜文字，并同步剧本原文）。
 
         可选能力，任何异常（包括宿主没有 recent_entries）都只跳过，绝不让主叙事回合失败。
         """
-        reader = getattr(self, 'recent_entries', None)
-        if not callable(reader) or not isinstance(decision, dict):
+        if not isinstance(decision, dict):
             return
         try:
-            messages = expression.her_messages(await reader(story['id'], 40))
+            messages = await self._her_recent_messages(story['id'])
+            if messages is None:
+                return
             lines = expression.guard_decision(
                 decision, messages, decode_story_state(story.get('state')),
                 str(_cfg(self.runtime_config, 'messageSeparator', '<sep/>')),

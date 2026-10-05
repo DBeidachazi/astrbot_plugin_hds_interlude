@@ -557,6 +557,8 @@ class GroupChatRule(TypedDict, total=False):
     cooldown_seconds: int
     #: 本地扩展：false 时 @ / 引用 / 叫名字不再强制唤醒（缺省 true）。
     respond_to_mentions: bool
+    #: 本地扩展：群内称呼，每行「称呼=指谁(QQ)」（如「主播=好小狗-放映手机(458593826)」）。
+    member_nicknames: str
     #: 上游 `Partial<GroupWillingnessConfig>`；本移植版 `GroupWillingnessConfig`
     #: 的键是 snake_case，读取方 `resolve_group_willingness()` 两种拼写都认。
     willingness: Any

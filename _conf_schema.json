@@ -887,6 +887,12 @@
             ],
             "hint": "mention-only 仅被 @ 时触发；always 处理所有群消息"
           },
+          "member_nicknames": {
+            "type": "text",
+            "description": "群内称呼（谁被叫什么）",
+            "default": "",
+            "hint": "每行一条「称呼=指谁」，可带 QQ 号，如：主播=好小狗-放映手机(458593826)。她会知道这些称呼说的是那位群友，不会对号入座"
+          },
           "respond_to_mentions": {
             "type": "bool",
             "description": "被 @ / 引用 / 叫名字时必回",

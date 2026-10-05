@@ -108,7 +108,7 @@ from ..story_state import (
 from ..time import dt_ms, format_log_time, iso, parse_dt, utc_now
 from ..turn_persistence import script_entry_draft_for_commit
 from ..urge import commit_urge, normalize_urge_state, urge_burst_active
-from .. import expression, vitality
+from .. import expression, trust, vitality
 from .base import ServiceBase, pick
 from .config import (
     TIMELINE_DIRECTOR_FUSE,
@@ -1539,6 +1539,10 @@ class ServiceChunk4(ServiceBase):
             story, decoded_state, phase, now, await self.recent_entries(story['id'], 40),
             await self._merged_world_rows(story), her_recent,
         )
+        # 本地扩展：高信任对象（私聊聊天回合才有；其他人不带这个字段，行为不变）。
+        trust_context = self._trust_context(participant, phase)
+        if trust_context:
+            request['trust'] = trust_context
         if vitality_context:
             request['vitality'] = vitality_context
             if vitality_context.get('lifeHooks') or vitality_context.get('lifeStagnation'):
@@ -1557,6 +1561,32 @@ class ServiceChunk4(ServiceBase):
         return _resync_dual(resolve_authored_actions(
             await self.narrator.decide(request), False, separator,
         ))
+
+    def _trust_context(self, participant: Any, phase: str) -> Optional[dict[str, Any]]:
+        """本地扩展：私聊回合的 `interval.trust`（见 core/trust.py）；读不到配置时 None。"""
+        reader = getattr(self, '_access_config', None)
+        if participant is None or not callable(reader):
+            return None
+        try:
+            return trust.prompt_context(reader(), participant, phase)
+        except Exception:  # noqa: BLE001 - 可选能力，绝不影响主叙事
+            return None
+
+    def _group_promises_from_turn(self, participant: Any, phase: str, raw: Any, script: Any,
+                                  now: datetime) -> list[dict[str, Any]]:
+        """本回合（高信任对象的私聊）里她答应的群发言；其他情况空列表。"""
+        context = self._trust_context(participant, phase)
+        if not context or not isinstance(raw, dict):
+            return []
+        try:
+            return trust.normalize_promises(
+                pick(raw, 'groupPromises', 'group_promises'), context['knownGroups'], str(script or ''),
+                # 显示名可能是空白（269502169 的昵称是全角空格）；不用 QQ 号兜底，免得她在群里照抄号码。
+                str(pick(participant, 'displayName', 'display_name') or '').strip() or '私聊里你最信任的那个人',
+                str(pick(participant, 'id') or ''), now,
+            )
+        except Exception:  # noqa: BLE001
+            return []
 
     async def _her_recent_messages(self, story_id: Any, limit: int = 20) -> Optional[list[str]]:
         """她最近发出的消息（时间顺序）。直接按 kind 取：热闹的群里「最近 40 条全部条目」只含她
@@ -2372,6 +2402,21 @@ class ServiceChunk4(ServiceBase):
             )
             if vitality_state is not None:
                 next_state['extensions'] = {**(next_state.get('extensions') or {}), 'vitality': vitality_state}
+            # 本地扩展：高信任对象私聊里她答应的「去群里说…」→ 记成待兑现的群发言承诺。
+            promises = self._group_promises_from_turn(participant, phase, raw, script, now)
+            if promises:
+                next_state['extensions'] = {
+                    **(next_state.get('extensions') or {}),
+                    'trust': trust.add_promises(next_state, promises, now),
+                }
+                for promise in promises:
+                    self.report_operation(
+                        'standard', 'info', story, phase, '群发言承诺已记录 群=%s 内容=%s 来自=%s',
+                        promise['groupId'], promise['gist'], promise['from'],
+                    )
+                    scheduler = getattr(self, 'schedule_group_promise_trigger', None)
+                    if callable(scheduler):
+                        scheduler(story['id'], promise['groupId'])
             for row_id in world_ids:
                 # 合并模式：世界事件已作为钩子交给她，标记为已注入（也计入播种器的每日上限）。
                 await self.db_set('interlude_seeded_event', {'id': row_id}, {'status': 'injected', 'updatedAt': now})

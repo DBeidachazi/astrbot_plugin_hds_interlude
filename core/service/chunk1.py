@@ -66,7 +66,7 @@ from ..script.commit_builder import find_group_script_event
 from ..script.contract import message_event_reference
 from ..script.delivery_ledger import platform_action_reference
 from ..story_state import decode_story_state, encode_story_state
-from .. import group_digest, vitality
+from .. import group_digest, trust, vitality
 from ..types import empty_participant_state, empty_story_state
 from .base import (
     GROUP_SKIP_NOTE_INTERVAL_MS,
@@ -300,6 +300,15 @@ def _message_characters(runtime: Any) -> int:
     if raw is None or isinstance(raw, bool):
         return 2 ** 31 - 1
     return int(raw)
+
+
+def _promise_sessions(service: Any) -> dict[str, Any]:
+    """每个 `故事:群` 最近一次的群会话（只在内存里，重启后等群里来消息再填）。"""
+    cache = getattr(service, '_group_promise_sessions', None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(service, '_group_promise_sessions', cache)
+    return cache
 
 
 def _respond_to_mentions(rule: Any) -> bool:
@@ -1421,6 +1430,11 @@ class ServiceChunk1(ServiceBase):
             turn['timer']()
         turn['channel_id'] = _session_read(session, 'channelId', 'channel_id')
         turn['latest_session'] = session
+        # 本地扩展：记住这个群最近一次的会话，群发言承诺到点时用它自己开一轮（见 trigger_group_promise）。
+        _promise_sessions(self)[key] = {
+            'story_id': story_id, 'group_id': group_id, 'rule': rule,
+            'channel_id': turn['channel_id'], 'session': session,
+        }
         sources = [str(item) for item in (audio_sources or []) if str(item or '').strip()]
         if sources:
             # 上游同一形状：有语音才写这两个键，没有就**不出现**（别留空数组）。
@@ -1436,6 +1450,39 @@ class ServiceChunk1(ServiceBase):
             lambda: _spawn(self.flush_group_turn(key, revision)), delay,
         )
         self.buffered_group_turns[key] = turn
+
+    def schedule_group_promise_trigger(self, story_id: Any, group_id: Any) -> None:
+        """本地扩展：群发言承诺记下后，若 10 分钟内这个群没有自然的群回合，就自己开一轮。"""
+        set_timeout = getattr(getattr(self, 'ctx', None), 'set_timeout', None)
+        if callable(set_timeout):
+            set_timeout(lambda: _spawn(self.trigger_group_promise(story_id, group_id)), trust.PROMISE_TRIGGER_MS)
+
+    async def trigger_group_promise(self, story_id: Any, group_id: Any) -> bool:
+        """到点仍未兑现的承诺：用这个群最近的会话开一轮没有新消息的群回合。返回是否开了。"""
+        key = '%s:%s' % (story_id, normalize_group_id(group_id))
+        if self.buffered_group_turns.get(key):
+            return False  # 群里正好有一批在排队，交给它
+        story = await self.get_story(story_id)
+        if not trust.pending_promises(decode_story_state(pick(story, 'state')), self.now(), str(normalize_group_id(group_id))):
+            return False
+        cached = _promise_sessions(self).get(key)
+        if not cached:
+            self.report_operation(
+                'standard', 'info', story, 'user-message',
+                '群发言承诺到点，但重启后还没有这个群的会话，等群里下一条消息时兑现 群=%s', group_id,
+            )
+            return False
+        self.buffered_group_turns[key] = {
+            'story_id': story_id, 'group_id': cached['group_id'], 'rule': cached['rule'],
+            'channel_id': cached['channel_id'], 'latest_session': cached['session'],
+            'messages': [], 'revision': 1, 'mentioned_bot': False, 'quoted_bot': False,
+            'timer': None, 'promise_trigger': True,
+        }
+        self.report_operation(
+            'standard', 'info', story, 'user-message', '群发言承诺到点，主动开一轮群回合 群=%s', group_id,
+        )
+        await self.flush_group_turn(key, 1)
+        return True
 
     async def flush_group_turn(self, key: str, revision: int) -> None:
         """上游 `flushGroupTurn(key, revision)`（`src/service.ts:1769`）。
@@ -1462,7 +1509,7 @@ class ServiceChunk1(ServiceBase):
         turn['timer'] = None
         batch = list(turn.get('messages') or [])
         del turn['messages'][:]
-        if not batch:
+        if not batch and not turn.get('promise_trigger'):
             self.buffered_group_turns.pop(key, None)
             return
 
@@ -1485,6 +1532,12 @@ class ServiceChunk1(ServiceBase):
 
         rule = turn.get('rule') or {}
         group_id = turn.get('group_id')
+        # 本地扩展：私聊里答应过要在这个群说的话（见 core/trust.py）。有待兑现的承诺时，这一轮
+        # 不受意愿门、冷却和「对别人说就不插嘴」拦截——她答应了，就得有机会说出来。
+        promises = trust.pending_promises(decode_story_state(pick(story, 'state')), self.now(), str(group_id or ''))
+        if turn.get('promise_trigger') and not promises:
+            self.buffered_group_turns.pop(key, None)
+            return
         # 上游 1.0.1-rc23：走档位解析层（五档 / auto 按生活状态 / 旧数值门按 custom）。
         life_status = decode_story_state(pick(story, 'state')).get('life_status')
         # 本地扩展：群级开关 respond_to_mentions=false（2026-10-04 加入；目前没有群启用，全部照常响应 @）——
@@ -1510,6 +1563,8 @@ class ServiceChunk1(ServiceBase):
             rng=self.rng,
         )
         self.group_willingness[key] = willingness['state']
+        if promises and not willingness['should_call']:
+            willingness = {**willingness, 'should_call': True, 'reason': 'group-promise'}
         addressed = respond_to_mentions and (bool(turn.get('mentioned_bot')) or bool(turn.get('quoted_bot')))
         turn['mentioned_bot'] = False
         turn['quoted_bot'] = False
@@ -1535,7 +1590,7 @@ class ServiceChunk1(ServiceBase):
         # 本地偏离：明确 @ 主角（意愿门判为 forced-mention）时不受群发言冷却约束。
         # 冷却是为了压住她自己连续插话；被点名却因为 20~60 秒前刚说过话而整条丢弃
         # （冷却期内的消息不排队），在群友看来就是「@ 了她不理人」。
-        if willingness.get('reason') != 'forced-mention' and await self.group_cooldown_active(
+        if willingness.get('reason') != 'forced-mention' and not promises and await self.group_cooldown_active(
             pick(story, 'id'), group_id, _config_limit(rule, 'cooldownSeconds', 'cooldown_seconds', 1),
         ):
             self.report_operation(
@@ -1580,7 +1635,7 @@ class ServiceChunk1(ServiceBase):
         audience_self_ids = {normalize_account_id(_session_read(turn.get('latest_session'), 'selfId', 'self_id'))}
         audience_aliases = _addressing_aliases(story, rule)
         nicknames = group_digest.parse_nicknames(pick(rule, 'memberNicknames', 'member_nicknames'))
-        if not addressed and group_digest.addressed_elsewhere_only(
+        if not addressed and not promises and group_digest.addressed_elsewhere_only(
             batch, audience_self_ids, audience_aliases, (), nicknames,
         ):
             self.report_operation(
@@ -1639,8 +1694,10 @@ class ServiceChunk1(ServiceBase):
                 batch, self_ids, _addressing_aliases(snapshot['story'], rule), snapshot['contextMessages'], nicknames,
             )
             preamble = group_digest.nickname_preamble(nicknames, character_name)
+            promise_note = trust.promise_preamble(promises)
             user_message = '\n\n'.join(
-                ([preamble] if preamble else [])
+                ([promise_note] if promise_note else [])
+                + ([preamble] if preamble else [])
                 + ([digest] if digest else [])
                 + ['[群聊连续消息 %d｜%s]\n%s%s' % (
                     index + 1, pick(item, 'speaker'),
@@ -1843,6 +1900,22 @@ class ServiceChunk1(ServiceBase):
                         }, recorded_at)
 
                 await self.serial(story_id, record_task)
+
+            if promises:
+                posted = bool(delivered_segments)
+
+                async def settle_task() -> list[str]:
+                    current = await self.get_story(story_id)
+                    state = decode_story_state(pick(current, 'state'))
+                    trust_state, lines = trust.settle(state, str(group_id or ''), posted, self.now())
+                    extensions = {**(state.get('extensions') or {}), 'trust': trust_state}
+                    await self.db_set('interlude_story', {'id': story_id}, {
+                        'state': encode_story_state({**state, 'extensions': extensions}),
+                    })
+                    return lines
+
+                for line in await self.serial(story_id, settle_task):
+                    self.report_operation('standard', 'info', snapshot['story'], 'user-message', '%s', line)
 
             sticker_delivered = False
             if result['sticker'] and turn.get('latest_session'):

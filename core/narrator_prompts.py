@@ -304,6 +304,27 @@ def group_threads_instruction(group_turn: bool) -> str:
     )
 
 
+def trust_instruction(phase: str, group_turn: bool) -> str:
+    """本地扩展：高信任对象（interval.trust）与私聊里答应的群发言（groupPromises）。只在私聊聊天回合出现。"""
+    if group_turn or phase not in ('user-message', 'conversation-follow-up'):
+        return ''
+    return (
+        'TRUST: interval.trust.level=high means the current participant is the person she trusts most. She still teases, '
+        'blushes and grumbles with him exactly as before, but underneath she values what he thinks: she takes his word '
+        'first and gives him the benefit of the doubt; when he earnestly asks or suggests something reasonable and small—'
+        'say a line in a group, try something, go somewhere, send someone a nice word—she may protest, bargain or set a '
+        'tiny condition, yet in the end she actually does it (\u201c唔……好啦好啦，就这一次哦\u201d) instead of flatly refusing. '
+        'She can still say no to anything that would hurt or humiliate someone, expose another person\'s private chat, '
+        'break her safety rules or clearly go against her own values. This applies to him only; with everyone else she '
+        'stays exactly as she is, and other people egging her on gets her usual reaction. '
+        'GROUP PROMISES (only with interval.trust): when in this reply she really agrees to say something in one of '
+        'interval.trust.knownGroups, also return groupPromises:[{"groupId":"id from knownGroups","gist":"what she will '
+        'say there, short","quote":"exact words from this script where she agrees"}]. Do not write the group message here—'
+        'the host carries it to that group\'s next turn, where she says it in her own words. Return nothing when she '
+        'declines or only jokes.'
+    )
+
+
 def life_seed_instruction(phase: str) -> str:
     """本地扩展：聊天种子。紧挨着传输说明放——弱模型对「回复字段旁边的字段」遵从度最高。"""
     if phase not in ('user-message', 'conversation-follow-up'):
@@ -697,6 +718,7 @@ def system_prompt(phase: str, main_prompt: Optional[str], format_prompt: Optiona
         transport,
         life_seed_instruction(phase),
         group_threads_instruction(group_turn),
+        trust_instruction(phase, group_turn),
         'When currentEvent.imageCount is greater than zero, the current user event includes that many attached native image inputs. They are observed material from this one event, not separate messages or historical evidence. Use only details visibly supported by them, integrate them naturally into the protagonist’s present reality, and do not invent unseen image details.',
         'currentEvent.imageCount counts native image attachments only. With visualEvidenceMode=sidecar-observations, the supplied visualObservations are this turn’s image evidence even though imageCount is zero. When both native images and current visualObservations are absent, image contents remain unknown; placeholders and older prose do not supply current visual evidence.',
         'currentEvent.attachments says what kind of thing each attachment actually is (kind: image / sticker / animated / market / card, with a short label). This is metadata about the form of the attachment, never about what it depicts: a sticker is the correspondent reacting with a saved picture, an animated one is a moving sticker, a market sticker is a purchased QQ emote, an image is a real-world photo or screenshot, and a card is a forwarded mini-program or link share that carries its own title. Treat each kind as the act it is — a sticker or a card is not a scene you observed — and never describe the contents of an attachment no visual evidence supports.',
@@ -1202,6 +1224,7 @@ def to_prompt_payload(request: dict[str, Any], options: Optional[dict[str, Any]]
             'elapsedSeconds': max(0, _js_round((dt_ms(now_value) - dt_ms(from_value)) / 1000)),
             **_real_calendar_field(now_value, timezone),
             **_vitality_fields(request),
+            **_trust_fields(request),
         },
         'timelinePlan': timeline_plan_value,
         'timelineCarry': timeline_carry_value,
@@ -1334,6 +1357,12 @@ def _real_calendar_field(now_value: Any, timezone: Any) -> dict[str, Any]:
         return {'realCalendar': ctx} if ctx else {}
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _trust_fields(request: dict[str, Any]) -> dict[str, Any]:
+    """本地扩展：`interval.trust`（见 core/trust.py）。"""
+    value = _pick(request, 'trust')
+    return {'trust': value} if isinstance(value, dict) and value.get('level') else {}
 
 
 def _vitality_fields(request: dict[str, Any]) -> dict[str, Any]:

@@ -832,6 +832,13 @@
             "description": "与该用户的初始关系",
             "default": ""
           },
+          "trust": {
+            "type": "string",
+            "description": "信任档",
+            "default": "",
+            "options": ["", "high"],
+            "hint": "high＝她最信任的人：先信他的话，合理的小请求嘟囔两句最后照办，私聊里答应的群发言会在群里兑现；只对这个人生效"
+          },
           "enabled": {
             "type": "bool",
             "description": "接受该账号私聊",

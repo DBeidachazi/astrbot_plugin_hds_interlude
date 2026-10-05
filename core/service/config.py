@@ -541,6 +541,8 @@ class OneBotAccountRule(TypedDict, total=False):
     person_id: str
     profile: str
     relationship: str
+    #: 本地扩展：信任档（"high" 或空），见 core/trust.py。
+    trust: str
 
 
 class GroupChatRule(TypedDict, total=False):

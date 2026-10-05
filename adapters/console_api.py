@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from ..core import platform_actions
+from ..core.alter import DEFAULT_COOLDOWN_MS
 from ..core.database import TABLES
 from ..core.meta import HDS_INTERLUDE_VERSION
 #: N:1 旧分组归并（配置页显示的当前值必须与运行期读到的一致，见 `config_schema`）。
@@ -3116,14 +3117,24 @@ class ConsoleApi:
         return self._pick_story(stories, story_id)
 
     def _alter_config(self) -> dict[str, Any]:
+        """「触发配置」面板。本地修复：面板读 threshold / decay / cooldown_minutes / weight_step，
+        而真实配置键是 base_threshold / opposite_decay / same_direction_boost（冷却是代码常量），
+        之前四项都显示「—」。旧键名仍优先，便于兼容。"""
         section = self.bridge.section('alter_system')
+
+        def first(*keys: str) -> Any:
+            for key in keys:
+                if section.get(key) is not None:
+                    return section.get(key)
+            return None
+
         return {
             'enabled': section.get('enabled') is not False,
-            'threshold': section.get('threshold'),
-            'max_intensity': section.get('max_intensity', section.get('maxIntensity')),
-            'decay': section.get('decay'),
-            'cooldown_minutes': section.get('cooldown_minutes', section.get('cooldownMinutes')),
-            'weight_step': section.get('weight_step', section.get('weightStep')),
+            'threshold': first('threshold', 'base_threshold', 'baseThreshold'),
+            'max_intensity': first('max_intensity', 'maxIntensity'),
+            'decay': first('decay', 'opposite_decay', 'oppositeDecay'),
+            'cooldown_minutes': first('cooldown_minutes', 'cooldownMinutes') or DEFAULT_COOLDOWN_MS // 60_000,
+            'weight_step': first('weight_step', 'weightStep', 'same_direction_boost', 'sameDirectionBoost'),
         }
 
     def _agency_config(self) -> dict[str, Any]:

@@ -444,6 +444,15 @@ def _normalize_intent_updates(value: Any) -> list[dict[str, Any]]:
     return updates[:8]
 
 
+def _alter_analysis_trigger(alter_turn: Any) -> Optional[str]:
+    """本回合 Alter 位移达到阈值时返回来源桶（参与者 id，主角自身为 ''），否则 None。
+    两种拼写都认：`advance_alter_system` 返回的是 snake_case。"""
+    record = alter_turn if isinstance(alter_turn, dict) else {}
+    if not pick(record, 'thresholdReached', 'threshold_reached'):
+        return None
+    return str(pick(record, 'sourceParticipantId', 'source_participant_id') or '')
+
+
 def _normalize_conversation_action(
     value: Any,
     runtime: dict[str, Any],
@@ -2588,10 +2597,12 @@ class ServiceChunk4(ServiceBase):
                 'interlude_story', {'id': story['id']},
                 {'state': encode_story_state(next_state), 'updatedAt': now},
             )
-            if _record(alter_turn).get('thresholdReached'):
-                self.schedule_alter_analysis(
-                    story['id'], phase, _record(alter_turn).get('sourceParticipantId') or '',
-                )
+            # 本地修复：`advance_alter_system` 返回 snake_case（`threshold_reached` /
+            # `source_participant_id`），这里原来只读 camelCase，于是侧端分析从未被安排——
+            # 位移一路累积到 -192 也没有生成过「内心天气」（2026-10-05 发现；KelaLeaf 同样有此问题）。
+            alter_target = _alter_analysis_trigger(alter_turn)
+            if alter_target is not None:
+                self.schedule_alter_analysis(story['id'], phase, alter_target)
 
         if agency_recheck:
             await self.append_proactive_check(

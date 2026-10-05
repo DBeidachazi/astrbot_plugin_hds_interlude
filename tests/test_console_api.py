@@ -665,6 +665,19 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual([item['alter_value'] for item in payload['history']], [0.2, 0.4])
         self.assertEqual(payload['pending'][0]['participant_id'], 'p1')
 
+    def test_alter_config_panel_reads_the_real_config_keys(self):
+        # 本地修复：面板的四项之前读不存在的键，全部显示「—」。
+        api = ConsoleApi(_make_bridge({'alter_system': {
+            'enabled': True, 'base_threshold': 10.0, 'opposite_decay': 0.15,
+            'same_direction_boost': 0.05, 'max_intensity': 2.0,
+        }}))
+        config = api._alter_config()
+        self.assertEqual(config['threshold'], 10.0)
+        self.assertEqual(config['decay'], 0.15)
+        self.assertEqual(config['weight_step'], 0.05)
+        self.assertEqual(config['max_intensity'], 2.0)
+        self.assertEqual(config['cooldown_minutes'], 5)
+
     def test_alter_without_state_is_an_empty_shell(self):
         self._seed_story({})
         payload = _run(self.api.alter())

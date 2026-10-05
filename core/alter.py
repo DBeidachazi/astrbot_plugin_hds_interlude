@@ -731,3 +731,42 @@ def _materialize_legacy_pending_value(state: AlterSystemState) -> None:
     alter_value = _finite_number(_pick(state, 'alter_value', 'alterValue'), 0)
     if abs(alter_value) > 0:
         state['pending_scopes'] = [{'participant_id': '', 'alter_value': alter_value}]
+
+
+# ======================================================================================
+# 本地扩展：积压桶夹紧（2026-10-05）
+# ======================================================================================
+
+
+def clamp_alter_backlog(state: Any, limit: float = 8.0) -> tuple[Any, list[tuple[str, float, float]]]:
+    """把超出 ``±limit`` 的待处理桶收回到 ``±limit``（保留方向），并重算总位移。
+
+    用途：侧端分析因为键名不一致从未被安排过（chunk4 的 `_alter_analysis_trigger`），
+    桶一路累积到 -172；修好之后第一次触发会按 ``|值| / 阈值`` 直接顶到强度上限。
+    部署修复时先收回到阈值附近，让第一次内心天气以温和强度出现。
+    返回 ``(新状态, [(桶, 原值, 新值), ...])``；没有需要收的桶时状态原样返回。
+    """
+    if not isinstance(state, dict):
+        return state, []
+    key = 'pending_scopes' if 'pending_scopes' in state else ('pendingScopes' if 'pendingScopes' in state else None)
+    if key is None or not isinstance(state.get(key), list):
+        return state, []
+    bound = abs(_finite_number(limit, 8.0))
+    changes: list[tuple[str, float, float]] = []
+    scopes = []
+    for scope in state[key]:
+        if not isinstance(scope, dict):
+            scopes.append(scope)
+            continue
+        value_key = 'alter_value' if 'alter_value' in scope else 'alterValue'
+        value = _finite_number(scope.get(value_key), 0)
+        if abs(value) > bound:
+            new_value = math.copysign(bound, value)
+            changes.append((str(_pick(scope, 'participant_id', 'participantId') or ''), value, new_value))
+            scope = {**scope, value_key: new_value}
+        scopes.append(scope)
+    if not changes:
+        return state, []
+    total = sum(_finite_number(_pick(scope, 'alter_value', 'alterValue'), 0) for scope in scopes if isinstance(scope, dict))
+    total_key = 'alter_value' if 'alter_value' in state or 'alterValue' not in state else 'alterValue'
+    return {**state, key: scopes, total_key: total}, changes

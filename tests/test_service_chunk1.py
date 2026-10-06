@@ -1925,6 +1925,48 @@ class ReceiveTests(ServiceHarness):
         self.assertEqual(calls['paused'], [SHARED_STORY_ID])
 
     @needs('receive', 'append_entry', 'buffer_user_narrative', 'describe_vision_event')
+    async def test_stickers_sent_privately_while_asleep_are_still_collected(self) -> None:
+        # 本地修复：免打扰分支不进 buffer_user_narrative，收藏旁路要单独挂上。
+        service = self.make_service(self._config())
+        self.make_story()
+        participant = {'id': 'onebot:1:2', 'status': 'active', 'personId': '2'}
+        self._stub_private_dependencies(service, participant)
+        service.signal_incoming_interruption = lambda _story, _part: None
+
+        async def asleep(_story: Any, _now: Any) -> Any:
+            return datetime(2026, 1, 3, 1, 0, tzinfo=timezone.utc)
+
+        service.sleep_resume_at = asleep
+        sticker = {'source': 'onebot-file:abc.gif', 'kind': 'sticker', 'label': '[动画表情]'}
+
+        def described(_story: Any, _session: Any) -> dict[str, Any]:
+            return {'content': '[动画表情]', 'sources': ['onebot-file:abc.gif'], 'media': [sticker],
+                    'audio_sources': [], 'quote': None}
+
+        service.describe_user_event = described
+        collected: list[Any] = []
+
+        async def collect(media: Any, sources: Any) -> list[Any]:
+            collected.append((media, sources))
+            return []
+
+        service.collect_incoming_stickers = collect
+        self.assertTrue(await service.receive(self._session(content='[动画表情]'), STORY_TIME))
+        await asyncio.sleep(0)
+        self.assertEqual(collected, [([sticker], ['onebot-file:abc.gif'])])
+        self.assertNotIn('onebot:1:2', service.buffered_narrative_turns)
+
+        collected.clear()
+
+        def plain(_story: Any, _session: Any) -> dict[str, Any]:
+            return {'content': '晚安', 'sources': [], 'media': [], 'audio_sources': [], 'quote': None}
+
+        service.describe_user_event = plain
+        self.assertTrue(await service.receive(self._session(content='晚安', message_id='m-2'), STORY_TIME))
+        await asyncio.sleep(0)
+        self.assertEqual(collected, [], '纯文字不建收藏任务')
+
+    @needs('receive', 'append_entry', 'buffer_user_narrative', 'describe_vision_event')
     async def test_urgent_private_message_still_wakes_her(self) -> None:
         service = self.make_service(self._config())
         self.make_story()

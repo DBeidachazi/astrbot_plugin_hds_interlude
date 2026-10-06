@@ -1796,6 +1796,17 @@ class ServiceChunk2(ServiceBase):
             self.collect_stickers_from_buffered_turn(participant_key, message_index),
         )
 
+    def _spawn_quiet_private_sticker_collect(self, media: Any, sources: Any) -> None:
+        """本地修复：**私聊夜间免打扰**时的收藏入口。
+
+        免打扰分支不进 `buffer_user_narrative`，原来挂在那里的私聊收藏旁路就被一起跳过了——
+        夜里别人私聊发来的表情包收不进库（2026-10-06 发现）。这里直接用这条消息入站时那一次
+        解析出来的 `media` / 图片来源（与 `buffer_user_narrative` 收到的是同一份），判据不变。
+        """
+        if not _has_collectible_media(media, self._sticker_guess_enabled()):
+            return
+        self._spawn_sticker_task(self.collect_incoming_stickers(media, list(sources or []) or _media_sources(media)))
+
     def _spawn_group_sticker_collect(self, media: Any) -> None:
         """**群聊**的自动收藏旁路入口（`receive_group` 在通过全部入站闸门后调用）。
 

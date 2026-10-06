@@ -1308,6 +1308,10 @@ class ServiceChunk1(ServiceBase):
                 and not vitality.is_urgent(str(pick(user_input, 'content') or '')):
             sleep_resume = await self.sleep_resume_at(accepted['story'], accepted['now'])
             if sleep_resume is not None:
+                # 不进叙事，但别人发来的表情包照常收藏（原来的收藏旁路挂在 buffer_user_narrative 上）。
+                collector = getattr(self, '_spawn_quiet_private_sticker_collect', None)
+                if callable(collector):
+                    collector(pick(user_input, 'media') or [], pick(user_input, 'sources') or [])
                 self.report_operation(
                     'standard', 'info', accepted['story'], 'user-message',
                     '夜间免打扰：她已睡着，私聊消息已入库不调用主叙事，醒来后回信 参与者=%s 预计起床=%s',

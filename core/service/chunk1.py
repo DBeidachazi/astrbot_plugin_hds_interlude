@@ -1767,7 +1767,7 @@ class ServiceChunk1(ServiceBase):
             # 每回合一个**新的**追问预算（同回合最多多问一次，铁律见 §48 兜底表）。
             sticker_follow_up: dict[str, Any] = {}
             sticker = await self.resolve_sticker_selection(
-                decision, sticker_selection, sticker_follow_up,
+                decision, sticker_selection, sticker_follow_up, user_message,
             )
             native_face = None if sticker else self.resolve_native_face(decision, chat_capabilities)
 
@@ -1839,6 +1839,9 @@ class ServiceChunk1(ServiceBase):
 
             result = await self.serial(pick(story, 'id'), persist_task)
             platform_entry_id = pick(result['script_entry'], 'id')
+            if sticker is None and sticker_follow_up.get('miss') and succeeded:
+                # 本地扩展：点了分组却没发出表情——补一条事实，下一回合她才知道其实没发。
+                await self.record_sticker_miss(pick(story, 'id'), '', sticker_follow_up, self.now())
 
             def reference_for(reaction: dict[str, Any]) -> Any:
                 return platform_action_reference(

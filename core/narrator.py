@@ -821,6 +821,8 @@ class SilentNarrator:
         message_text: str = '',
         threshold: float = 0.7,
         group_id: str = '',
+        intent: str = '',
+        user_message: str = '',
     ) -> Optional[dict[str, Any]]:
         """两级选择的第二步同样不产出（没有模型连接 → 服务层按"没有候选"兜底）。"""
         return None
@@ -1959,8 +1961,13 @@ class OpenAICompatibleNarrator:
         message_text: str = '',
         threshold: float = 0.7,
         group_id: str = '',
+        intent: str = '',
+        user_message: str = '',
     ) -> Optional[dict[str, Any]]:
         """两级表情选择的第二步（本移植版新增 §48 甲）：附该组条目，让它挑一条并给出正文。
+
+        本地扩展：`intent`（第一步的 `localMedia.want`）与 `user_message`（对方刚说的话）一起交给它——
+        只看正文「这就给你发」判断贴不贴合，会把「对方点名要表情」误判成 null。
 
         走**主叙事**连接（`main` 任务）：挑表情的是主角自己，正文也得是她的口吻——
         拿识图模型（`stickers` 路由）去挑表情是错误的接线。返回模型**原样**的 JSON
@@ -1992,6 +1999,8 @@ class OpenAICompatibleNarrator:
                     {
                         'groupId': group_id,
                         'message': message_text,
+                        **({'intent': intent} if intent else {}),
+                        **({'userMessage': user_message[-600:]} if user_message else {}),
                         'stickerCandidates': items,
                     },
                     ensure_ascii=False,

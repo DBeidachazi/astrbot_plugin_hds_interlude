@@ -1248,11 +1248,30 @@ def parse_sticker_selection_receipt(payload: Any) -> dict[str, Any]:
     value = _dual_field(payload, 'content')
     if isinstance(value, str) and value.strip():
         content = value
+    reason = _dual_field(payload, 'reason')
     return {
         'assetId': asset_id,
         'content': content,
         'willingness': _dual_field(payload, 'willingness'),
+        # 本地扩展：挑不到时模型给的理由（INFO 日志与「实际没发出去」的事实里用）。
+        'reason': reason.strip()[:120] if isinstance(reason, str) else '',
     }
+
+
+def parse_sticker_intent(decision: Any) -> str:
+    """本地扩展：第一步点名分组时附带的意图（`localMedia.want`）——为什么想发表情。
+
+    2026-10-06 实测：用户点名要表情包，第一步三次都点了分组，第二步只看到「这就给你发」这句正文，
+    判断「没有候选贴合这句话」回了 null。意图要跟着分组一起交给第二步。
+    """
+    local_media = _dual_field(decision, 'localMedia', 'local_media')
+    if not isinstance(local_media, dict):
+        return ''
+    for key in ('want', 'intent', 'reason'):
+        value = local_media.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:120]
+    return ''
 
 
 def parse_sticker_auto_group(receipt: Any) -> Optional[dict[str, Any]]:

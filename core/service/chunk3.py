@@ -1681,7 +1681,7 @@ class ServiceChunk3(ServiceBase):
             sticker = (
                 self.resolve_sticker(pick(decision, 'localMedia', 'local_media'), sticker_catalog)
                 if early['delivered'] else await self.resolve_sticker_selection(
-                    decision, sticker_selection, sticker_follow_up,
+                    decision, sticker_selection, sticker_follow_up, user_message,
                 )
             )
             native_face = None if sticker else self.resolve_native_face(decision, chat_capabilities)
@@ -1804,6 +1804,9 @@ class ServiceChunk3(ServiceBase):
                     '已丢弃过期主模型结果 参与者=%s 请求=%d', pick(snapshot['participant'], 'id'), request_id,
                 )
                 return
+            if sticker is None and sticker_follow_up.get('miss'):
+                # 本地扩展：点了分组却没发出表情——补一条事实，下一回合她才知道其实没发。
+                await self.record_sticker_miss(story_id, pick(snapshot['participant'], 'id'), sticker_follow_up, self.now())
             if self.can_handle_participant(snapshot['participant']):
                 delivered = await self.send_outgoing_messages(
                     snapshot['story'], result['messages'], snapshot['participant'], latest_session,

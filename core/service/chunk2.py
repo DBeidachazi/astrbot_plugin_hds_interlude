@@ -139,6 +139,7 @@ from .helpers import (
     normalize_quoted_message_context,
     parse_sticker_auto_group,
     parse_sticker_group_choice,
+    parse_sticker_intent,
     parse_sticker_selection_receipt,
     rank_sticker_catalog,
     safe_sticker_group_name,
@@ -3506,6 +3507,7 @@ class ServiceChunk2(ServiceBase):
 
     async def resolve_sticker_selection(
         self, decision: Any, selection: Any, follow_up_budget: Optional[dict[str, Any]] = None,
+        user_text: str = '',
     ) -> Optional[dict[str, Any]]:
         """把这一回合的表情草稿解析成**可投递的资产**（两级选择的第二步）。
 
@@ -3526,21 +3528,21 @@ class ServiceChunk2(ServiceBase):
         if not group_id:
             self._report_sticker_selection_fallback('模型没有点名分组')
             return None
+        budget = follow_up_budget if isinstance(follow_up_budget, dict) else {}
+        intent = parse_sticker_intent(decision)
         items = sticker_group_items(self.sticker_catalog, group_id, STICKER_GROUP_ITEM_LIMIT)
         if not items:
-            self._report_sticker_selection_fallback(
-                '点名的分组不存在或没有可挑的条目 分组=%s' % group_id,
-            )
+            self._note_sticker_miss(budget, group_id, 0, '点名的分组不存在或没有可挑的表情', intent)
             return None
-        budget = follow_up_budget if isinstance(follow_up_budget, dict) else {}
         asked = budget.get('count')
         asked = int(asked) if isinstance(asked, (int, float)) and not isinstance(asked, bool) else 0
         if asked >= STICKER_FOLLOW_UP_MAX_PER_TURN:
             self._report_sticker_selection_fallback('本回合已经追问过，不再追问 分组=%s' % group_id)
             return None
         budget['count'] = asked + 1
-        receipt = await self.request_sticker_selection(decision, group_id, items)
+        receipt = await self.request_sticker_selection(decision, group_id, items, intent, user_text)
         if not receipt:
+            self._note_sticker_miss(budget, group_id, len(items), '第二步没有可用回执（失败 / 超时 / 无法解析）', intent)
             return None
         if receipt.get('content'):
             # 正文**以第一段为准**（§48.1）：判据在 `helpers.apply_sticker_follow_up_content()`
@@ -3555,10 +3557,14 @@ class ServiceChunk2(ServiceBase):
         sticker = self.resolve_sticker(
             {'assetId': receipt.get('assetId'), 'willingness': willingness}, items,
         )
-        if sticker is None and receipt.get('assetId'):
-            self._report_sticker_selection_fallback(
-                '追问选中的素材不在候选里 素材=%s 分组=%s', receipt.get('assetId'), group_id,
-            )
+        if sticker is None:
+            if not receipt.get('assetId'):
+                reason = '模型认为候选都不贴切' + (('：' + receipt['reason']) if receipt.get('reason') else '')
+            elif any(pick(item, 'assetId', 'asset_id') == receipt.get('assetId') for item in items):
+                reason = '意愿 %.2f 未达阈值 %.2f' % (float(willingness), float(self.expression_threshold))
+            else:
+                reason = '选中的素材不在候选里 素材=%s' % receipt.get('assetId')
+            self._note_sticker_miss(budget, group_id, len(items), reason, intent)
             return None
         # 把选中的 `assetId` 写回**模型那份草稿**：落库的 `metadata.localMedia` 与投递账本
         # 读的都是它（`delivery_ledger` 只认 `localMedia.assetId`）——不写回去就成了
@@ -3574,6 +3580,7 @@ class ServiceChunk2(ServiceBase):
 
     async def request_sticker_selection(
         self, decision: Any, group_id: str, items: list[dict[str, Any]],
+        intent: str = '', user_text: str = '',
     ) -> Optional[dict[str, Any]]:
         """**追问一次**主模型：附上该组条目，让它挑一条并给出正文。
 
@@ -3586,10 +3593,12 @@ class ServiceChunk2(ServiceBase):
             return None
         message = visible_reply_text(decision)
         try:
-            receipt = await asyncio.wait_for(
-                select(items, message, self.expression_threshold, group_id),
-                STICKER_FOLLOW_UP_TIMEOUT_SECONDS,
-            )
+            try:
+                call = select(items, message, self.expression_threshold, group_id,
+                              intent=intent, user_message=str(user_text or ''))
+            except TypeError:  # 旧签名的替身 / 实现：不带意图也照常挑
+                call = select(items, message, self.expression_threshold, group_id)
+            receipt = await asyncio.wait_for(call, STICKER_FOLLOW_UP_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             self._report_sticker_selection_fallback('表情追问超时 分组=%s' % group_id)
             return None
@@ -3604,6 +3613,39 @@ class ServiceChunk2(ServiceBase):
             self._report_sticker_selection_fallback('表情追问回执无法解析 分组=%s' % group_id)
             return None
         return parsed
+
+    def _note_sticker_miss(self, budget: dict[str, Any], group_id: str, candidates: int,
+                           reason: str, intent: str = '') -> None:
+        """本地扩展：第一步点名了分组、第二步却没发出表情——INFO 日志 + 记进本回合的预算，
+        由调用方补一条「想发表情但没发出去」的事实（见 `record_sticker_miss`）。"""
+        budget['miss'] = {'groupId': group_id, 'candidates': candidates, 'reason': reason, 'intent': intent}
+        self.report_standalone_operation(
+            'standard', 'info', '表情选择未发出 分组=%s 候选=%d 原因=%s 意图=%s',
+            group_id, candidates, reason, intent or '（未给）',
+        )
+
+    async def record_sticker_miss(self, story_id: Any, participant_id: str, budget: Any, now: Any) -> None:
+        """本地扩展：把「想发表情包但没挑到合适的，实际没发出去」写进剧本时间线（system 条目）。
+
+        剧本里她可能已经写了「点了发送」——下一回合能看到这条事实，才会自然地解释 / 重选，
+        而不是以为自己发过了（2026-10-06：三次都以为发了）。"""
+        miss = budget.get('miss') if isinstance(budget, dict) else None
+        if not isinstance(miss, dict):
+            return
+        content = '（她想发一张表情包（分组：%s）但没挑到合适的，实际没有发出去。原因：%s）' % (
+            miss.get('groupId') or '?', miss.get('reason') or '未知')
+
+        async def task() -> None:
+            await self.append_entry(story_id, {
+                'kind': 'system', 'actor': 'system', 'content': content, 'occurredAt': iso(now),
+                'metadata': {'stickerOutcome': 'not-sent', 'stickerGroupId': miss.get('groupId'),
+                             'reason': miss.get('reason'), 'intent': miss.get('intent')},
+            }, now, participant_id or '')
+
+        try:
+            await self.serial(story_id, task)
+        except Exception as error:  # noqa: BLE001 - 补事实失败不影响已发出的回复
+            self.report_standalone('warn', '表情未发出的事实补录失败：%s', error)
 
     def _report_sticker_selection_fallback(self, message: str, *args: Any) -> None:
         """两级选择的每一次兜底都从这里出去：**debug**，不带候选继续。

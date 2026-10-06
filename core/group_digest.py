@@ -265,3 +265,80 @@ def addressed_elsewhere_only(batch: list[Any], self_ids: Iterable[str], aliases:
     audiences = message_audiences(batch, self_ids, aliases, prior, nicknames)
     texts = [audience for message, audience in zip(batch or [], audiences) if not _is_placeholder(message)]
     return bool(texts) and all(audience and audience.startswith('other:') for audience in texts)
+
+
+# ---------------------------------------------------------------- 只有一个 @（2026-10-06）
+# 群友常把话拆成两条：先「小满在干什么」，再补一个「@林小满」（或反过来）。只有 @ 的那条照实呈现为
+# 「@林小满」，绝不编成「（没说话）」；另外给一个**事实指针**：往前 5 分钟里同一个人说过的话，
+# 或别人提到她的话——怎么理解交给模型结合上下文判断。
+
+POINTER_WINDOW_SECONDS = 5 * 60
+
+
+def is_mention_only(message: Any) -> bool:
+    """这条只有 @（可以是几个），没有文字、图片等其它内容。"""
+    raw = str(_get(message, 'content') or '')
+    return bool(_targets(message)) and not _TAG.sub('', raw).strip() and '<img' not in raw and '<audio' not in raw
+
+
+def _moment(message: Any) -> Optional[float]:
+    from datetime import datetime, timezone
+    value = _get(message, 'occurredAt', 'occurred_at')
+    if isinstance(value, datetime):
+        moment = value
+    else:
+        try:
+            moment = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        except (TypeError, ValueError):
+            return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def merged_timeline(context: Iterable[Any], batch: Iterable[Any]) -> list[Any]:
+    """群上下文 + 本批合成一条时间线（批次消息通常已经入库、也在上下文里：按 messageId 去重）。"""
+    seen: set[Any] = set()
+    items = []
+    for message in [*(context or []), *(batch or [])]:
+        key = _get(message, 'messageId', 'message_id') or (
+            _get(message, 'senderId', 'sender_id'), _get(message, 'content'), _moment(message))
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(message)
+    return sorted(items, key=lambda item: _moment(item) or 0.0)
+
+
+def mention_pointer(message: Any, timeline: list[Any], names: dict[str, str], self_ids: Iterable[str],
+                    character_name: str, aliases: Iterable[str] = ()) -> str:
+    """只有 @ 的消息：指向往前 5 分钟里最相关的一句（同一个人优先，其次提到她的话）。没有就返回空串。"""
+    at = _moment(message)
+    if at is None:
+        return ''
+    own = {str(item) for item in self_ids if str(item or '').strip()}
+    aliases = [str(item) for item in aliases if str(item or '').strip()]
+    sender = str(_get(message, 'senderId', 'sender_id') or '')
+    earlier = []
+    for item in timeline:
+        moment = _moment(item)
+        if moment is None or moment >= at or at - moment > POINTER_WINDOW_SECONDS:
+            continue
+        if str(_get(item, 'senderId', 'sender_id') or '') in own or is_mention_only(item) or _is_placeholder(item):
+            continue
+        earlier.append((moment, item))
+
+    def describe(moment: float, item: Any) -> str:
+        who = names.get(str(_get(item, 'senderId', 'sender_id') or '')) or _get(item, 'senderName', 'sender_name') or '群友'
+        minutes = int((at - moment) // 60)
+        ago = '刚刚' if minutes < 1 else '%d 分钟前' % minutes
+        text = _snippet(render_mentions(_get(item, 'content'), names, own, character_name))
+        return '%s %s发过「%s」' % (who, ago, text)
+
+    for moment, item in reversed(earlier):
+        if str(_get(item, 'senderId', 'sender_id') or '') == sender:
+            return describe(moment, item)
+    for moment, item in reversed(earlier):
+        if _calls_her(item, own, aliases):
+            return describe(moment, item)
+    return ''

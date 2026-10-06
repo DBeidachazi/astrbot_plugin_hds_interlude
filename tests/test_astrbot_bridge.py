@@ -2055,6 +2055,34 @@ class BridgeIntegrationTests(unittest.TestCase):
         self.assertEqual(asyncio.run(bridge.handle_event(event)), [])
         self.assertFalse(event.stopped, '群聊没内容时保持上游语义，交回其它处理器')
 
+    def test_handle_event_swallows_unusable_events_in_an_allowlisted_group(self):
+        """本地修复：白名单群里的事件一律吞掉，不漏给 AstrBot 自带模型（2026-10-06 冒牌回复）。"""
+        import asyncio
+
+        config = {'qq_access': {'group_chats_only': True,
+                                'group_chats': [{'group_id': '90001', 'enabled': True, 'response_mode': 'always'}]}}
+        bridge = _make_bridge(config)
+        empty = FakeMessageEvent(message='', components=[], group_id='90001')
+        self.assertEqual(asyncio.run(bridge.handle_event(empty)), [])
+        self.assertTrue(empty.stopped, '白名单群里没有可用内容的事件也要吞掉')
+
+        async def declined(_session):
+            return False
+
+        bridge.service.receive_group = declined
+        unconsumed = FakeMessageEvent(message='hi', components=[Plain('hi')], group_id='90001')
+        asyncio.run(bridge.handle_event(unconsumed))
+        self.assertTrue(unconsumed.stopped, '白名单群里没成为回合的事件也要吞掉')
+
+        other = FakeMessageEvent(message='', components=[], group_id='90002')
+        asyncio.run(bridge.handle_event(other))
+        self.assertFalse(other.stopped, '不归我们管的群保持原样')
+        disabled = _make_bridge({'qq_access': {'group_chats_only': True,
+                                               'group_chats': [{'group_id': '90001', 'enabled': False}]}})
+        off = FakeMessageEvent(message='', components=[], group_id='90001')
+        asyncio.run(disabled.handle_event(off))
+        self.assertFalse(off.stopped, '规则停用的群不算归我们管')
+
     def test_handle_event_leaves_an_empty_private_event_alone_when_capture_is_off(self):
         import asyncio
 

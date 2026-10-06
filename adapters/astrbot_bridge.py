@@ -5777,6 +5777,13 @@ class AstrbotBridge:
         content = session.content
 
         if not content.strip() and not self._has_voice(session):
+            if self.owns_group_session(session):
+                # 本地修复：归我们管的群里「说不出话」的事件也吞掉——放行就会落给 AstrBot 自带的
+                # 模型 / 单 @ 处理器，用小满的号冒出第二个人格（2026-10-06「老师在讲台上盯着」）。
+                event.stop_event()
+                log_fallback('debug', '已吞掉群里没有可用内容的事件 群=%s 用户=%s',
+                             session.channel_id, session.user_id)
+                return []
             # 上游这里 `next()`：把这条消息交回其它处理器。但 AstrBot 的部署里往往还有
             # 另一个聊天 Agent（默认 Agent / 别的拟人插件），交回去 = 同一个私聊里冒出
             # 第二个人格（实测：用户"一张图 + 一句文字"分两条发来，图片那条事件的消息链
@@ -5804,6 +5811,9 @@ class AstrbotBridge:
             self.end_capture()
         if consumed:
             event.stop_event()
+        elif endpoint.is_group and self.owns_group_session(session):
+            # 本地修复：白名单群里没能成为回合的事件同样吞掉，不交给后面的内置模型。
+            event.stop_event()
         elif not endpoint.is_group and self.owns_private_session(session):
             # 我们看了、但没能把它变成一回合（故事暂停 / 参与者不在 / 适配器给的形状怪…）：
             # **照样吞掉**。上游在这里 `next()`，而 AstrBot 的后面坐着第二个 Agent——
@@ -5812,6 +5822,21 @@ class AstrbotBridge:
             event.stop_event()
             await self._report_unconsumed_private(event, session)
         return list(capture.texts)
+
+    def owns_group_session(self, session: SessionView) -> bool:
+        """这个群归我们管吗：在群聊白名单里、启用、并且通过接入判定（纯读）。
+
+        归我们管的群里，事件无论是否成为回合都要吞掉：这个账号上不该有第二个人格。
+        """
+        try:
+            if session.is_direct:
+                return False
+            if self.service.group_rule(self.service._session_group_id(session)) is None:
+                return False
+            return bool(self.service.explain_group_access(session)[0])
+        except Exception as error:  # noqa: BLE001 - 归属判定失败按"不归我们"处理
+            log_fallback('warn', '群聊归属判定失败，按不消费处理 错误=%s' % error)
+            return False
 
     def owns_private_session(self, session: SessionView) -> bool:
         """这条私聊归我们管吗：私聊 + capture 开着 + `can_handle_session` 通过。

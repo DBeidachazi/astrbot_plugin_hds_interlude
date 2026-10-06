@@ -1707,6 +1707,18 @@ class ServiceChunk1(ServiceBase):
                 batch, self_ids, _addressing_aliases(snapshot['story'], rule), snapshot['contextMessages'], nicknames,
             )
             preamble = group_digest.nickname_preamble(nicknames, character_name)
+            # 本地扩展：只有 @ 的消息照实呈现，并给一个往前 5 分钟的事实指针（不编「没说话」）。
+            timeline = group_digest.merged_timeline(context_messages, batch)
+            aliases = _addressing_aliases(snapshot['story'], rule)
+
+            def batch_note(index: int, item: Any) -> str:
+                note = group_digest.audience_note(audiences[index], names, pick(item, 'content'), nicknames)
+                if group_digest.is_mention_only(item):
+                    pointer = group_digest.mention_pointer(item, timeline, names, self_ids, character_name, aliases)
+                    if pointer:
+                        note = ('%s；%s）' % (note[:-1], pointer)) if note else '（↑ %s）' % pointer
+                return note
+
             promise_note = trust.promise_preamble(promises)
             user_message = '\n\n'.join(
                 ([promise_note] if promise_note else [])
@@ -1715,8 +1727,7 @@ class ServiceChunk1(ServiceBase):
                 + ['[群聊连续消息 %d｜%s]\n%s%s' % (
                     index + 1, pick(item, 'speaker'),
                     group_digest.render_mentions(pick(item, 'content'), names, self_ids, character_name),
-                    ('\n' + note) if (note := group_digest.audience_note(
-                        audiences[index], names, pick(item, 'content'), nicknames)) else '',
+                    ('\n' + note) if (note := batch_note(index, item)) else '',
                 ) for index, item in enumerate(batch)]
             )
             if self.semantic_turn_embedding_enabled():

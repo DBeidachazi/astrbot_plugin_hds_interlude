@@ -1271,7 +1271,12 @@ class HDSInterludePlugin(Star):
         if not allowed:
             self.bridge.service.note_group_skip(session, reason)
             return
-        await self.bridge.handle_event(event)
+        try:
+            await self.bridge.handle_event(event)
+        except Exception as error:  # noqa: BLE001 - 白名单群出错也不能漏给内置模型
+            logger.error('hds-interlude：群聊事件处理失败，已吞掉事件以免内置模型接手：%s' % error)
+            event.stop_event()
+            return
         for reply in self.bridge.turn_replies():
             yield self._reply_result(event, reply)
 

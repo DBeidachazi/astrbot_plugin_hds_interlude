@@ -1590,6 +1590,17 @@ class ServiceChunk4(ServiceBase):
             participants = await self.participants(story['id'])
             reader = getattr(self, '_access_config', None)
             access = reader() if callable(reader) else {}
+            # 先结清已经回过的晨间回访（模型没交 followUpResolutions 时，宿主据实结清，免得推后重回）。
+            by_id = {item.get('id'): item for item in participants if isinstance(item, dict)}
+            for intent in await self.db_get('interlude_intent', {
+                'storyId': story['id'], 'type': 'follow-up-commitment', 'status': 'pending',
+            }):
+                target = by_id.get(pick(intent, 'participantId', 'participant_id'))
+                if catch_up.is_catch_up_intent(intent) and target is not None \
+                        and catch_up.answered_since(target, pick(intent, 'createdAt', 'created_at')):
+                    await self.db_set('interlude_intent', {'id': pick(intent, 'id')}, {'status': 'completed', 'updatedAt': now})
+                    self.report_operation('standard', 'info', story, 'advance', '晨间回信已回过，回访结清 参与者=%s',
+                                          pick(intent, 'participantId', 'participant_id'))
             new_state, drafts = catch_up.plan(
                 state, asleep, now, participants,
                 lambda item: trust.trust_level(access, item), _timezone(story), self.rng,

@@ -183,6 +183,32 @@ class Broken(Host):
 broken = Broken({'extensions': {'catch_up': {'asleep_since': '2026-10-05T16:40:00.000Z'}}}, awake_entries, PEOPLE)
 check(asyncio.run(broken._morning_catch_up(broken.story, WAKE)) is broken.story and any('WARN' in x for x in broken.logs),
       '出错只 warn，不影响后台推进')
+# 回访那一回合她已经回过了，但模型没交 followUpResolutions（10-06 #14 实测）：下一次扫描据实结清
+fang_replied = participant('onebot:1:458593826', '好小狗-放映手机', '2026-10-05T20:01:49Z', last_char='2026-10-06T01:45:46Z')
+settle = Host({}, awake_entries, [fang_replied, ME],
+              pending=[{'id': 14, 'participantId': fang_replied['id'], 'type': 'follow-up-commitment', 'status': 'pending',
+                        'createdAt': '2026-10-06T01:20:12.223Z', 'payload': {'manual': 'morning-catch-up 2026-10-06'}},
+                       {'id': 15, 'participantId': ME['id'], 'type': 'follow-up-commitment', 'status': 'pending',
+                        'createdAt': '2026-10-06T01:30:00Z', 'payload': {'morningCatchUp': True}},
+                       {'id': 16, 'participantId': fang_replied['id'], 'type': 'follow-up-commitment', 'status': 'pending',
+                        'createdAt': '2026-10-06T01:20:00Z', 'payload': {'kind': 'reply'}}])
+settle_sets = []
+_orig = settle.db_set
+
+
+async def tracking(table, where, values):
+    if table == 'interlude_intent':
+        settle_sets.append((where['id'], values['status']))
+    else:
+        await _orig(table, where, values)
+
+
+settle.db_set = tracking
+asyncio.run(settle._morning_catch_up(settle.story, WAKE + timedelta(minutes=21)))
+check(settle_sets == [(14, 'completed')], '回过了的晨间回访结清；没回的、非晨间回访的承诺不动: %s' % settle_sets)
+check(any('回访结清' in line for line in settle.logs), settle.logs)
+check(cu.is_catch_up_intent({'payload': '{"morningCatchUp": true}'}) and not cu.is_catch_up_intent({'payload': {}}), '字符串 payload')
+check(not cu.answered_since(ME, '2026-10-06T01:30:00Z') and cu.answered_since(fang_replied, '2026-10-06T01:20:12Z'), 'answered_since')
 print('T3 服务层排队 ✓')
 
 # ============================================================ T4 私聊夜间免打扰：静默入库省调用，紧急穿透

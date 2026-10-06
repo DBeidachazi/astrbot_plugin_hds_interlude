@@ -164,3 +164,32 @@ def plan(story_state: Any, asleep: Optional[bool], now: datetime, participants: 
             },
         })
     return state, drafts
+
+
+def is_catch_up_intent(intent: Any) -> bool:
+    payload = _get(intent, 'payload') or {}
+    if isinstance(payload, str):
+        try:
+            import json
+            payload = json.loads(payload)
+        except ValueError:
+            payload = {}
+    return bool(_get(payload, 'morningCatchUp')) or str(_get(payload, 'manual') or '').startswith('morning-catch-up')
+
+
+def answered_since(participant: Any, created_at: Any) -> bool:
+    """这个人在回访创建之后已经收到她的消息（回过了）。
+
+    2026-10-06 实测：晨间回访那一回合她已经回了好小狗，但模型没有交 followUpResolutions，
+    回访被推后 40 分钟——放着不管，10:25 会再回一遍。回过了就直接结清。
+    """
+    state = _get(participant, 'state') or {}
+    if isinstance(state, str):
+        try:
+            import json
+            state = json.loads(state)
+        except ValueError:
+            state = {}
+    replied = _parse(_get(state, 'lastCharacterMessageAt', 'last_character_message_at'))
+    created = _parse(created_at)
+    return replied is not None and created is not None and replied >= created

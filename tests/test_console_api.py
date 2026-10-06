@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from typing import Any
+from datetime import datetime, timedelta
 import asyncio
 import base64
 import hashlib
@@ -102,15 +103,18 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(payload['totals']['inputTokens'], 0)
         self.assertEqual(len(payload['series']), 1, '按天视图至少给今天这一格')
 
+        # 日期相对今天取：写死的 09-29 / 09-30 在 10-06 起滑出「最近 7 天」窗口，测试过期失效。
+        day1 = (datetime.now().date() - timedelta(days=1)).isoformat()
+        day2 = (datetime.now().date() - timedelta(days=2)).isoformat()
         self.bridge.db.insert('interlude_token_usage', {
-            'day': '2026-09-30', 'storyId': 's1', 'task': '主叙事', 'model': 'deepseek-chat',
+            'day': day1, 'storyId': 's1', 'task': '主叙事', 'model': 'deepseek-chat',
             'provider': '连接A', 'inputTokens': 1200, 'outputTokens': 300, 'cachedTokens': 600,
-            'calls': 3, 'createdAt': '2026-09-30T00:00:00Z', 'updatedAt': '2026-09-30T00:00:00Z',
+            'calls': 3, 'createdAt': day1 + 'T00:00:00Z', 'updatedAt': day1 + 'T00:00:00Z',
         })
         self.bridge.db.insert('interlude_token_usage', {
-            'day': '2026-09-29', 'storyId': 's1', 'task': '压缩', 'model': 'flash',
+            'day': day2, 'storyId': 's1', 'task': '压缩', 'model': 'flash',
             'provider': '连接B', 'inputTokens': 400, 'outputTokens': 100, 'cachedTokens': 0,
-            'calls': 1, 'createdAt': '2026-09-29T00:00:00Z', 'updatedAt': '2026-09-29T00:00:00Z',
+            'calls': 1, 'createdAt': day2 + 'T00:00:00Z', 'updatedAt': day2 + 'T00:00:00Z',
         })
         week = _run(self.api.token_stats('week', '', ''))
         self.assertEqual(week['range'], 'week')
@@ -121,9 +125,9 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(len(week['series']), 7)
 
         # 自选范围能精确圈住一天（8 月那类老数据不进本周视图这件事由纯函数测试覆盖）。
-        custom = _run(self.api.token_stats('custom', '2026-09-30', '2026-09-30'))
+        custom = _run(self.api.token_stats('custom', day1, day1))
         self.assertEqual(custom['totals']['inputTokens'], 1200)
-        self.assertEqual(custom['from'], '2026-09-30')
+        self.assertEqual(custom['from'], day1)
 
     # ---- 平台动作目录与权限（面板「动作」） ----
 

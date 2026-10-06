@@ -1578,8 +1578,11 @@ class ServiceChunk4(ServiceBase):
 
         可选能力：任何异常都只留一条 warn，绝不影响后台推进。
         """
-        if not bool(_cfg(self.runtime_config, 'morningCatchUp', True)):
+        if not bool(_cfg(getattr(self, 'runtime_config', None) or {}, 'morningCatchUp', True)):
             return story
+        needed = ('recent_entries', 'participants', 'append_intent', 'schedule_due_intent_wake', 'db_get', 'db_set')
+        if not all(callable(getattr(self, name, None)) for name in needed):
+            return story  # 精简宿主（上游测试替身）没有这些能力：直接跳过
         try:
             asleep = catch_up.asleep_in_story(await self.recent_entries(story['id'], 8))
             state = decode_story_state(story.get('state'))
@@ -1619,7 +1622,10 @@ class ServiceChunk4(ServiceBase):
                 self.report_operation('standard', 'info', story, 'advance', '她醒了 等待回复的私聊=%d', len(drafts))
             return await self.get_story(story['id'])
         except Exception as error:  # noqa: BLE001
-            self.report_standalone('warn', '晨间回信检查失败，跳过本轮 错误=%s', error)
+            try:
+                self.report_standalone('warn', '晨间回信检查失败，跳过本轮 错误=%s', error)
+            except Exception:  # noqa: BLE001 - 报告本身失败也不能打断后台推进
+                pass
             return story
 
     def _trust_context(self, participant: Any, phase: str) -> Optional[dict[str, Any]]:

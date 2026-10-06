@@ -5380,8 +5380,23 @@ class AstrbotBridge:
         return '%s:GroupMessage:%s' % (platform_id, channel)
 
     def channel_umo(self, channel_id: str) -> str:
-        """按会话 id 猜 UMO（私聊与群聊都试一遍）。"""
-        return self.group_umo(channel_id) or self.private_umo_for_scope(channel_id)
+        """**非群聊**发送（`is_group=False`）的 UMO：私聊优先，只有确实认识的群才按群聊发。
+
+        本地修复（2026-10-06）：原来先试 `group_umo()`，而它在只有一个平台时会给**任何** id 兜底拼出
+        `<platform>:GroupMessage:<id>`——于是私聊里的表情包 / 图片 / 原生表情全被当成「发往群 269502169」，
+        NapCat 上传富媒体失败（`rich media transfer failed`），文字却走会话 UMO 正常到达。
+        """
+        channel = _text(channel_id)
+        if channel in self._group_endpoints or channel in self._saved_group_umos:
+            return self.group_umo(channel)
+        scope = channel.split(':', 1)[1] if channel.startswith('private:') else channel
+        private = self.private_umo_for_scope(scope)
+        if private:
+            return private
+        platform_id = self._sole_platform_id()
+        if not platform_id or not scope:
+            return ''
+        return '%s:FriendMessage:%s' % (platform_id, scope)
 
     def private_umo_for_scope(self, scope: str) -> str:
         for endpoint in self._private_endpoints.values():

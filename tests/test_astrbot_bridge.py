@@ -1559,6 +1559,27 @@ class TransportDegradationTests(unittest.TestCase):
         self.assertTrue(self._run(self.transport.react('m-1', 'like')))
         self.assertEqual(event.reactions, ['👍'])
 
+    def test_private_image_goes_to_the_private_chat_not_a_made_up_group(self):
+        """本地修复：私聊发图（表情包）不能被拼成「发往群 <QQ号>」（2026-10-06 rich media transfer failed）。"""
+        event = FakeMessageEvent(components=[Plain('hi')], umo='aiocqhttp:FriendMessage:20002')
+        endpoint = bridge_module.endpoint_for_event(event)
+        self.bridge.remember_event(event, session_view(event, endpoint), endpoint)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'cat.gif')
+            with open(path, 'wb') as handle:
+                handle.write(b'GIF89a')
+            result = self._run(self.transport.send_sticker('20002', path, is_group=False))
+        self.assertTrue(result['ok'])
+        self.assertEqual(self.context.sent[-1][0], 'aiocqhttp:FriendMessage:20002')
+        # 没见过这个私聊端点（比如刚重启）：仍按私聊拼，不按群聊拼
+        self.assertEqual(self.bridge.channel_umo('30003'), 'aiocqhttp:FriendMessage:30003')
+        self.assertEqual(self.bridge.channel_umo('private:30003'), 'aiocqhttp:FriendMessage:30003')
+        # 认识的群照旧按群聊
+        group_event = FakeMessageEvent(components=[Plain('hi')], group_id='g-1')
+        group_endpoint = bridge_module.endpoint_for_event(group_event)
+        self.bridge._group_endpoints['g-1'] = group_endpoint
+        self.assertIn(':GroupMessage:g-1', self.bridge.channel_umo('g-1'))
+
     def test_send_native_face_degrades_on_non_onebot(self):
         event = FakeMessageEvent(platform_name='telegram', platform_id='telegram')
         endpoint = bridge_module.endpoint_for_event(event)

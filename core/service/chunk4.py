@@ -108,7 +108,7 @@ from ..story_state import (
 from ..time import dt_ms, format_log_time, iso, parse_dt, utc_now
 from ..turn_persistence import script_entry_draft_for_commit
 from ..urge import commit_urge, normalize_urge_state, urge_burst_active
-from .. import expression, trust, vitality
+from .. import catch_up, expression, trust, vitality
 from .base import ServiceBase, pick
 from .config import (
     TIMELINE_DIRECTOR_FUSE,
@@ -880,6 +880,8 @@ class ServiceChunk4(ServiceBase):
             await self.schedule_next_automatic_advance(story['id'], now)
             story = await self.get_story(story['id'])
 
+        # 本地扩展：晨间回信——她在剧本里从睡着变成醒着时，给还在等她的私聊排回访（见 core/catch_up.py）。
+        story = await self._morning_catch_up(story, now)
         cursor_from = narrative_cursor(story, now)
         elapsed = max(0, dt_ms(now) - dt_ms(cursor_from))
         due = await self.due_intents(story['id'], now)
@@ -1570,6 +1572,55 @@ class ServiceChunk4(ServiceBase):
         return _resync_dual(resolve_authored_actions(
             await self.narrator.decide(request), False, separator,
         ))
+
+    async def _morning_catch_up(self, story: Any, now: datetime) -> Any:
+        """每次后台扫描：记下「睡着」，醒来那一刻给等待中的私聊排错峰回访。返回（可能已更新的）story。
+
+        可选能力：任何异常都只留一条 warn，绝不影响后台推进。
+        """
+        if not bool(_cfg(self.runtime_config, 'morningCatchUp', True)):
+            return story
+        try:
+            asleep = catch_up.asleep_in_story(await self.recent_entries(story['id'], 8))
+            state = decode_story_state(story.get('state'))
+            before = catch_up._state(state)  # noqa: SLF001
+            participants = await self.participants(story['id'])
+            reader = getattr(self, '_access_config', None)
+            access = reader() if callable(reader) else {}
+            new_state, drafts = catch_up.plan(
+                state, asleep, now, participants,
+                lambda item: trust.trust_level(access, item), _timezone(story), self.rng,
+            )
+            if new_state == before and not drafts:
+                return story
+            current = await self.get_story(story['id'])
+            current_state = decode_story_state(current.get('state'))
+            extensions = {**(current_state.get('extensions') or {}), 'catch_up': new_state}
+            await self.db_set('interlude_story', {'id': story['id']}, {
+                'state': encode_story_state({**current_state, 'extensions': extensions}),
+            })
+            for draft in drafts:
+                participant_id = draft['participantId']
+                pending = await self.db_get('interlude_intent', {
+                    'storyId': story['id'], 'participantId': participant_id,
+                    'type': 'follow-up-commitment', 'status': 'pending',
+                })
+                if any(_record(pick(item, 'payload')).get('morningCatchUp') for item in pending):
+                    continue
+                await self.append_intent(story['id'], {key: draft[key] for key in ('type', 'summary', 'notBefore', 'payload')},
+                                         now, participant_id)
+                self.schedule_due_intent_wake(story['id'], parse_dt(draft['notBefore']))
+                self.report_operation(
+                    'standard', 'info', story, 'advance', '晨间回信已排队 参与者=%s 时间=%s 条数=%s',
+                    participant_id, format_log_time(parse_dt(draft['notBefore']), _timezone(story)),
+                    draft['payload'].get('messageCount'),
+                )
+            if new_state.get('last_wake_at') and new_state.get('last_wake_at') != before.get('last_wake_at'):
+                self.report_operation('standard', 'info', story, 'advance', '她醒了 等待回复的私聊=%d', len(drafts))
+            return await self.get_story(story['id'])
+        except Exception as error:  # noqa: BLE001
+            self.report_standalone('warn', '晨间回信检查失败，跳过本轮 错误=%s', error)
+            return story
 
     def _trust_context(self, participant: Any, phase: str) -> Optional[dict[str, Any]]:
         """本地扩展：私聊回合的 `interval.trust`（见 core/trust.py）；读不到配置时 None。"""

@@ -1895,6 +1895,52 @@ class ReceiveTests(ServiceHarness):
         self.assertIn('用户回合已入队', self.sink.text())
 
     @needs('receive', 'append_entry', 'buffer_user_narrative', 'describe_vision_event')
+    async def test_private_message_while_asleep_is_stored_without_a_model_turn(self) -> None:
+        # 本地扩展：私聊夜间免打扰——入库与未读计数照常，但不进叙事缓冲（不调用主叙事）。
+        service = self.make_service(self._config())
+        self.make_story()
+        participant = {'id': 'onebot:1:2', 'status': 'active', 'personId': '2'}
+        calls = self._stub_private_dependencies(service, participant)
+        service.signal_incoming_interruption = lambda _story, _part: None
+        recorded: list[Any] = []
+        original_record = service.record_incoming_message
+
+        async def record(current: Any, now: Any) -> Any:
+            recorded.append(now)
+            return await original_record(current, now)
+
+        service.record_incoming_message = record
+
+        async def asleep(_story: Any, _now: Any) -> Any:
+            return datetime(2026, 1, 3, 1, 0, tzinfo=timezone.utc)
+
+        service.sleep_resume_at = asleep
+        self.assertTrue(await service.receive(self._session(), STORY_TIME))
+        entries = [row for row in self.rows('interlude_script_entry') if row['kind'] == 'user-message']
+        self.assertEqual([row['content'] for row in entries], ['你好'])
+        self.assertEqual(len(recorded), 1)
+        self.assertNotIn('onebot:1:2', service.buffered_narrative_turns)
+        self.assertIn('夜间免打扰：她已睡着，私聊消息已入库不调用主叙事', self.sink.text())
+        self.assertNotIn('用户回合已入队', self.sink.text())
+        self.assertEqual(calls['paused'], [SHARED_STORY_ID])
+
+    @needs('receive', 'append_entry', 'buffer_user_narrative', 'describe_vision_event')
+    async def test_urgent_private_message_still_wakes_her(self) -> None:
+        service = self.make_service(self._config())
+        self.make_story()
+        participant = {'id': 'onebot:1:2', 'status': 'active', 'personId': '2'}
+        self._stub_private_dependencies(service, participant)
+        service.signal_incoming_interruption = lambda _story, _part: None
+
+        async def asleep(_story: Any, _now: Any) -> Any:
+            return datetime(2026, 1, 3, 1, 0, tzinfo=timezone.utc)
+
+        service.sleep_resume_at = asleep
+        self.assertTrue(await service.receive(self._session(content='急事！快醒醒'), STORY_TIME))
+        self.assertIn('onebot:1:2', service.buffered_narrative_turns)
+        self.assertIn('用户回合已入队', self.sink.text())
+
+    @needs('receive', 'append_entry', 'buffer_user_narrative', 'describe_vision_event')
     async def test_incoming_images_and_audio_are_counted_in_metadata(self) -> None:
         service = self.make_service(self._config())
         self.make_story()

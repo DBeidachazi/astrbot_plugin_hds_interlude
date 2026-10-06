@@ -125,8 +125,19 @@ def handoffs(entries: Any) -> list[dict[str, Any]]:
     return result
 
 
+#: 「睡」说的是别人 / 猫，不是她（2026-10-06 实测：「喝温水看猫睡觉」「摸摸熟睡的煤球」把醒着的她判成睡着，
+#: 22:14 起群消息被夜间免打扰拦下）。判定前先把这些片段去掉。
+_OTHERS_SLEEPING = re.compile(
+    r'(?:看|陪|哄|摸摸?)着?(?:猫咪?|小猫|煤球|它|狗狗?|妹妹|弟弟)[^，、。,;；]{0,3}(?:睡觉|熟睡|睡着|酣睡|入睡|沉睡)'
+    r'|(?:熟睡|睡着|酣睡|沉睡)(?:中)?的(?:猫咪?|小猫|煤球|狗狗?|妹妹|弟弟)'
+)
+
+
 def is_asleep(activity: str) -> bool:
-    return bool(activity) and bool(_ASLEEP.search(activity)) and not _AWAKE.search(activity)
+    if not activity:
+        return False
+    own = activity if re.search(r'一起(?:睡|入睡|午睡)', activity) else _OTHERS_SLEEPING.sub('', activity)
+    return bool(_ASLEEP.search(own)) and not _AWAKE.search(own)
 
 
 def place_key(place: str) -> str:

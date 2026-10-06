@@ -1302,6 +1302,19 @@ class ServiceChunk1(ServiceBase):
                 'selfId': _session_read(session, 'selfId', 'self_id'),
                 'userId': _session_read(session, 'userId', 'user_id'),
             })
+        # 本地扩展：私聊夜间免打扰。她在剧本里睡着（且在睡眠时段）时，非紧急私聊只入库（未读 / 待回计数
+        # 照常累计），不调用主叙事；醒来后由晨间回信（core/catch_up.py）排回访。明显紧急的照常进叙事。
+        if bool(_config_value(self.runtime_config, 'nightQuietPrivate', 'night_quiet_private', True)) \
+                and not vitality.is_urgent(str(pick(user_input, 'content') or '')):
+            sleep_resume = await self.sleep_resume_at(accepted['story'], accepted['now'])
+            if sleep_resume is not None:
+                self.report_operation(
+                    'standard', 'info', accepted['story'], 'user-message',
+                    '夜间免打扰：她已睡着，私聊消息已入库不调用主叙事，醒来后回信 参与者=%s 预计起床=%s',
+                    pick(accepted['participant'], 'id'),
+                    format_log_time(sleep_resume, pick(pick(accepted['story'], 'setting') or {}, 'timezone') or 'Asia/Shanghai'),
+                )
+                return True
         self.buffer_user_narrative(
             accepted['story'], accepted['participant'], session, accepted['now'],
             accepted['superseded'], pick(user_input, 'content'),

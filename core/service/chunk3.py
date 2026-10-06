@@ -1677,11 +1677,12 @@ class ServiceChunk3(ServiceBase):
             # 两级选择（§48 甲）：每回合一个**新的**追问预算（最多多问一次，铁律）。
             # 首条回复已经提前投递（early）时不再追问——正文已经发出去了，追问改不动它，
             # 只会在投递之后凭空多出一张图。
-            sticker_follow_up: dict[str, Any] = {}
+            # 本地扩展：对方原话随追问预算一起交给第二步（不改方法签名，旧实现 / 替身照常可用）。
+            sticker_follow_up: dict[str, Any] = {'userText': user_message}
             sticker = (
                 self.resolve_sticker(pick(decision, 'localMedia', 'local_media'), sticker_catalog)
                 if early['delivered'] else await self.resolve_sticker_selection(
-                    decision, sticker_selection, sticker_follow_up, user_message,
+                    decision, sticker_selection, sticker_follow_up,
                 )
             )
             native_face = None if sticker else self.resolve_native_face(decision, chat_capabilities)

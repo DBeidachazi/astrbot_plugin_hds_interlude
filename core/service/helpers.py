@@ -1248,14 +1248,16 @@ def parse_sticker_selection_receipt(payload: Any) -> dict[str, Any]:
     value = _dual_field(payload, 'content')
     if isinstance(value, str) and value.strip():
         content = value
-    reason = _dual_field(payload, 'reason')
-    return {
+    result = {
         'assetId': asset_id,
         'content': content,
         'willingness': _dual_field(payload, 'willingness'),
-        # 本地扩展：挑不到时模型给的理由（INFO 日志与「实际没发出去」的事实里用）。
-        'reason': reason.strip()[:120] if isinstance(reason, str) else '',
     }
+    # 本地扩展：挑不到时模型给的理由（INFO 日志与「实际没发出去」的事实里用）；没有就不加这个键。
+    reason = _dual_field(payload, 'reason')
+    if isinstance(reason, str) and reason.strip():
+        result['reason'] = reason.strip()[:120]
+    return result
 
 
 def parse_sticker_intent(decision: Any) -> str:

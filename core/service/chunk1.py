@@ -1765,9 +1765,10 @@ class ServiceChunk1(ServiceBase):
             succeeded = bool(pick(decision_result, 'succeeded'))
             chat_actions = normalize_group_chat_actions(decision, chat_capabilities, group_context)
             # 每回合一个**新的**追问预算（同回合最多多问一次，铁律见 §48 兜底表）。
-            sticker_follow_up: dict[str, Any] = {}
+            # 本地扩展：对方原话随追问预算一起交给第二步（不改方法签名，旧实现 / 替身照常可用）。
+            sticker_follow_up: dict[str, Any] = {'userText': user_message}
             sticker = await self.resolve_sticker_selection(
-                decision, sticker_selection, sticker_follow_up, user_message,
+                decision, sticker_selection, sticker_follow_up,
             )
             native_face = None if sticker else self.resolve_native_face(decision, chat_capabilities)
 

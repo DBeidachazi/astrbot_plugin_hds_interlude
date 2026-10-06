@@ -3530,6 +3530,7 @@ class ServiceChunk2(ServiceBase):
             return None
         budget = follow_up_budget if isinstance(follow_up_budget, dict) else {}
         intent = parse_sticker_intent(decision)
+        user_text = str(user_text or budget.get('userText') or '')
         items = sticker_group_items(self.sticker_catalog, group_id, STICKER_GROUP_ITEM_LIMIT)
         if not items:
             self._note_sticker_miss(budget, group_id, 0, '点名的分组不存在或没有可挑的表情', intent)

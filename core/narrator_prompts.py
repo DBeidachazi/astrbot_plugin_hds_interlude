@@ -617,7 +617,7 @@ def sticker_selection_instruction(threshold: float = 0.7) -> str:
         'and the conversation, not only the outgoing text. When the other person explicitly asked for a sticker or the '
         'intent is clear, pick the closest candidate even if it is not perfect, with willingness of at least '
         + _js_number(threshold) + '. Return null only when every candidate clearly contradicts the intended mood, and '
-        'then give the reason. Never invent an assetId. Keep "content" as the same message — '
+        'then give the reason; never invent an assetId. Keep "content" as the same message — '
         'the sticker is sent alongside it only when willingness reaches ' + _js_number(threshold) + '.'
     )
 

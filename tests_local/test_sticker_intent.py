@@ -105,8 +105,8 @@ SELECTION = {'mode': 'groups', 'assets': [], 'groups': [{'groupId': '动物表�
 
 
 def run(host, dec, user='你有表情包可以发吗'):
-    budget = {}
-    sticker = asyncio.run(host.resolve_sticker_selection(dec, SELECTION, budget, user))
+    budget = {'userText': user}
+    sticker = asyncio.run(host.resolve_sticker_selection(dec, SELECTION, budget))
     return sticker, budget
 
 
@@ -167,9 +167,9 @@ host3 = Host(Narrator(None))
 asyncio.run(host3.record_sticker_miss('st', 'p', {}, NOW))
 check(host3.entries == [], '没有 miss：不补')
 src = open(importlib.import_module(f'{PKG}.core.service.chunk3').__file__, encoding='utf-8').read()
-check('decision, sticker_selection, sticker_follow_up, user_message,' in src and 'record_sticker_miss(story_id' in src, '私聊接线')
+check("sticker_follow_up: dict[str, Any] = {'userText': user_message}" in src and 'record_sticker_miss(story_id' in src, '私聊接线')
 src1 = open(importlib.import_module(f'{PKG}.core.service.chunk1').__file__, encoding='utf-8').read()
-check('decision, sticker_selection, sticker_follow_up, user_message,' in src1 and "record_sticker_miss(pick(story, 'id'), ''" in src1, '群聊接线')
+check("sticker_follow_up: dict[str, Any] = {'userText': user_message}" in src1 and "record_sticker_miss(pick(story, 'id'), ''" in src1, '群聊接线')
 # SilentNarrator 也接受新参数
 check(asyncio.run(narrator_mod.SilentNarrator().select_sticker([], 'x', 0.7, 'g', intent='i', user_message='u')) is None,
       'SilentNarrator 签名一致')
